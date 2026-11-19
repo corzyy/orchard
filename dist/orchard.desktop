@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Orchard
+Comment=A macOS-style Wayland session
+Exec=/usr/local/bin/orchard-session
+Type=Application
+DesktopNames=Orchard

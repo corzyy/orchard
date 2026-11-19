@@ -1,0 +1,334 @@
+//! The user's Orchard settings (`~/.config/orchard/settings.json`, written by
+//! `orchard-settings`).
+//!
+//! Kept in a process-wide store because many readers are free functions
+//! (chrome painting, shortcuts). `reload_settings` over IPC re-reads the file;
+//! `OrchardState::apply_settings` then pushes the parts that need it into
+//! live objects (keyboard, input devices, outputs, wallpaper).
+
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, RwLock,
+};
+
+pub use orchard_config::Settings;
+
+static CURRENT: RwLock<Option<Arc<Settings>>> = RwLock::new(None);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The current settings (loaded from disk on first use).
+pub fn get() -> Arc<Settings> {
+    if let Some(s) = CURRENT.read().unwrap().as_ref() {
+        return s.clone();
+    }
+    reload()
+}
+
+/// Re-read the settings file. Returns the new settings.
+pub fn reload() -> Arc<Settings> {
+    let s = Arc::new(Settings::load());
+    *CURRENT.write().unwrap() = Some(s.clone());
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    crate::chrome::theme::refresh_appearance();
+    s
+}
+
+/// Bumped on every reload; caches keyed on it are rebuilt after a change.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
+/// Command for ⌘Return (env var wins, then settings).
+pub fn terminal() -> String {
+    std::env::var("ORCHARD_TERMINAL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let t = get().apps.terminal.clone();
+            if t.trim().is_empty() { "konsole".into() } else { t }
+        })
+}
+
+/// Command used to lock the screen.
+pub fn locker() -> String {
+    std::env::var("ORCHARD_LOCKER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let l = get().lock.locker.clone();
+            if l.trim().is_empty() { "swaylock -f -c 1e1e1e".into() } else { l }
+        })
+}
+
+use orchard_config::CornerAction;
+use smithay::{
+    input::keyboard::XkbConfig,
+    utils::{Logical, Point},
+};
+
+use crate::state::{Backend, OrchardState};
+
+/// Runtime state for settings-driven behaviour.
+#[derive(Debug)]
+pub struct Runtime {
+    /// Corner the pointer is currently in (fires once per visit).
+    pub corner: Option<Corner>,
+    pub last_activity: std::time::Instant,
+    /// The idle locker already ran for this idle period.
+    pub idle_locked: bool,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            corner: None,
+            last_activity: std::time::Instant::now(),
+            idle_locked: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// How close (logical px) the pointer must be to count as "in the corner".
+const CORNER_SIZE: f64 = 2.0;
+
+impl<BackendData: Backend + 'static> OrchardState<BackendData> {
+    /// `reload_settings` IPC request: re-read the file, apply it, tell clients.
+    pub fn reload_settings(&mut self) {
+        let s = reload();
+        tracing::info!("settings reloaded");
+        self.apply_settings(&s);
+        self.ipc_broadcast(&crate::ipc::Event::SettingsChanged);
+    }
+
+    /// Push settings into live objects. Things read on demand (corner radius,
+    /// appearance, shortcuts, double-click, minimize effect, …) need nothing.
+    pub fn apply_settings(&mut self, s: &Settings) {
+        // keyboard layout + repeat
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            let kb = crate::wm::keyboard_settings();
+            let xkb = XkbConfig {
+                rules: "",
+                model: &kb.model,
+                layout: &kb.layout,
+                variant: &kb.variant,
+                options: kb.options.clone(),
+            };
+            if let Err(e) = keyboard.set_xkb_config(self, xkb) {
+                tracing::warn!(layout = kb.layout, "keyboard layout from settings rejected: {e:?}");
+            }
+            keyboard.change_repeat_info(kb.repeat_rate, kb.repeat_delay);
+        }
+
+        // mouse / trackpad
+        self.backend_data.apply_input_settings(&s.pointer);
+
+        // display scale
+        let outputs: Vec<_> = self.space.outputs().cloned().collect();
+        let mut scaled = false;
+        for output in outputs {
+            let Some(&want) = s.displays.scale.get(&output.name()) else { continue };
+            if !(0.5..=4.0).contains(&want) {
+                continue;
+            }
+            if (output.current_scale().fractional_scale() - want).abs() > 1e-3 {
+                output.change_current_state(None, None, Some(smithay::output::Scale::Fractional(want)), None);
+                self.backend_data.reset_buffers(&output);
+                scaled = true;
+            }
+        }
+        // refresh rate (at the output's current resolution)
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            let Some(&want) = s.displays.refresh.get(&output.name()) else { continue };
+            let Some(cur) = output.current_mode() else { continue };
+            if (cur.refresh - want).abs() < 500 {
+                continue;
+            }
+            let best = self
+                .backend_data
+                .output_modes(&output)
+                .into_iter()
+                .filter(|m| m.size == cur.size)
+                .min_by_key(|m| (m.refresh - want).abs());
+            if let Some(mode) = best.filter(|m| m.refresh != cur.refresh) {
+                if self.backend_data.set_output_mode(&output, mode) {
+                    output.change_current_state(Some(mode), None, None, None);
+                    self.backend_data.reset_buffers(&output);
+                }
+            }
+        }
+        if scaled {
+            crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
+        }
+
+        // pointer theme, and the appearance settings apps read
+        self.backend_data.reload_cursor();
+        crate::session::sync_app_appearance(s);
+
+        // wallpaper
+        self.fx.wallpaper.reset();
+
+        self.prefs_rt.idle_locked = false;
+    }
+
+    /// Run the action bound to a hot corner, if the pointer just entered one.
+    pub fn check_hot_corner(&mut self, pos: Point<f64, Logical>) {
+        let Some(output) = self.space.output_under(pos).next().cloned() else {
+            self.prefs_rt.corner = None;
+            return;
+        };
+        let Some(g) = self.space.output_geometry(&output) else { return };
+        let (l, t) = (g.loc.x as f64, g.loc.y as f64);
+        let (r, b) = (l + g.size.w as f64 - 1.0, t + g.size.h as f64 - 1.0);
+        let near = |a: f64, b: f64| (a - b).abs() <= CORNER_SIZE;
+        let corner = match (near(pos.x, l), near(pos.x, r), near(pos.y, t), near(pos.y, b)) {
+            (true, _, true, _) => Some(Corner::TopLeft),
+            (_, true, true, _) => Some(Corner::TopRight),
+            (true, _, _, true) => Some(Corner::BottomLeft),
+            (_, true, _, true) => Some(Corner::BottomRight),
+            _ => None,
+        };
+        if corner == self.prefs_rt.corner {
+            return;
+        }
+        self.prefs_rt.corner = corner;
+        let Some(corner) = corner else { return };
+        // don't fire while dragging a window or holding a button
+        if self.pointer.is_grabbed() {
+            return;
+        }
+        let hc = &get().desktop.hot_corners;
+        let action = match corner {
+            Corner::TopLeft => hc.top_left,
+            Corner::TopRight => hc.top_right,
+            Corner::BottomLeft => hc.bottom_left,
+            Corner::BottomRight => hc.bottom_right,
+        };
+        let name = match action {
+            CornerAction::None => return,
+            CornerAction::MissionControl => "mission-control",
+            CornerAction::AppExpose => "app-expose",
+            CornerAction::Launcher => "launcher",
+            CornerAction::LockScreen => "lock",
+            CornerAction::Launchpad => "launchpad",
+        };
+        let name = name.to_string();
+        self.handle.insert_idle(move |state| state.run_named_action(&name));
+    }
+
+    /// After every pointer motion: hot corners, focus follows mouse.
+    pub fn after_pointer_motion(&mut self, pos: Point<f64, Logical>) {
+        self.update_fs_reveal(pos);
+        self.fs_reveal_cursor(pos);
+        self.check_hot_corner(pos);
+        if get().windows.focus_follows_mouse {
+            self.focus_under_pointer(pos);
+        }
+    }
+
+    /// Called on every input event.
+    pub fn note_activity(&mut self) {
+        self.prefs_rt.last_activity = std::time::Instant::now();
+        self.prefs_rt.idle_locked = false;
+    }
+
+    /// Periodic timer: start the locker after the configured idle time.
+    pub fn check_idle_lock(&mut self) {
+        let minutes = get().lock.lock_after_minutes;
+        if minutes == 0 || self.prefs_rt.idle_locked || self.is_locked() || !self.protocols.idle_inhibitors.is_empty() {
+            return;
+        }
+        if self.prefs_rt.last_activity.elapsed().as_secs() >= minutes as u64 * 60 {
+            self.prefs_rt.idle_locked = true;
+            tracing::info!("idle for {minutes} min, locking");
+            self.spawn(&locker());
+        }
+    }
+
+    /// Start a 15 s timer that drives the idle lock.
+    pub fn init_settings_timers(&mut self) {
+        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        let res = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(15)), |_, _, state| {
+            state.check_idle_lock();
+            TimeoutAction::ToDuration(std::time::Duration::from_secs(15))
+        });
+        if let Err(e) = res {
+            tracing::warn!("idle timer: {e}");
+        }
+        let res = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(1)), |_, _, state| {
+            state.supervise_shell();
+            TimeoutAction::ToDuration(std::time::Duration::from_secs(1))
+        });
+        if let Err(e) = res {
+            tracing::warn!("shell supervisor timer: {e}");
+        }
+        // Re-apply pointer settings after startup: wireless receivers (Logitech
+        // Lightspeed etc.) can re-create their input devices once the HID++
+        // driver binds, and anything that slipped past DeviceAdded gets fixed here.
+        for secs in [3u64, 10] {
+            let _ = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(secs)), |_, _, state| {
+                let prefs = get().pointer.clone();
+                state.backend_data.apply_input_settings(&prefs);
+                TimeoutAction::Drop
+            });
+        }
+    }
+
+    /// Xwayland is up (or failed / timed out): publish the session environment
+    /// and run the autostart entries. Runs once.
+    pub fn on_session_ready(&mut self) {
+        if self.session_ready {
+            return;
+        }
+        self.session_ready = true;
+        if BackendData::IS_SESSION {
+            crate::session::sync_app_appearance(&get());
+            let mut extra: Vec<(&str, String)> = Vec::new();
+            if let Some(s) = &self.socket_name {
+                extra.push(("WAYLAND_DISPLAY", s.clone()));
+            }
+            #[cfg(feature = "xwayland")]
+            if let Some(d) = self.xdisplay {
+                extra.push(("DISPLAY", format!(":{d}")));
+            }
+            if let Some(p) = &self.ipc.path {
+                extra.push(("ORCHARD_SOCKET", p.display().to_string()));
+            }
+            crate::session::start(crate::session::exported_env(&extra), || {});
+        }
+        self.run_autostart();
+    }
+
+    /// Launch `~/.config/autostart` + `/etc/xdg/autostart` entries (once, at startup).
+    pub fn run_autostart(&self) {
+        if !get().apps.run_autostart || std::env::var_os("ORCHARD_NO_AUTOSTART").is_some() {
+            return;
+        }
+        // programs systemd starts itself as part of graphical-session.target
+        // (e.g. kunifiedpush-distributor): launching them again makes the
+        // second copy fail on its bus name and leaves a failed unit behind
+        let mut systemd_programs = None;
+        for item in orchard_config::desktop::autostart_items() {
+            if !item.entry.autostarts_in_orchard() {
+                continue;
+            }
+            let Some(cmd) = item.entry.command() else { continue };
+            if item.entry.systemd_skip() {
+                let programs = systemd_programs.get_or_insert_with(crate::session::session_unit_programs);
+                if programs.contains(crate::session::program_name(&cmd)) {
+                    tracing::info!("autostart: {cmd} skipped (started by a systemd unit)");
+                    continue;
+                }
+            }
+            tracing::info!("autostart: {cmd}");
+            self.spawn_autostart(&cmd);
+        }
+    }
+}

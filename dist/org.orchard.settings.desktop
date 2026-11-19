@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=System Settings
+Name[de]=Systemeinstellungen
+GenericName=Orchard Settings
+Comment=Appearance, Dock, keyboard, mouse and more for the Orchard desktop
+Exec=orchard-settings %u
+Icon=preferences-system
+Categories=Settings;DesktopSettings;
+Keywords=settings;preferences;dock;appearance;wallpaper;keyboard;mouse;trackpad;
+OnlyShowIn=Orchard;
+StartupWMClass=org.orchard.settings

@@ -1,0 +1,6 @@
+# Lets the udev backend link against runtime-only libinput/libseat (see .devshim/).
+[env]
+PKG_CONFIG_PATH = { value = ".devshim/pkgconfig", relative = true }
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "/home/jakob/projects/orchard/.devshim/lib"]

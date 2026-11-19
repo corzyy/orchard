@@ -1,0 +1,20 @@
+#!/bin/sh
+# Session wrapper for Orchard (selected from SDDM / GDM "Orchard" entry).
+export XDG_CURRENT_DESKTOP=Orchard
+export XDG_SESSION_DESKTOP=orchard
+export XDG_SESSION_TYPE=wayland
+export QT_QPA_PLATFORM="wayland;xcb"
+export QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=auto
+export SDL_VIDEODRIVER=wayland
+export _JAVA_AWT_WM_NONREPARENTING=1
+# NVIDIA: GBM backend + explicit sync are handled by the compositor
+export GBM_BACKEND="${GBM_BACKEND:-nvidia-drm}"
+export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/orchard"
+mkdir -p "$LOG_DIR"
+[ -f "$LOG_DIR/orchard.log" ] && mv -f "$LOG_DIR/orchard.log" "$LOG_DIR/orchard.log.old"
+
+exec /usr/local/bin/orchard --tty >"$LOG_DIR/orchard.log" 2>&1

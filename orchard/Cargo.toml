@@ -1,0 +1,72 @@
+[package]
+name = "orchard"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A macOS-style Wayland compositor built on Smithay (based on Smithay's anvil, MIT)"
+
+[dependencies]
+bitflags = "2.2.1"
+image = { version = "0.25.1", default-features = false, features = ["png", "jpeg", "webp"] }
+rand = "0.8"
+tracing = { version = "0.1.37", features = ["max_level_trace", "release_max_level_debug"] }
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+thiserror = "1"
+xcursor = { version = "0.3.3", optional = true }
+xkbcommon = "0.8.0"
+# display-info is off: Fedora ships libdisplay-info 0.3, the crate wants < 0.3
+smithay-drm-extras = { version = "0.1.0", optional = true, default-features = false }
+profiling = "1.0"
+# wl_display_set_default_max_buffer_size (libwayland >= 1.23; Fedora ships 1.26)
+wayland-backend = { version = "0.3.17", features = ["libwayland_server_1_23"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+wayland-protocols-plasma = { version = "0.3", features = ["server"] }
+orchard-config = { path = "../orchard-config" }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+fontdue = "0.9"
+fps_ticker = { version = "1.0.0", optional = true }
+renderdoc = { version = "0.11.0", optional = true }
+puffin_http = { version = "0.13", optional = true }
+
+[dependencies.smithay]
+version = "0.7.0"
+default-features = false
+features = ["desktop", "wayland_frontend"]
+
+[dependencies.x11rb]
+default-features = false
+features = ["composite"]
+optional = true
+version = "0.13.0"
+
+[features]
+default = ["egl", "winit", "headless", "udev", "xwayland"]
+headless = ["egl", "smithay/renderer_gl"]
+debug = ["fps_ticker", "renderdoc"]
+egl = ["smithay/use_system_lib", "smithay/backend_egl"]
+udev = [
+  "smithay-drm-extras",
+  "smithay/backend_libinput",
+  "smithay/backend_udev",
+  "smithay/backend_drm",
+  "smithay/backend_gbm",
+  "smithay/backend_vulkan",
+  "smithay/backend_egl",
+  "smithay/backend_session_libseat",
+  "smithay/renderer_gl",
+  "smithay/renderer_multi",
+  "xcursor",
+]
+winit = ["smithay/backend_winit", "smithay/backend_drm"]
+x11 = ["smithay/backend_x11", "x11rb", "smithay/renderer_gl", "smithay/backend_vulkan"]
+xwayland = ["smithay/xwayland", "x11rb", "smithay/x11rb_event_source", "xcursor"]
+profile-with-puffin = ["profiling/profile-with-puffin", "puffin_http"]
+profile-with-tracy = ["profiling/profile-with-tracy"]
+profile-with-tracy-mem = ["profile-with-tracy"]
+renderer_sync = []
+
+[dev-dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
