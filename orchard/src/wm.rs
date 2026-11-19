@@ -481,7 +481,12 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if !window.alive() {
             return;
         }
-        let loc = self.space.element_location(window).unwrap_or_default();
+        if window.is_fullscreen() {
+            self.exit_fullscreen_space(window);
+        }
+        let Some(loc) = self.space.element_location(window) else {
+            return;
+        };
         let now = self.clock.now().into();
         self.write_thumbnail(window);
         // into the slot the Dock opens for this window's thumbnail
@@ -504,6 +509,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             .get::<RefCell<Point<i32, Logical>>>()
             .unwrap()
             .borrow_mut() = loc;
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = window.0.x11_surface() {
+            let _ = x11.set_suspended(true);
+        }
         self.space.unmap_elem(window);
         self.minimized.retain(|w| w != window);
         self.minimized.push(window.clone());
@@ -521,6 +530,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         let window = self.minimized.remove(idx);
         let was_hidden = window.decoration_state().hidden;
         window.decoration_state().hidden = false;
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = window.0.x11_surface() {
+            let _ = x11.set_suspended(false);
+        }
         // out of its thumbnail (⌘H-hidden windows have none: from the app icon)
         let target = match self.ipc.dock_window_tiles.get(&window.ipc_id().0).copied() {
             Some(tile) if !was_hidden => self.thumbnail_target(&window, tile),

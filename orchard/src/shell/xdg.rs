@@ -400,6 +400,12 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
         surface.send_pending_configure();
     }
 
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface()) {
+            self.minimize_window(&window);
+        }
+    }
+
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
         let seat: Seat<OrchardState<BackendData>> = Seat::from_resource(&seat).unwrap();
         let kind = PopupKind::Xdg(surface);

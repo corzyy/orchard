@@ -89,13 +89,18 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
             }
             self.space.unmap_elem(&elem)
         }
+        self.minimized
+            .retain(|e| !matches!(e.0.x11_surface(), Some(w) if w == &window));
         if !window.is_override_redirect() {
             let _ = window.set_mapped(false);
             self.focus_topmost();
         }
     }
 
-    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.minimized
+            .retain(|e| !matches!(e.0.x11_surface(), Some(w) if w == &window));
+    }
 
     fn configure_request(
         &mut self,
@@ -210,6 +215,28 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
                 let _ = window.configure(self.space.element_bbox(elem));
                 self.backend_data.reset_buffers(output);
             }
+        }
+    }
+
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let elem = self
+            .space
+            .elements()
+            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
+            .cloned();
+        if let Some(elem) = elem {
+            self.minimize_window(&elem);
+        }
+    }
+
+    fn unminimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        let elem = self
+            .minimized
+            .iter()
+            .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
+            .cloned();
+        if let Some(elem) = elem {
+            self.unminimize(Some(&elem));
         }
     }
 
