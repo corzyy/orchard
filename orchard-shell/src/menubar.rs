@@ -60,7 +60,7 @@ pub struct MenuBar {
     pub tray_items: Vec<crate::tray::TrayItem>,
     /// current window layout mode (Floating / Tiling)
     pub tiling_mode: orchard_config::TilingMode,
-    german: bool,
+    pub german: bool,
 }
 
 impl MenuBar {

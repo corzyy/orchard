@@ -15,6 +15,7 @@ mod globalmenu;
 mod ipc;
 mod launcher;
 mod launchpad;
+mod lowbattery;
 mod menu;
 mod hud;
 mod menubar;
@@ -226,6 +227,7 @@ struct App {
     vol_tx: Sender<Option<(f32, bool)>>,
     vol_pending: Arc<AtomicBool>,
     status_tick: u32,
+    low_battery: lowbattery::Watch,
 
     /// global app menus
     gmenu: Option<globalmenu::GlobalMenu>,
@@ -423,6 +425,7 @@ fn main() {
         vol_tx,
         vol_pending: Arc::new(AtomicBool::new(false)),
         status_tick: 0,
+        low_battery: lowbattery::Watch::default(),
         gmenu,
         menu_addr: None,
         app_menu_ids: Vec::new(),
@@ -473,7 +476,9 @@ fn main() {
             let status_changed = if slow_due {
                 last_slow_poll = Instant::now();
                 app.refresh_apps();
-                app.menubar.refresh_status_with(app.perf.battery_saver)
+                let changed = app.menubar.refresh_status_with(app.perf.battery_saver);
+                app.check_low_battery();
+                changed
             } else {
                 app.menubar.refresh_clock()
             };
@@ -1477,6 +1482,54 @@ impl App {
     fn redraw_icon_surfaces(&mut self) {
         for w in [Which::Switcher, Which::Launcher, Which::Launchpad, Which::Notify, Which::Panel] {
             self.redraw(w);
+        }
+    }
+
+    /// Notify when the computer's or a wireless device's battery runs low.
+    fn check_low_battery(&mut self) {
+        let german = self.menubar.german;
+        let mut notes: Vec<notify::Incoming> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(b) = status::battery() {
+            keys.push("system".into());
+            if let Some(t) = self.low_battery.check("system", b.percent, b.charging, lowbattery::SYSTEM) {
+                let critical = t <= 5;
+                notes.push(low_battery_note(
+                    lowbattery::notification_id("system"),
+                    if german { "Batterie schwach".into() } else { "Low Battery".into() },
+                    if german {
+                        format!("Noch {} %. Schließe den Computer bald an das Stromnetz an.", b.percent)
+                    } else {
+                        format!("{}% remaining. Plug in your computer soon.", b.percent)
+                    },
+                    if critical { "battery-caution" } else { "battery-low" },
+                    critical,
+                ));
+            }
+        }
+        for d in status::device_batteries() {
+            keys.push(d.key.clone());
+            if self.low_battery.check(&d.key, d.percent, d.charging, lowbattery::DEVICE).is_some() {
+                notes.push(low_battery_note(
+                    lowbattery::notification_id(&d.key),
+                    if german { format!("Batterie von „{}“ schwach", d.name) } else { format!("{} Battery Low", d.name) },
+                    if german {
+                        format!("Noch {} %. Lade das Gerät bald auf.", d.percent)
+                    } else {
+                        format!("{}% remaining. Charge it soon.", d.percent)
+                    },
+                    "battery-low",
+                    false,
+                ));
+            }
+        }
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        self.low_battery.retain(&keys);
+        for n in notes {
+            tracing::info!("low battery: {}", n.summary);
+            // a lower level slides in again instead of silently updating the old banner
+            self.notes.remove(n.id);
+            self.on_notification(notify::Msg::Notify(Box::new(n)));
         }
     }
 
@@ -3081,3 +3134,20 @@ impl KeyboardHandler for App {
 }
 delegate_layer!(App);
 delegate_registry!(App);
+
+fn low_battery_note(id: u32, summary: String, body: String, icon: &str, critical: bool) -> notify::Incoming {
+    notify::Incoming {
+        id,
+        app_name: "Orchard".into(),
+        app_icon: icon.into(),
+        summary,
+        body,
+        actions: Vec::new(),
+        desktop_entry: None,
+        image: None,
+        image_path: None,
+        critical,
+        resident: false,
+        timeout_ms: None,
+    }
+}

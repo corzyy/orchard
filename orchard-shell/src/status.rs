@@ -73,22 +73,75 @@ pub struct Battery {
     pub charging: bool,
 }
 
+fn supply_attr(p: &std::path::Path, f: &str) -> Option<String> {
+    std::fs::read_to_string(p.join(f)).ok().map(|s| s.trim().to_string())
+}
+
+/// Percentage of a supply; HID++ / Bluetooth devices sometimes only report a level.
+fn supply_percent(p: &std::path::Path) -> Option<u32> {
+    if let Some(v) = supply_attr(p, "capacity").and_then(|v| v.parse().ok()) {
+        return Some(v);
+    }
+    match supply_attr(p, "capacity_level")?.as_str() {
+        "Critical" => Some(5),
+        "Low" => Some(15),
+        "Normal" => Some(50),
+        "High" => Some(80),
+        "Full" => Some(100),
+        _ => None,
+    }
+}
+
+fn supply_charging(p: &std::path::Path) -> bool {
+    matches!(supply_attr(p, "status").as_deref(), Some("Charging" | "Full"))
+}
+
+/// The computer's own battery. Wireless mice, keyboards and headsets
+/// (`scope = Device`) are not the system battery: a desktop with a wireless
+/// mouse must not look like a laptop running on battery.
 pub fn battery() -> Option<Battery> {
     let rd = std::fs::read_dir("/sys/class/power_supply").ok()?;
-    for e in rd.flatten() {
-        let p = e.path();
-        let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
-        if kind.trim() != "Battery" {
+    let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        if supply_attr(&p, "type").as_deref() != Some("Battery") || supply_attr(&p, "scope").as_deref() == Some("Device") {
             continue;
         }
-        let percent = std::fs::read_to_string(p.join("capacity")).ok()?.trim().parse().ok()?;
-        let status = std::fs::read_to_string(p.join("status")).unwrap_or_default();
-        return Some(Battery {
-            percent,
-            charging: status.trim() == "Charging" || status.trim() == "Full",
-        });
+        let Some(percent) = supply_percent(&p) else { continue };
+        return Some(Battery { percent, charging: supply_charging(&p) });
     }
     None
+}
+
+/// A wireless peripheral's battery (mouse, keyboard, headset, controller).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceBattery {
+    /// stable key (the sysfs name)
+    pub key: String,
+    pub name: String,
+    pub percent: u32,
+    pub charging: bool,
+}
+
+pub fn device_batteries() -> Vec<DeviceBattery> {
+    let Ok(rd) = std::fs::read_dir("/sys/class/power_supply") else { return Vec::new() };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if supply_attr(&p, "type").as_deref() != Some("Battery") || supply_attr(&p, "scope").as_deref() != Some("Device") {
+            continue;
+        }
+        // receivers keep the entry of a switched-off device around
+        if supply_attr(&p, "online").as_deref() == Some("0") {
+            continue;
+        }
+        let Some(percent) = supply_percent(&p) else { continue };
+        let key = e.file_name().to_string_lossy().into_owned();
+        let name = supply_attr(&p, "model_name").filter(|n| !n.is_empty()).unwrap_or_else(|| key.clone());
+        out.push(DeviceBattery { key, name, percent, charging: supply_charging(&p) });
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
