@@ -115,13 +115,13 @@ dist/install.sh --dev     # /usr/local/bin/orchard* -> symlinks into target/rele
 Afterwards, from a terminal inside the Orchard session:
 ```sh
 dist/dev.sh                  # rebuild and apply once
-dist/dev.sh watch            # rebuild and apply on every save (foreground)
+dist/dev.sh watch            # live-reload shaders/settings; Rust waits for `go` (foreground)
 dist/dev.sh start            # run the auto-reloader in the background (stop / status / logs)
 dist/dev.sh install-service  # auto-start the watcher on every Orchard login
 dist/dev.sh reload-shaders   # hot-reload GLSL shaders without rebuilding
-dist/dev.sh hold             # collect changes without building (batch mode)
-dist/dev.sh go               # build + apply the collected batch now
-dist/dev.sh auto             # back to auto: build after 20s without edits (ORCHARD_DEV_QUIET)
+dist/dev.sh go               # build + apply all Rust changes now (= menu bar ▸ Rebuild ▸ Rebuild Desktop)
+dist/dev.sh auto             # opt in to rebuilding automatically 20s after the last edit
+dist/dev.sh manual           # back to the default: Rust is only built when you ask
 ```
 - GLSL shaders (`orchard/src/effects/shaders/*.frag`): hot-reloaded in place via `reload_shaders` IPC without rebuilding.
 - `~/.config/orchard/settings.json`: auto-reloaded by the compositor when edited externally.

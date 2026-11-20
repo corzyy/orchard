@@ -6,6 +6,7 @@
 
 mod apps;
 mod dock;
+mod devbuild;
 mod draw;
 mod globalmenu;
 mod ipc;
@@ -384,6 +385,16 @@ fn main() {
             }
             // X11 apps register their menu some time after mapping
             app.refresh_app_menu();
+            // Rebuild item: pending sources / build state
+            if let Some(dev) = app.menubar.dev.as_mut() {
+                let running = dev.build == devbuild::Build::Running;
+                if running {
+                    app.menubar.dev_spin = app.menubar.dev_spin.wrapping_add(1);
+                }
+                if (running || app.status_tick.is_multiple_of(3)) && (dev.refresh() | running) {
+                    app.redraw(Which::Bar);
+                }
+            }
             TimeoutAction::ToDuration(Duration::from_secs(1))
         })
         .expect("timer");
@@ -1461,6 +1472,7 @@ impl App {
                 Action::Launch("xdg-open https://github.com/Smithay/smithay".into()),
             )],
             BarItem::Control | BarItem::Volume | BarItem::Network => vec![],
+            BarItem::Dev => self.menubar.dev.as_ref().map(|d| d.menu()).unwrap_or_default(),
             BarItem::AppMenu(i) => {
                 let items = match (&self.menu_addr, self.app_menu_ids.get(i as usize), &self.gmenu) {
                     (Some((service, path)), Some(id), Some(g)) => {
@@ -1646,6 +1658,10 @@ impl App {
                     .into_iter()
                     .find(|(i, _, _)| *i == item)
                     .map(|(_, a, _)| a)
+                    .or_else(|| match item {
+                        BarItem::Dev => self.menubar.dev_range(&self.fonts, width).map(|(a, _)| a),
+                        _ => None,
+                    })
                     .unwrap_or_else(|| self.menubar.clock_range(&self.fonts, width).0);
                 let items = self.bar_menu(item);
                 self.open_menu(qh, MenuOwner::Bar(item), Menu::new(items, x, menubar::HEIGHT + 2.0));
@@ -1746,7 +1762,7 @@ impl App {
         if y < menubar::HEIGHT && matches!(self.menu_owner, Some(MenuOwner::Bar(_))) {
             let width = self.output_size.0 as f32;
             if let Some(item) = self.menubar.hit(&self.fonts, x, width) {
-                if !matches!(item, BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network)
+                if !matches!(item, BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Dev)
                     && Some(MenuOwner::Bar(item)) != self.menu_owner
                 {
                     if let PointerEventKind::Motion { .. } = kind {

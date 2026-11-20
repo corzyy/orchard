@@ -11,15 +11,15 @@
 #   dist/dev.sh reload-shaders   hot-reload GLSL shaders immediately (no build)
 #   dist/dev.sh install-service  auto-start the watcher on every Orchard login
 #
-#   Batching (so the desktop isn't rebuilt on every save):
-#   dist/dev.sh hold             collect changes, don't build (shaders/settings stay live)
-#   dist/dev.sh go               build + apply everything collected now, keep holding
-#   dist/dev.sh auto             back to auto mode (and apply anything pending)
-#   dist/dev.sh pending          show what is waiting to be built
+#   Rust code is built only when you ask (manual mode, the default):
+#   dist/dev.sh go               build + apply everything that changed since the last build
+#                                (same as the menu bar's Rebuild item ▸ Rebuild Desktop)
+#   dist/dev.sh auto             opt in: watcher builds after ORCHARD_DEV_QUIET (20) s idle
+#   dist/dev.sh manual           back to manual (alias: hold)
 #
-#   In auto mode a build starts only after ORCHARD_DEV_QUIET seconds without edits
-#   (default 20). Builds run at idle CPU/IO priority on ORCHARD_DEV_JOBS cores
-#   (default: all but 2), so the desktop stays responsive while compiling.
+#   Builds run at idle CPU/IO priority on ORCHARD_DEV_JOBS cores (default: all but 2),
+#   so the desktop stays responsive while compiling. Shaders and settings.json are
+#   always applied live by the watcher, in both modes.
 #
 #   GLSL shaders (*.frag/*.vert)     hot-reloaded in place (~20ms, no build)
 #   settings.json                    hot-reloaded in place via IPC
@@ -40,12 +40,18 @@ LOG_FILE=$STATE_DIR/dev-watch.log
 PID_FILE=$RUNTIME/orchard-dev-watch.pid
 LOCK_FILE=$RUNTIME/orchard-dev-watch.lock
 NESTED_STATE=$RUNTIME/orchard-nested.sock-path
-MODE_FILE=$STATE_DIR/dev-mode          # "hold" or absent (auto)
-PENDING_FILE=$STATE_DIR/dev-pending    # categories collected while holding
+MODE_FILE=$STATE_DIR/dev-mode          # "auto" or absent (manual)
+STATUS_FILE=$STATE_DIR/dev-status      # "building <pid>" / "ok" / "failed", read by the shell
+BUILD_LOG=$STATE_DIR/dev-build.log     # output of the last build (menu bar ▸ Show Build Log)
 BUILD_LOCK=$RUNTIME/orchard-dev-build.lock
 QUIET=${ORCHARD_DEV_QUIET:-20}
 NCPU=$(nproc 2>/dev/null || echo 4)
 JOBS=${ORCHARD_DEV_JOBS:-$(( NCPU > 3 ? NCPU - 2 : 1 ))}
+
+# Spawned from the menu bar the PATH may be the session's minimal one.
+case ":$PATH:" in *":$HOME/.cargo/bin:"*) ;; *) PATH=$HOME/.cargo/bin:$PATH ;; esac
+
+auto_mode() { [ "$(cat "$MODE_FILE" 2>/dev/null)" = auto ]; }
 
 if [ "$(id -u)" = 0 ]; then
     echo "run dist/dev.sh as your user, not root" >&2
@@ -165,7 +171,7 @@ restart_shell() {
         *)
             pkill -x orchard-shell 2>/dev/null || true
             sleep 0.3
-            setsid -f "$BIN/orchard-shell" >/dev/null 2>&1 </dev/null
+            setsid -f "$BIN/orchard-shell" >/dev/null 2>&1 </dev/null 7>&-
             say "menu bar + Dock restarted (by hand)"
             notify "Orchard Shell reloaded" "Menu bar & Dock updated"
             ;;
@@ -183,7 +189,7 @@ restart_settings() {
     page=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 2p)
     pkill -f '(^|/)orchard-settings( |$)' 2>/dev/null || true
     sleep 0.3
-    setsid -f "$BIN/orchard-settings" ${page:+"$page"} >/dev/null 2>&1 </dev/null
+    setsid -f "$BIN/orchard-settings" ${page:+"$page"} >/dev/null 2>&1 </dev/null 7>&-
     say "System Settings reopened"
     notify "System Settings reloaded"
 }
@@ -196,7 +202,7 @@ restart_nested_if_running() {
             [ ! -f "$NESTED_STATE" ] && break
             sleep 0.1
         done
-        setsid -f "$ROOT/dist/nested.sh" run >/dev/null 2>&1 </dev/null
+        setsid -f "$ROOT/dist/nested.sh" run >/dev/null 2>&1 </dev/null 7>&-
         notify "Nested Orchard restarted" "Compositor changes live in nested window"
         return 0
     fi
@@ -235,18 +241,19 @@ build_and_apply() {
         say "building workspace..."
     fi
 
-    local log
-    log=$(mktemp)
+    local log=$BUILD_LOG
+    mkdir -p "$STATE_DIR"
+    echo "building $$" >"$STATUS_FILE"
     # Idle priority: the compositor, shell and your apps always win over rustc.
     if ! nice -n 19 ionice -c 3 cargo "${cargo_args[@]}" >"$log" 2>&1; then
         grep -E -A10 '^error' "$log" | head -60
-        rm -f "$log"
+        echo failed >"$STATUS_FILE"
         warn "build failed; nothing changed on the desktop"
-        notify "Orchard build failed" "Check terminal or 'dist/dev.sh logs'" normal
+        notify "Orchard build failed" "Menu bar ▸ Rebuild ▸ Show Build Log" normal
         return 1
     fi
+    echo ok >"$STATUS_FILE"
     grep -E '^\s*Finished' "$log" || true
-    rm -f "$log"
 
     local changed=0
     [ "$(mtime orchard-shell)" != "$s0" ] && { restart_shell; changed=1; }
@@ -256,14 +263,10 @@ build_and_apply() {
     return 0
 }
 
+# One build at a time, whether started by the watcher or by `go`. The lock lives on
+# fd 7 of a subshell; programs started from it close fd 7 so they never hold it.
 apply_categories() {
-    # One build at a time, whether started by the watcher or by `go`.
-    exec 8>"$BUILD_LOCK"
-    flock 8
-    _apply_categories "$@"
-    local rc=$?
-    flock -u 8
-    return $rc
+    ( flock 7; _apply_categories "$@" ) 7>"$BUILD_LOCK"
 }
 
 _apply_categories() {
@@ -300,7 +303,11 @@ watch_loop() {
     say "  orchard-shell           -> fast rebuild + live restart"
     say "  orchard-settings        -> fast rebuild + live reopen"
     say "  orchard (compositor)    -> fast rebuild + nested auto-restart"
-    say "  Rust builds wait for ${QUIET}s of no edits; 'dist/dev.sh hold' to batch manually"
+    if auto_mode; then
+        say "  Rust: auto, builds after ${QUIET}s without edits ('dist/dev.sh manual' to stop)"
+    else
+        say "  Rust: manual, build with menu bar ▸ Rebuild or 'dist/dev.sh go'"
+    fi
 
     # Python watcher emits space-separated categories whenever files settle.
     python3 -u -I -c '
@@ -309,23 +316,13 @@ import os, sys, time
 root = sys.argv[1]
 quiet = float(sys.argv[2])
 mode_file = sys.argv[3]
-pending_file = sys.argv[4]
 INSTANT = {"shaders", "user_settings"}
 
-def holding():
+def auto():
     try:
-        return open(mode_file).read().strip() == "hold"
+        return open(mode_file).read().strip() == "auto"
     except OSError:
         return False
-
-def stash(cats):
-    try:
-        old = set(open(pending_file).read().split())
-    except OSError:
-        old = set()
-    os.makedirs(os.path.dirname(pending_file), exist_ok=True)
-    with open(pending_file, "w") as f:
-        f.write(" ".join(sorted(old | cats)) + "\n")
 settings_file = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"),
     "orchard",
@@ -401,13 +398,13 @@ while True:
     if instant and idle >= 0.25:
         print(" ".join(sorted(instant)), flush=True)
         pending -= instant
-    if pending and holding() and idle >= 0.25:
-        stash(pending)
+    if pending and not auto():
+        # manual mode: Rust changes wait for `dist/dev.sh go` (the shell shows them)
         pending.clear()
     elif pending and idle >= quiet:
         print(" ".join(sorted(pending)), flush=True)
         pending.clear()
-' "$ROOT" "$QUIET" "$MODE_FILE" "$PENDING_FILE" | while read -r cats; do
+' "$ROOT" "$QUIET" "$MODE_FILE" | while read -r cats; do
         # Coalesce anything that queued up while the previous build ran.
         while read -r -t 0.2 more; do cats="$cats $more"; done
         [ -n "$cats" ] && apply_categories $cats
@@ -467,17 +464,12 @@ status_daemon() {
     return 1
 }
 
-flush_pending() {
-    local cats=""
-    [ -f "$PENDING_FILE" ] && cats=$(cat "$PENDING_FILE")
-    rm -f "$PENDING_FILE"
-    if [ -z "${cats// /}" ]; then
-        say "nothing pending (the watcher may still be waiting ${QUIET}s for edits to settle)"
-        return 0
-    fi
-    say "applying batch: $cats"
-    # shellcheck disable=SC2086
-    apply_categories $cats
+# Build the whole workspace (cargo only recompiles what changed) and apply it.
+rebuild_now() {
+    (
+        flock -n 7 || { warn "a build is already running"; exit 0; }
+        build_and_apply
+    ) 7>"$BUILD_LOCK"
 }
 
 install_service() {
@@ -517,10 +509,10 @@ fi
 
 case "${1:-}" in
     "")
-        build_and_apply
+        rebuild_now
         ;;
     watch)
-        build_and_apply
+        auto_mode && rebuild_now
         watch_loop
         ;;
     _daemon)
@@ -547,23 +539,17 @@ case "${1:-}" in
     reload-shaders)
         reload_shaders
         ;;
-    hold)
-        mkdir -p "$STATE_DIR"
-        echo hold >"$MODE_FILE"
-        say "holding: changes are collected; run 'dist/dev.sh go' to build them"
+    manual|hold)
+        rm -f "$MODE_FILE"
+        say "manual: build with menu bar ▸ Rebuild or 'dist/dev.sh go'"
         ;;
     go|apply)
-        flush_pending
+        rebuild_now
         ;;
     auto)
-        rm -f "$MODE_FILE"
-        say "auto mode: builds start after ${QUIET}s without edits"
-        flush_pending
-        ;;
-    pending)
-        mode=auto; [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE")
-        say "mode: $mode"
-        say "pending: $(cat "$PENDING_FILE" 2>/dev/null || echo none)"
+        mkdir -p "$STATE_DIR"
+        echo auto >"$MODE_FILE"
+        say "auto: the watcher builds after ${QUIET}s without edits"
         ;;
     install-service)
         install_service

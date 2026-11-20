@@ -28,6 +28,8 @@ pub enum BarItem {
     Network,
     /// one of the focused app's own menus (global menu), by index
     AppMenu(u8),
+    /// "Rebuild Desktop" (only when running from a source checkout)
+    Dev,
 }
 
 pub struct MenuBar {
@@ -46,6 +48,10 @@ pub struct MenuBar {
     pub dnd: bool,
     /// titles of the focused app's global menu (empty: Window + Help)
     pub app_menus: Vec<String>,
+    /// source checkout status for the Rebuild item (`None`: hidden)
+    pub dev: Option<crate::devbuild::DevBuild>,
+    /// advances once a second; turns the Rebuild icon while a build runs
+    pub dev_spin: u8,
     german: bool,
 }
 
@@ -62,6 +68,8 @@ impl MenuBar {
             open: None,
             dnd: false,
             app_menus: Vec::new(),
+            dev: crate::devbuild::DevBuild::detect(),
+            dev_spin: 0,
             german: std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false),
         }
     }
@@ -85,7 +93,7 @@ impl MenuBar {
             BarItem::Window => if self.german { "Fenster" } else { "Window" }.into(),
             BarItem::Help => if self.german { "Hilfe" } else { "Help" }.into(),
             BarItem::Clock => self.clock.clone(),
-            BarItem::Control | BarItem::Volume | BarItem::Network => String::new(),
+            BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Dev => String::new(),
             BarItem::AppMenu(i) => self.app_menus.get(i as usize).cloned().unwrap_or_default(),
         }
     }
@@ -145,6 +153,26 @@ impl MenuBar {
         Some((right - 30.0, right - 2.0))
     }
 
+    /// The Rebuild item, left of the other status icons (source checkouts only).
+    pub fn dev_range(&self, fonts: &Fonts, width: f32) -> Option<(f32, f32)> {
+        self.dev.as_ref()?;
+        let right = self
+            .network_range(fonts, width)
+            .or_else(|| self.volume_range(fonts, width))
+            .map(|(a, _)| a)
+            .unwrap_or_else(|| self.control_range(fonts, width).0);
+        Some((right - 30.0, right - 2.0))
+    }
+
+    /// Left edge of the fixed right-side items (DND moon and battery go further left).
+    fn status_left_edge(&self, fonts: &Fonts, width: f32) -> f32 {
+        self.dev_range(fonts, width)
+            .or_else(|| self.network_range(fonts, width))
+            .or_else(|| self.volume_range(fonts, width))
+            .map(|(a, _)| a)
+            .unwrap_or_else(|| self.control_range(fonts, width).0)
+    }
+
     pub fn hit(&self, fonts: &Fonts, x: f32, width: f32) -> Option<BarItem> {
         if let Some((item, _, _)) = self.left_items(fonts).into_iter().find(|(_, a, b)| x >= *a && x < *b) {
             return Some(item);
@@ -165,6 +193,11 @@ impl MenuBar {
         if let Some((a, b)) = self.network_range(fonts, width) {
             if x >= a && x < b {
                 return Some(BarItem::Network);
+            }
+        }
+        if let Some((a, b)) = self.dev_range(fonts, width) {
+            if x >= a && x < b {
+                return Some(BarItem::Dev);
             }
         }
         None
@@ -204,23 +237,36 @@ impl MenuBar {
         }
         draw_control_icon(pm, (cca + ccb) / 2.0 * s, HEIGHT / 2.0 * s, s, theme.bar_text);
 
-        let mut left_edge = cca;
         if let Some((va, vb)) = self.volume_range(fonts, w) {
             if self.open == Some(BarItem::Volume) {
                 fill_rounded(pm, va * s, 3.0 * s, (vb - va) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
             }
             draw_volume(pm, (va + vb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.volume, theme.bar_text);
-            left_edge = va;
         }
         if let Some((na, nb)) = self.network_range(fonts, w) {
             if self.open == Some(BarItem::Network) {
                 fill_rounded(pm, na * s, 3.0 * s, (nb - na) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
             }
             draw_network(pm, (na + nb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.network, theme.bar_text);
-            left_edge = na;
+        }
+        if let (Some((da, db)), Some(dev)) = (self.dev_range(fonts, w), self.dev.as_ref()) {
+            if self.open == Some(BarItem::Dev) {
+                fill_rounded(pm, da * s, 3.0 * s, (db - da) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+            }
+            let running = dev.build == crate::devbuild::Build::Running;
+            let mut c = theme.bar_text;
+            if !running && dev.badge().is_none() {
+                c[3] = (c[3] as u16 * 3 / 5) as u8; // nothing to do: recede
+            }
+            let turn = if running { self.dev_spin as f32 * 45f32.to_radians() } else { 0.0 };
+            let (cx, cy) = ((da + db) / 2.0 * s, HEIGHT / 2.0 * s);
+            draw_rebuild(pm, cx, cy, s, turn, c);
+            if let Some(badge) = dev.badge() {
+                crate::draw::fill_circle(pm, cx + 5.5 * s, cy - 5.0 * s, 2.6 * s, badge);
+            }
         }
 
-        let mut x = left_edge - 4.0;
+        let mut x = self.status_left_edge(fonts, w) - 4.0;
         if self.dnd {
             x -= 22.0;
             crate::panel::moon(pm, (x + 11.0) * s, HEIGHT / 2.0 * s, 6.0 * s, theme.bar_text);
@@ -237,6 +283,44 @@ impl MenuBar {
                 }
             }
         }
+    }
+}
+
+/// Rebuild: a circular arrow (rotated by `turn` radians while building).
+fn draw_rebuild(pm: &mut Pixmap, cx: f32, cy: f32, s: f32, turn: f32, color: [u8; 4]) {
+    let r = 5.6 * s;
+    let st = Stroke {
+        width: 1.5 * s,
+        line_cap: tiny_skia::LineCap::Round,
+        ..Default::default()
+    };
+    let (a0, a1) = (turn + 30f32.to_radians(), turn + 320f32.to_radians());
+    let mut pb = PathBuilder::new();
+    let n = 24;
+    for k in 0..=n {
+        let a = a0 + (a1 - a0) * k as f32 / n as f32;
+        let (px, py) = (cx + r * a.cos(), cy + r * a.sin());
+        if k == 0 {
+            pb.move_to(px, py);
+        } else {
+            pb.line_to(px, py);
+        }
+    }
+    if let Some(p) = pb.finish() {
+        pm.stroke_path(&p, &paint(color), &st, Transform::identity(), None);
+    }
+    // arrowhead at the end of the arc, pointing along it
+    let (ex, ey) = (cx + r * a1.cos(), cy + r * a1.sin());
+    let (tx, ty) = (-a1.sin(), a1.cos()); // tangent (direction of travel)
+    let (nx, ny) = (a1.cos(), a1.sin()); // outward normal
+    let (len, half) = (3.6 * s, 2.9 * s);
+    let mut pb = PathBuilder::new();
+    pb.move_to(ex + tx * len, ey + ty * len);
+    pb.line_to(ex + nx * half, ey + ny * half);
+    pb.line_to(ex - nx * half, ey - ny * half);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        pm.fill_path(&p, &paint(color), FillRule::Winding, Transform::identity(), None);
     }
 }
 
