@@ -56,7 +56,7 @@ dist/           login session files + installer
   - Scrollable, with "Clear All". Click a notification to open it, or hover and click × to remove it.
   - Do Not Disturb silences banners (critical ones still show), shows a moon in the menu bar and is remembered across restarts.
 - **Control Center** (the switches icon left of the clock):
-  - Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`) and Do Not Disturb toggles.
+  - Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`), Do Not Disturb and Night Shift toggles.
   - Display brightness (laptops) and volume sliders, and Now Playing with previous / play-pause / next (`playerctl`).
   - Click outside or press Esc to close.
 - **Lock screen** (`orchard-lock`; ⌃⌘Q, Apple menu → Lock Screen, hot corners, idle lock):
@@ -65,6 +65,9 @@ dist/           login session files + installer
   - On success the lock fades out and the blurred wallpaper dissolves into the desktop.
   - The compositor never draws windows while locked, and only the lock screen gets keys, even from windows that open behind it. If the locker crashes, the session stays locked and Orchard starts a new one. A second locker is refused.
   - **Instead of a login greeter** (`dist/autologin.sh enable`): the PC boots straight into Orchard, which starts at the lock screen (`orchard-session --locked`). The desktop, the menu bar, the Dock and your autostart apps load behind it while you type, so one password brings up a ready desktop. Logging out shows the greeter again; `dist/autologin.sh disable` turns this off. With automatic login, a keyring that PAM would unlock at login (KWallet, GNOME Keyring) is not unlocked.
+- **Night Shift** (System Settings → Displays, or Control Center): warmer display colours on a custom schedule (22:00–07:00 by default), or by hand until the next morning. Switching it off during the schedule holds until the schedule starts again. Fades over about two seconds; a warmth slider picks the colour temperature (5500 K – 2700 K). The compositor multiplies the final image on each display, so it costs one blended quad, needs no gamma ioctls, and never shows up in screenshots or screen sharing. `ORCHARD_NO_NIGHT_SHIFT=1` turns it off.
+- **Shake to locate**: wiggle the mouse quickly and the pointer grows to 3× for a moment (a larger cursor-theme size, not blurry upscaling). Toggle under Accessibility → Pointer.
+- **Low-battery warnings**: notifications at 20 %, 10 % and 5 % (critical) for the computer's battery, and at 15 % and 5 % for wireless mice, keyboards and headsets. Peripheral batteries never count as the computer's battery in the menu bar or for battery saver.
 - **Volume / brightness HUD**: media keys change the volume (`wpctl`), brightness (`brightnessctl`, or DDC/CI via `ddcutil` for external monitors) and playback (`playerctl`).
   - The macOS-style bezel shows the new level in 16 steps.
   - ⇧⌥ + volume/brightness changes in quarter steps.
@@ -181,4 +184,4 @@ Apps started from the Dock or the launcher are spawned by the compositor, so the
 - KDE apps that apply a colour scheme themselves still read it from kdeglobals.
 
 ## System Settings
-`orchard-settings` (Apple menu → System Settings…, or the Dock) edits `~/.config/orchard/settings.json` and then sends `{"request":"reload_settings"}`. The compositor applies the change right away (appearance, corner radius, keyboard layout/repeat, mouse/trackpad, scroll speed, hot corners, focus follows mouse, title-bar double-click, minimize effect, idle lock, display scale, wallpaper) and broadcasts `settings_changed`, so the shell restyles the menu bar and Dock. Choosing Light or Dark also sets `org.gnome.desktop.interface color-scheme`, so GTK/Qt apps follow. Autostart entries (`~/.config/autostart`, `/etc/xdg/autostart`, including the polkit agent) run once at login unless turned off under General.
+`orchard-settings` (Apple menu → System Settings…, or the Dock) edits `~/.config/orchard/settings.json` and then sends `{"request":"reload_settings"}`. It writes back only the fields you changed there, so changes made meanwhile by the Control Center, the menu bar or a text editor are kept, and it picks up outside changes while open. The compositor applies the change right away (appearance, corner radius, keyboard layout/repeat, mouse/trackpad, scroll speed, hot corners, focus follows mouse, title-bar double-click, minimize effect, idle lock, display scale, wallpaper) and broadcasts `settings_changed`, so the shell restyles the menu bar and Dock. Choosing Light or Dark also sets `org.gnome.desktop.interface color-scheme`, so GTK/Qt apps follow. Autostart entries (`~/.config/autostart`, `/etc/xdg/autostart`, including the polkit agent) run once at login unless turned off under General.
