@@ -368,7 +368,15 @@ pub fn run_winit() {
                     locked,
                     lock_surface,
                 };
-                output_elements(&output, space, &mut ctx, elements, renderer, now.into())
+                let (mut els, clear) = output_elements(&output, space, &mut ctx, elements, renderer, now.into());
+                let size = output
+                    .current_mode()
+                    .map(|m| output.current_transform().transform_size(m.size))
+                    .unwrap_or_default();
+                if let Some(el) = ctx.fx.night.element(size, now.into()) {
+                    els.insert(0, crate::render::OutputRenderElements::Night(el));
+                }
+                (els, clear)
             };
             // The live blur's offscreen passes make the context current
             // without a surface; re-binding the window latches a new back

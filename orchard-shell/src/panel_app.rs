@@ -48,6 +48,7 @@ impl App {
         let mut p = Panel::new(kind, anchor);
         if kind == Kind::Control {
             p.control = self.control_cache.clone();
+            p.night_shift = orchard_config::Settings::load().night_shift.active_now();
             if let Some(sub) = submenu {
                 p.standalone = true;
                 p.open_submenu(sub);
@@ -152,6 +153,24 @@ impl App {
         self.redraw(Which::Panel);
     }
 
+    /// Control Center → Night Shift: the compositor fades the tint in/out.
+    pub(crate) fn toggle_night_shift(&mut self) {
+        let mut s = orchard_config::Settings::load();
+        let on = !s.night_shift.active_now();
+        s.night_shift.set_manual_now(on);
+        if let Err(e) = s.save() {
+            tracing::warn!("saving night shift: {e}");
+            return;
+        }
+        if let Some(p) = self.panel.as_mut() {
+            p.night_shift = on;
+        }
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.request("reload_settings", serde_json::json!({}));
+        }
+        self.redraw(Which::Panel);
+    }
+
     pub(crate) fn send_panel_backdrop(&mut self) {
         let Some(p) = self.panel.as_ref() else { return };
         let (x, y, w, h) = p.rect();
@@ -240,6 +259,7 @@ impl App {
                 match target {
                     Target::Panel => {}
                     Target::Dnd => self.toggle_dnd(),
+                    Target::NightShift => self.toggle_night_shift(),
                     Target::ClearAll => {
                         let ids = self.notes.clear_history();
                         if let Some(c) = &self.dbus {

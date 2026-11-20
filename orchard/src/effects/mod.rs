@@ -3,6 +3,7 @@
 pub mod blur;
 pub mod genie;
 pub mod label;
+pub mod night;
 pub mod rounded;
 pub mod snapshot;
 pub mod spring;
@@ -193,6 +194,8 @@ pub struct Effects {
     /// green traffic-light Move & Resize popover
     pub tile_menu: Option<crate::chrome::tile_menu::TileMenu>,
     pub tile_menu_arm: Option<crate::chrome::tile_menu::TileMenuArm>,
+    /// warmer colours at night (drawn by the on-screen render paths only)
+    pub night: night::NightShift,
 }
 
 /// An element id created on first use (`Id` has no `Default`).
@@ -225,6 +228,7 @@ impl Effects {
 impl Effects {
     pub fn is_animating(&self, now: Duration) -> bool {
         self.transients.iter().any(|t| !t.is_done(now))
+            || self.night.is_animating(now)
             || self.unlock_fade.map(|s| now.saturating_sub(s) < UNLOCK_FADE).unwrap_or(false)
             || self.tile_preview_anim.as_ref().map(|(_, s, _)| !s.is_done_at(now)).unwrap_or(false)
             || self

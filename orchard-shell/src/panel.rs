@@ -99,6 +99,7 @@ pub enum Target {
     Card(Hit),
     ClearAll,
     Dnd,
+    NightShift,
     WifiToggle,
     BluetoothToggle,
     OpenSubmenu(Submenu),
@@ -144,6 +145,8 @@ pub struct Panel {
     pub control: ControlState,
     /// slider being dragged
     pub dragging: Option<Target>,
+    /// Night Shift on right now (schedule or manual switch)
+    pub night_shift: bool,
     // filled by paint, used for hit tests
     targets: Vec<((f32, f32, f32, f32), Target)>,
     cards: Vec<CardHit>,
@@ -166,6 +169,7 @@ impl Panel {
             anchor_right,
             control: ControlState::default(),
             dragging: None,
+            night_shift: false,
             targets: Vec::new(),
             cards: Vec::new(),
             panel_rect: (0.0, 0.0, 0.0, 0.0),
@@ -532,19 +536,35 @@ impl Panel {
             }
         }
 
-        // Do Not Disturb card
+        // Do Not Disturb + Night Shift: two stacked cards on the right
         let fx = inner_x + half + pad;
-        fill_rounded(pm, fx * s, y * s, half * s, 110.0 * s, 14.0 * s, card);
-        stroke_rounded(pm, fx * s, y * s, half * s, 110.0 * s, 14.0 * s, 0.75 * s, card_border);
+        let card_h = (110.0 - pad) / 2.0;
         let dnd = center.do_not_disturb;
-        let (cx, cy) = (fx + 24.0, y + 30.0);
-        fill_circle(pm, cx * s, cy * s, 15.0 * s, if dnd { [94, 92, 230, 255] } else { off });
-        moon(pm, cx * s, cy * s, 7.0 * s, if dnd { [255, 255, 255, 255] } else { text });
-        let b1 = fonts.baseline_centered((y + 54.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
-        fonts.draw(pm, t("Do Not Disturb", "Nicht stören"), (fx + 12.0) * s, b1, 12.0 * s, Weight::Bold, text);
-        let b2 = fonts.baseline_centered((y + 72.0) * s, 16.0 * s, 11.0 * s, Weight::Regular);
-        fonts.draw(pm, if dnd { t("On", "Ein") } else { t("Off", "Aus") }, (fx + 12.0) * s, b2, 11.0 * s, Weight::Regular, sub);
-        self.targets.push(((fx, y, half, 110.0), Target::Dnd));
+        let night = self.night_shift;
+        let cards: [(Target, &str, bool, Rgba); 2] = [
+            (Target::Dnd, t("Do Not Disturb", "Nicht stören"), dnd, [94, 92, 230, 255]),
+            (Target::NightShift, "Night Shift", night, [255, 149, 0, 255]),
+        ];
+        for (i, (target, title, on, on_col)) in cards.into_iter().enumerate() {
+            let cy0 = y + i as f32 * (card_h + pad);
+            let hovered = self.hovered(fx, cy0, half, card_h);
+            fill_rounded(pm, fx * s, cy0 * s, half * s, card_h * s, 14.0 * s, if hovered && !on { hover_bg } else { card });
+            stroke_rounded(pm, fx * s, cy0 * s, half * s, card_h * s, 14.0 * s, 0.75 * s, card_border);
+            let (cx, cy) = (fx + 22.0, cy0 + card_h / 2.0);
+            fill_circle(pm, cx * s, cy * s, 14.0 * s, if on { on_col } else { off });
+            let glyph = if on { [255, 255, 255, 255] } else { text };
+            match target {
+                Target::Dnd => moon(pm, cx * s, cy * s, 6.5 * s, glyph),
+                _ => sun(pm, cx * s, cy * s, 6.5 * s, glyph),
+            }
+            let tx = fx + 42.0;
+            let maxw = half - 48.0;
+            let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
+            fonts.draw(pm, &fonts.elide(title, 12.0 * s, Weight::Bold, maxw * s), tx * s, b1, 12.0 * s, Weight::Bold, text);
+            let b2 = fonts.baseline_centered((cy + 1.0) * s, 14.0 * s, 11.0 * s, Weight::Regular);
+            fonts.draw(pm, if on { t("On", "Ein") } else { t("Off", "Aus") }, tx * s, b2, 11.0 * s, Weight::Regular, sub);
+            self.targets.push(((fx, cy0, half, card_h), target));
+        }
 
         // sliders
         let mut y = y + 110.0 + pad;
@@ -1239,6 +1259,26 @@ pub fn moon(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     pb.close();
     if let Some(p) = pb.finish() {
         pm.fill_path(&p, &paint(c), FillRule::EvenOdd, Transform::identity(), None);
+    }
+}
+
+/// A sun: a disc with eight short rays (Night Shift).
+pub fn sun(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    fill_circle(pm, cx, cy, r * 0.5, c);
+    let mut pb = PathBuilder::new();
+    for k in 0..8 {
+        let a = (k as f32 * 45.0).to_radians();
+        let (sa, ca) = a.sin_cos();
+        pb.move_to(cx + ca * r * 0.78, cy + sa * r * 0.78);
+        pb.line_to(cx + ca * r * 1.08, cy + sa * r * 1.08);
+    }
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: r * 0.2,
+            line_cap: LineCap::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
     }
 }
 

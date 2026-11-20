@@ -71,6 +71,7 @@ smithay::backend::renderer::element::render_elements! {
     McWindow=RelocateRenderElement<RescaleRenderElement<WindowRenderElement>>,
     Solid=SolidColorRenderElement,
     Label=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Night=crate::effects::night::NightShiftElement,
 }
 
 /// Layer surfaces of one layer, topmost first. The Dock stays above the

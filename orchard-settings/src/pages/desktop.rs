@@ -3,7 +3,8 @@
 use std::time::Duration;
 
 use orchard_config::{
-    CornerAction, DockAutohide, DockPosition, MinimizeEffect, Settings, TitlebarDoubleClick,
+    CornerAction, DockAutohide, DockPosition, MinimizeEffect, NightShiftSchedule, NightShiftSettings, Settings,
+    TitlebarDoubleClick,
 };
 
 use iced::widget::column;
@@ -404,5 +405,63 @@ pub fn displays(s: &Settings, st: &mut DesktopState, wake: &Wake) -> El {
 
         col = col.push(form::section(o.name.clone())).push(form::group(rows));
     }
-    col.into()
+    col.push(form::section("Night Shift")).push(night_shift(s)).into()
+}
+
+/// Displays → Night Shift (macOS layout: schedule, manual switch, warmth).
+fn night_shift(s: &Settings) -> El {
+    let ns = &s.night_shift;
+    let custom = ns.schedule == NightShiftSchedule::Custom;
+    let mut rows = vec![form::popup_row(
+        "Schedule",
+        some("Shifts the colours of your display to the warmer end of the spectrum after dark"),
+        choices([("off", "Off"), ("custom", "Custom")]),
+        if custom { "custom" } else { "off" },
+        |v| {
+            edit(move |s| {
+                s.night_shift.schedule = if v == "custom" { NightShiftSchedule::Custom } else { NightShiftSchedule::Off };
+                // a manual switch made for the old schedule no longer applies
+                s.night_shift.manual = None;
+            })
+        },
+    )];
+    if custom {
+        let times = || choices((0..48).map(|i| ((i * 30).to_string(), NightShiftSettings::clock(i * 30))));
+        let snap = |m: u32| (m / 30 * 30).to_string();
+        rows.push(form::popup_row("From", None, times(), &snap(ns.from_minute), |v| {
+            edit(move |s| {
+                if let Ok(m) = v.parse() {
+                    s.night_shift.from_minute = m;
+                    s.night_shift.manual = None;
+                }
+            })
+        }));
+        rows.push(form::popup_row("To", None, times(), &snap(ns.to_minute), |v| {
+            edit(move |s| {
+                if let Ok(m) = v.parse() {
+                    s.night_shift.to_minute = m;
+                    s.night_shift.manual = None;
+                }
+            })
+        }));
+    }
+    let on = ns.active_now();
+    let manual_label = if on {
+        format!("On until {}", NightShiftSettings::clock(ns.to_minute))
+    } else {
+        "Turn on until tomorrow".to_string()
+    };
+    rows.push(form::toggle_row("Manual", Some(manual_label), on, |on| {
+        edit(move |s| s.night_shift.set_manual_now(on))
+    }));
+    rows.push(form::slider_row(
+        "Colour temperature",
+        None,
+        0.0..=1.0,
+        ns.warmth as f64,
+        0.05,
+        Some(("Less Warm", "More Warm")),
+        |v| edit(move |s| s.night_shift.warmth = v as f32),
+    ));
+    form::group(rows)
 }

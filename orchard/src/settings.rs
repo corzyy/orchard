@@ -300,6 +300,10 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
 
         self.prefs_rt.idle_locked = false;
+
+        // Night Shift schedule / manual switch / warmth
+        let now: std::time::Duration = self.clock.now().into();
+        self.fx.night.refresh(now);
     }
 
     /// Run the action bound to a hot corner, if the pointer just entered one.
@@ -380,8 +384,12 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
     pub fn init_settings_timers(&mut self) {
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
         refresh_power_source();
+        let now: std::time::Duration = self.clock.now().into();
+        self.fx.night.refresh(now);
         let res = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(15)), |_, _, state| {
             state.check_idle_lock();
+            let now: std::time::Duration = state.clock.now().into();
+            state.fx.night.refresh(now);
             if refresh_power_source() && get().performance.battery_saver {
                 state.fx.blur.invalidate();
                 for output in state.space.outputs().cloned().collect::<Vec<_>>() {

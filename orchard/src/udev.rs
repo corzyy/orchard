@@ -1961,6 +1961,11 @@ fn render_surface(
         .current_mode()
         .map(|m| output.current_transform().transform_size(m.size))
         .unwrap_or_default();
+    // Night Shift tints everything, the cursor included (screenshots and
+    // screen sharing render without it)
+    if let Some(el) = ctx.fx.night.element(output_size, now) {
+        elements.insert(0, OutputRenderElements::Night(el));
+    }
     if let Some(el) = surface.full_damage.element(output_size) {
         elements.insert(0, el);
     }

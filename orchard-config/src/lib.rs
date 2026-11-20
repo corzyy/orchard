@@ -766,6 +766,169 @@ impl PerformanceSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NightShiftSchedule {
+    /// Only the manual switch (Control Center / Settings) turns it on.
+    #[default]
+    Off,
+    /// Every day from `from_minute` to `to_minute` (local time).
+    Custom,
+}
+
+/// A manual Night Shift switch that holds until `until` (Unix seconds), like
+/// macOS's "Turn On Until Tomorrow" / switching it off during the schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NightShiftOverride {
+    pub on: bool,
+    pub until: i64,
+}
+
+/// Warmer display colours at night (macOS Night Shift).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NightShiftSettings {
+    pub schedule: NightShiftSchedule,
+    /// Schedule start, minutes after local midnight.
+    pub from_minute: u32,
+    /// Schedule end, minutes after local midnight (may be before `from_minute`: overnight).
+    pub to_minute: u32,
+    /// 0 = less warm … 1 = more warm.
+    pub warmth: f32,
+    /// Manual switch, ignored once it expires.
+    pub manual: Option<NightShiftOverride>,
+}
+
+impl Default for NightShiftSettings {
+    fn default() -> Self {
+        Self {
+            schedule: NightShiftSchedule::Off,
+            from_minute: 22 * 60,
+            to_minute: 7 * 60,
+            warmth: 0.5,
+            manual: None,
+        }
+    }
+}
+
+const DAY_MINUTES: u32 = 24 * 60;
+
+impl NightShiftSettings {
+    /// Colour temperature (Kelvin) at full strength.
+    pub fn kelvin(&self) -> f32 {
+        5500.0 - self.warmth.clamp(0.0, 1.0) * 2800.0
+    }
+
+    /// Whether the schedule alone wants Night Shift at `minute` (0..1440, local).
+    pub fn scheduled(&self, minute: u32) -> bool {
+        if self.schedule != NightShiftSchedule::Custom {
+            return false;
+        }
+        let (from, to, m) = (self.from_minute % DAY_MINUTES, self.to_minute % DAY_MINUTES, minute % DAY_MINUTES);
+        match from.cmp(&to) {
+            std::cmp::Ordering::Equal => false,
+            std::cmp::Ordering::Less => (from..to).contains(&m),
+            // overnight, e.g. 22:00 → 07:00
+            std::cmp::Ordering::Greater => m >= from || m < to,
+        }
+    }
+
+    /// Whether Night Shift is on at `now` (Unix seconds) / `minute` (local minute of the day).
+    pub fn active(&self, now: i64, minute: u32) -> bool {
+        match self.manual {
+            Some(o) if now < o.until => o.on,
+            _ => self.scheduled(minute),
+        }
+    }
+
+    /// Switch Night Shift on or off by hand. Holds until the schedule would next
+    /// change state anyway: on → the next morning (`to_minute`, 07:00 without a
+    /// schedule); off during the schedule → its next start.
+    pub fn set_manual(&mut self, on: bool, now: i64, minute: u32) {
+        if on == self.scheduled(minute) {
+            // the schedule already does that: just drop the override
+            self.manual = None;
+            return;
+        }
+        let target = if on || self.schedule != NightShiftSchedule::Custom {
+            self.to_minute
+        } else {
+            self.from_minute
+        } % DAY_MINUTES;
+        let minute = minute % DAY_MINUTES;
+        let mut wait = (target + DAY_MINUTES - minute) % DAY_MINUTES;
+        if wait == 0 {
+            wait = DAY_MINUTES;
+        }
+        self.manual = Some(NightShiftOverride { on, until: now + wait as i64 * 60 });
+    }
+
+    /// "HH:MM" for a minute of the day.
+    pub fn clock(minute: u32) -> String {
+        let m = minute % DAY_MINUTES;
+        format!("{:02}:{:02}", m / 60, m % 60)
+    }
+}
+
+/// Current local time: (Unix seconds, minute of the day).
+pub fn local_now() -> (i64, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let t = now as libc::time_t;
+    // SAFETY: localtime_r only writes into the zeroed `tm` we own.
+    let minute = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            0
+        } else {
+            (tm.tm_hour * 60 + tm.tm_min) as u32
+        }
+    };
+    (now, minute)
+}
+
+impl NightShiftSettings {
+    /// Whether Night Shift is on right now.
+    pub fn active_now(&self) -> bool {
+        let (now, minute) = local_now();
+        self.active(now, minute)
+    }
+
+    /// Manual switch at the current local time.
+    pub fn set_manual_now(&mut self, on: bool) {
+        let (now, minute) = local_now();
+        self.set_manual(on, now, minute);
+    }
+}
+
+/// Per-channel multipliers (sRGB, 0..1) for a black-body colour temperature;
+/// 6500 K is neutral. Tanner Helland's fit of the black-body curve, normalised
+/// so 6500 K gives white (the same curve redshift/gammastep follow).
+pub fn kelvin_to_rgb(kelvin: f32) -> [f32; 3] {
+    fn raw(k: f32) -> [f32; 3] {
+        let t = k.clamp(1000.0, 40000.0) / 100.0;
+        let r = if t <= 66.0 { 255.0 } else { 329.698_73 * (t - 60.0).powf(-0.133_204_76) };
+        let g = if t <= 66.0 {
+            99.470_8 * t.ln() - 161.119_57
+        } else {
+            288.122_17 * (t - 60.0).powf(-0.075_514_85)
+        };
+        let b = if t >= 66.0 {
+            255.0
+        } else if t <= 19.0 {
+            0.0
+        } else {
+            138.517_73 * (t - 10.0).ln() - 305.044_8
+        };
+        [r, g, b].map(|c| (c / 255.0).clamp(0.0, 1.0))
+    }
+    let white = raw(6500.0);
+    let c = raw(kelvin);
+    [0, 1, 2].map(|i| (c[i] / white[i]).clamp(0.0, 1.0))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
@@ -781,6 +944,7 @@ pub struct Settings {
     pub displays: DisplaySettings,
     pub apps: AppSettings,
     pub performance: PerformanceSettings,
+    pub night_shift: NightShiftSettings,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -849,6 +1013,37 @@ impl Settings {
         std::fs::write(&tmp, json)?;
         std::fs::rename(tmp, path)
     }
+}
+
+/// Three-way merge for a settings editor that saves a whole `Settings`:
+/// apply only the fields that changed from `base` (what the editor loaded or
+/// last saved) to `mine` (what it holds now) onto `disk` (the file as it is
+/// now). Changes others made meanwhile (the Control Center, the menu bar, a
+/// text editor) survive instead of being reverted by a stale copy.
+pub fn merge_settings(base: &Settings, mine: &Settings, disk: &Settings) -> Settings {
+    use serde_json::Value;
+    fn walk(base: &Value, mine: &Value, out: &mut Value) {
+        match (base, mine, &mut *out) {
+            (Value::Object(b), Value::Object(m), Value::Object(o)) => {
+                for (k, mv) in m {
+                    match (b.get(k), o.get_mut(k)) {
+                        (Some(bv), _) if bv == mv => {}
+                        (Some(bv), Some(ov)) if bv.is_object() && mv.is_object() && ov.is_object() => walk(bv, mv, ov),
+                        _ => {
+                            o.insert(k.clone(), mv.clone());
+                        }
+                    }
+                }
+            }
+            _ => *out = mine.clone(),
+        }
+    }
+    let (Ok(b), Ok(m), Ok(mut d)) = (serde_json::to_value(base), serde_json::to_value(mine), serde_json::to_value(disk))
+    else {
+        return mine.clone();
+    };
+    walk(&b, &m, &mut d);
+    serde_json::from_value(d).unwrap_or_else(|_| mine.clone())
 }
 
 /// Copy `user` onto `root` (which starts as the serialized defaults) one leaf at a time,
@@ -1029,6 +1224,93 @@ mod tests {
         assert_eq!(loaded.appearance.accent, Accent::Wallpaper);
         assert_eq!(loaded.appearance.wallpaper_accent, Some([0xE8, 0x5A, 0x3C]));
         assert_eq!(loaded.appearance.accent_rgb(), [0xE8, 0x5A, 0x3C]);
+    }
+
+    #[test]
+    fn merge_keeps_changes_made_elsewhere() {
+        let base = Settings::default();
+        let mut mine = base.clone();
+        mine.dock.icon_size = 64.0;
+        let mut disk = base.clone();
+        disk.night_shift.warmth = 0.9;
+        disk.windows.tiling_mode = TilingMode::Tiling;
+        let merged = merge_settings(&base, &mine, &disk);
+        assert_eq!(merged.dock.icon_size, 64.0, "my edit applied");
+        assert_eq!(merged.night_shift.warmth, 0.9, "other writer kept");
+        assert_eq!(merged.windows.tiling_mode, TilingMode::Tiling);
+        // both changed the same field: the editor (latest user action) wins
+        disk.dock.icon_size = 40.0;
+        assert_eq!(merge_settings(&base, &mine, &disk).dock.icon_size, 64.0);
+        // map entries merge per key
+        let mut mine = base.clone();
+        mine.displays.scale.insert("DP-1".into(), 1.5);
+        let mut disk = base.clone();
+        disk.displays.scale.insert("HDMI-A-1".into(), 2.0);
+        let merged = merge_settings(&base, &mine, &disk);
+        assert_eq!(merged.displays.scale.len(), 2);
+    }
+
+    #[test]
+    fn night_shift_schedule_wraps_midnight() {
+        let mut n = NightShiftSettings::default();
+        assert!(!n.scheduled(23 * 60), "schedule off by default");
+        n.schedule = NightShiftSchedule::Custom;
+        assert!(n.scheduled(22 * 60));
+        assert!(n.scheduled(23 * 60 + 59));
+        assert!(n.scheduled(0));
+        assert!(n.scheduled(6 * 60 + 59));
+        assert!(!n.scheduled(7 * 60));
+        assert!(!n.scheduled(12 * 60));
+        // daytime range
+        n.from_minute = 9 * 60;
+        n.to_minute = 17 * 60;
+        assert!(n.scheduled(12 * 60));
+        assert!(!n.scheduled(20 * 60));
+        n.to_minute = n.from_minute;
+        assert!(!n.scheduled(9 * 60), "empty range never runs");
+    }
+
+    #[test]
+    fn night_shift_manual_override_expires_at_the_next_boundary() {
+        let mut n = NightShiftSettings { schedule: NightShiftSchedule::Custom, ..Default::default() };
+        let noon = 12 * 60;
+        let t0 = 1_000_000;
+        // on at noon: holds until 07:00 tomorrow (19 h)
+        n.set_manual(true, t0, noon);
+        assert!(n.active(t0, noon));
+        assert_eq!(n.manual.unwrap().until, t0 + 19 * 3600);
+        assert!(!n.active(t0 + 19 * 3600, 7 * 60), "back to the schedule in the morning");
+
+        // off at 23:00 inside the schedule: off until 22:00 the next day
+        let late = 23 * 60;
+        n.set_manual(false, t0, late);
+        assert!(!n.active(t0, late));
+        assert_eq!(n.manual.unwrap().until, t0 + 23 * 3600);
+
+        // asking for what the schedule does anyway clears the override
+        n.set_manual(true, t0, late);
+        assert_eq!(n.manual, None);
+        assert!(n.active(t0, late));
+
+        // no schedule: "on until tomorrow" morning
+        let mut n = NightShiftSettings::default();
+        n.set_manual(true, t0, 20 * 60);
+        assert_eq!(n.manual.unwrap().until, t0 + 11 * 3600);
+        n.set_manual(false, t0, 20 * 60);
+        assert_eq!(n.manual, None);
+        assert!(!n.active(t0, 20 * 60));
+    }
+
+    #[test]
+    fn kelvin_curve_is_neutral_at_6500_and_warm_below() {
+        let w = kelvin_to_rgb(6500.0);
+        assert!(w.iter().all(|c| (c - 1.0).abs() < 1e-4), "{w:?}");
+        let [r, g, b] = kelvin_to_rgb(3400.0);
+        assert!((r - 1.0).abs() < 1e-4);
+        assert!(g < 0.85 && g > 0.65, "{g}");
+        assert!(b < g && b > 0.35, "{b}");
+        let n = NightShiftSettings::default();
+        assert!((2700.0..=5500.0).contains(&n.kelvin()));
     }
 
     #[test]

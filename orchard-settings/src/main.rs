@@ -150,10 +150,14 @@ impl App {
         if self.settings == self.saved {
             return;
         }
-        if let Err(e) = self.settings.save() {
+        // only write what was changed here: the Control Center, the menu bar
+        // or an editor may have changed other fields since we loaded the file
+        let merged = orchard_config::merge_settings(&self.saved, &self.settings, &Settings::load());
+        if let Err(e) = merged.save() {
             eprintln!("orchard-settings: save failed: {e}");
             return;
         }
+        self.settings = merged;
         self.saved = self.settings.clone();
         let reply = orchard_config::ipc_request(&serde_json::json!({"request": "reload_settings"}));
         self.compositor_live = Some(matches!(reply, Ok(ref v) if v["event"] == "ok"));
@@ -181,7 +185,19 @@ impl App {
                 f(&mut self.settings, self.st.get_mut(), &self.wake);
                 self.poll()
             }
-            Message::Wake | Message::Tick => self.poll(),
+            Message::Wake => self.poll(),
+            Message::Tick => {
+                // pick up changes made elsewhere while nothing is waiting to be saved
+                if self.settings == self.saved {
+                    let disk = Settings::load();
+                    if disk != self.saved {
+                        self.settings = disk.clone();
+                        self.saved = disk;
+                        self.update_theme();
+                    }
+                }
+                self.poll()
+            }
             Message::Save(serial) => {
                 if serial == self.save_serial {
                     self.save_now();
