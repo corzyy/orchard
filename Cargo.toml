@@ -11,3 +11,8 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Incremental release builds: dist/dev.sh rebuilds only what changed instead of
+# recompiling a whole crate from scratch on every edit.
+[profile.release]
+incremental = true

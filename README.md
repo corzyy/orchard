@@ -119,6 +119,9 @@ dist/dev.sh watch            # rebuild and apply on every save (foreground)
 dist/dev.sh start            # run the auto-reloader in the background (stop / status / logs)
 dist/dev.sh install-service  # auto-start the watcher on every Orchard login
 dist/dev.sh reload-shaders   # hot-reload GLSL shaders without rebuilding
+dist/dev.sh hold             # collect changes without building (batch mode)
+dist/dev.sh go               # build + apply the collected batch now
+dist/dev.sh auto             # back to auto: build after 20s without edits (ORCHARD_DEV_QUIET)
 ```
 - GLSL shaders (`orchard/src/effects/shaders/*.frag`): hot-reloaded in place via `reload_shaders` IPC without rebuilding.
 - `~/.config/orchard/settings.json`: auto-reloaded by the compositor when edited externally.
