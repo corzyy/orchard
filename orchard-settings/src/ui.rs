@@ -65,7 +65,40 @@ pub struct PopupMenu {
     pub options: Vec<(String, String)>,
     pub current: String,
     pub scroll: f32,
+    /// Highlighted row (pointer hover or arrow keys).
+    pub highlight: Option<usize>,
+    /// Pointer position when the highlight was last taken from the pointer, so
+    /// arrow keys aren't overridden by a pointer that hasn't moved.
+    pub last_ptr: (f32, f32),
+    /// Set on the frame the menu opened: the click that opened it must not
+    /// also count as a click outside the menu (which closed it instantly).
+    pub just_opened: bool,
+    /// Position the menu over the button on first layout (macOS style).
+    pub placed: Option<Rect>,
 }
+
+impl PopupMenu {
+    /// Arrow-key navigation.
+    pub fn step(&mut self, delta: i32) {
+        let n = self.options.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let cur = self
+            .highlight
+            .map(|h| h as i32)
+            .or_else(|| self.options.iter().position(|(k, _)| *k == self.current).map(|i| i as i32))
+            .unwrap_or(if delta > 0 { -1 } else { n });
+        self.highlight = Some((cur + delta).clamp(0, n - 1) as usize);
+    }
+
+    pub fn chosen(&self) -> Option<String> {
+        self.highlight.and_then(|h| self.options.get(h)).map(|(k, _)| k.clone())
+    }
+}
+
+pub const POPUP_ITEM_H: f32 = 24.0;
+pub const POPUP_PAD: f32 = 5.0;
 
 /// Persistent interaction state across frames.
 #[derive(Default)]
@@ -684,6 +717,10 @@ impl<'a> Ui<'a> {
                 options: options.to_vec(),
                 current: current.to_string(),
                 scroll: 0.0,
+                highlight: None,
+                last_ptr: self.st.pointer,
+                just_opened: true,
+                placed: None,
             });
         }
         self.st.take_popup_result(id)
@@ -806,55 +843,65 @@ impl<'a> Ui<'a> {
         if self.dry_run {
             return;
         }
-        let Some(popup) = self.st.open_popup.clone() else {
+        let Some(mut popup) = self.st.open_popup.take() else {
             return;
         };
         self.clip = None;
         self.block_input = false;
 
-        let item_h = 26.0f32;
-        let pad = 5.0f32;
-        let max_label = popup
-            .options
-            .iter()
-            .map(|(_, l)| self.fonts.measure(l, 12.5, Weight::Regular))
-            .fold(0.0f32, f32::max);
-        let menu_w = (max_label + 40.0).max(popup.anchor.w).clamp(130.0, 320.0);
-        let total_h = popup.options.len() as f32 * item_h + pad * 2.0;
-        let max_h = (self.win_h - 32.0).min(340.0);
-        let menu_h = total_h.min(max_h);
+        let item_h = POPUP_ITEM_H;
+        let pad = POPUP_PAD;
+        let n = popup.options.len();
+        let total_h = n as f32 * item_h + pad * 2.0;
+        let menu_h = total_h.min(self.win_h - 16.0);
+        let max_scroll = (total_h - menu_h).max(0.0);
 
-        let mut mx = popup.anchor.right() - menu_w;
-        if mx < 12.0 {
-            mx = 12.0;
-        }
-        if mx + menu_w > self.win_w - 12.0 {
-            mx = self.win_w - 12.0 - menu_w;
-        }
-        let mut my = popup.anchor.bottom() + 4.0;
-        if my + menu_h > self.win_h - 12.0 {
-            my = (popup.anchor.y - menu_h - 4.0).max(12.0);
-        }
-        let menu_r = Rect::new(mx, my, menu_w, menu_h);
+        let menu_r = match popup.placed {
+            Some(r) => r,
+            None => {
+                // Like a macOS pop-up button: the menu covers the button with
+                // the selected item's text exactly over the button's label.
+                let max_label = popup
+                    .options
+                    .iter()
+                    .map(|(_, l)| self.fonts.measure(l, 13.0, Weight::Regular))
+                    .fold(0.0f32, f32::max);
+                let a = popup.anchor;
+                let mx = a.x + 8.0 - pad - 22.0;
+                let menu_w = (max_label + 22.0 + 28.0 + pad * 2.0).max(a.w + 30.0).min(self.win_w - 16.0);
+                let mx = mx.min(self.win_w - 8.0 - menu_w).max(8.0);
+                let cur = popup.options.iter().position(|(k, _)| *k == popup.current).unwrap_or(0);
+                let item_top = pad + cur as f32 * item_h;
+                let mut my = a.cy() - item_top - item_h * 0.5;
+                // Too tall to fit there: clamp into the window and scroll so
+                // the current item still lands under the pointer if possible.
+                let lo = 8.0;
+                let hi = self.win_h - 8.0 - menu_h;
+                if my < lo {
+                    popup.scroll = (lo - my).min(max_scroll);
+                    my = lo;
+                } else if my > hi {
+                    my = hi.max(lo);
+                }
+                let r = Rect::new(mx, my, menu_w, menu_h);
+                popup.placed = Some(r);
+                r
+            }
+        };
 
-        // Soft drop shadow
-        self.fill_rect(
-            Rect::new(menu_r.x - 2.0, menu_r.y + 4.0, menu_r.w + 4.0, menu_r.h + 4.0),
-            10.0,
-            [0, 0, 0, if self.pal.dark { 110 } else { 42 }],
-        );
-        self.fill_rect(menu_r, 8.0, self.pal.menu);
-        self.stroke_rect(menu_r, 8.0, 1.0, self.pal.control_border);
+        // Shadow, body, hairline.
+        let shadow = if self.pal.dark { 90 } else { 30 };
+        self.fill_rect(Rect::new(menu_r.x - 1.0, menu_r.y + 3.0, menu_r.w + 2.0, menu_r.h + 6.0), 11.0, [0, 0, 0, shadow / 2]);
+        self.fill_rect(Rect::new(menu_r.x, menu_r.y + 1.0, menu_r.w, menu_r.h + 2.0), 10.0, [0, 0, 0, shadow]);
+        self.fill_rect(menu_r, 9.0, self.pal.menu);
+        self.stroke_rect(menu_r, 9.0, 1.0, self.pal.control_border);
 
         let inner = Rect::new(menu_r.x + pad, menu_r.y + pad, menu_r.w - pad * 2.0, menu_r.h - pad * 2.0);
+        popup.scroll = popup.scroll.clamp(0.0, max_scroll);
+        let scroll = popup.scroll;
+
+        let moved = popup.last_ptr != self.st.pointer;
         self.clip = Some(inner);
-
-        let max_scroll = (total_h - menu_h).max(0.0);
-        let scroll = popup.scroll.clamp(0.0, max_scroll);
-        if let Some(p) = self.st.open_popup.as_mut() {
-            p.scroll = scroll;
-        }
-
         let mut chosen: Option<String> = None;
         for (i, (key, label)) in popup.options.iter().enumerate() {
             let iy = inner.y + i as f32 * item_h - scroll;
@@ -862,8 +909,11 @@ impl<'a> Ui<'a> {
             if !ir.intersects_y(inner.y, inner.bottom()) {
                 continue;
             }
-            let hov = self.hovered(ir);
-            let fg = if hov {
+            if self.hovered(ir) && (moved || popup.just_opened) {
+                popup.highlight = Some(i);
+            }
+            let hl = popup.highlight == Some(i);
+            let fg = if hl {
                 self.fill_rect(ir, 5.0, self.pal.accent);
                 [255, 255, 255, 255]
             } else {
@@ -872,18 +922,34 @@ impl<'a> Ui<'a> {
             if key == &popup.current {
                 self.checkmark(ir.x + 11.0, ir.cy(), fg);
             }
-            self.text_elided(label, ir.x + 24.0, ir.cy(), ir.w - 30.0, 12.5, Weight::Regular, fg);
-            if self.clicked(ir) {
+            self.text_elided(label, ir.x + 22.0, ir.cy(), ir.w - 28.0, 13.0, Weight::Regular, fg);
+            if !popup.just_opened && self.clicked(ir) {
                 chosen = Some(key.clone());
             }
         }
         self.clip = None;
+        popup.last_ptr = self.st.pointer;
+
+        // Keep the keyboard highlight scrolled into view.
+        if let Some(h) = popup.highlight {
+            let top = h as f32 * item_h;
+            if top < popup.scroll {
+                popup.scroll = top;
+            } else if top + item_h > popup.scroll + inner.h {
+                popup.scroll = (top + item_h - inner.h).min(max_scroll);
+            }
+        }
 
         if let Some(val) = chosen {
             self.st.popup_result = Some((popup.id, val));
-            self.st.open_popup = None;
-        } else if self.st.clicked && !menu_r.contains(self.st.pointer.0, self.st.pointer.1) {
-            self.st.open_popup = None;
+        } else if !popup.just_opened
+            && self.st.clicked
+            && !menu_r.contains(self.st.pointer.0, self.st.pointer.1)
+        {
+            // Click outside: dismiss.
+        } else {
+            popup.just_opened = false;
+            self.st.open_popup = Some(popup);
         }
     }
 }

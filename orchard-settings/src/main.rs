@@ -685,12 +685,25 @@ impl KeyboardHandler for App {
             self.request_redraw();
             return;
         }
-        if ev.keysym == Keysym::Escape {
-            if self.ui_state.open_popup.is_some() {
-                self.ui_state.open_popup = None;
-                self.request_redraw();
-                return;
+        if let Some(p) = self.ui_state.open_popup.as_mut() {
+            match ev.keysym {
+                Keysym::Escape => self.ui_state.open_popup = None,
+                Keysym::Up => p.step(-1),
+                Keysym::Down => p.step(1),
+                Keysym::Home => p.highlight = Some(0),
+                Keysym::End => p.highlight = Some(p.options.len().saturating_sub(1)),
+                Keysym::Return | Keysym::KP_Enter | Keysym::space => {
+                    if let Some(v) = p.chosen() {
+                        self.ui_state.popup_result = Some((p.id, v));
+                    }
+                    self.ui_state.open_popup = None;
+                }
+                _ => {}
             }
+            self.request_redraw();
+            return;
+        }
+        if ev.keysym == Keysym::Escape {
             if self.ui_state.focused_input.is_some() {
                 self.ui_state.text_events.push(TextEvent::Escape);
                 self.request_redraw();
@@ -816,4 +829,5 @@ delegate_pointer!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 delegate_registry!(App);
+
 
