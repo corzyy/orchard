@@ -8,6 +8,8 @@ mod network;
 mod power;
 mod sound;
 
+pub use general::{load_about, AboutInfo};
+
 use eframe::egui::{self, vec2, Sense, TextureHandle, Ui};
 use orchard_config::Settings;
 

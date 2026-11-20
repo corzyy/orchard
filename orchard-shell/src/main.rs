@@ -1385,7 +1385,10 @@ impl App {
         let t = |en: &str, de_s: &str| if de { de_s.to_string() } else { en.to_string() };
         match item {
             BarItem::Logo => vec![
-                MenuItem::new(t("About This Computer", "Über diesen Computer"), Action::Launch("kinfocenter".into())),
+                MenuItem::new(
+                    t("About This Device", "Über dieses Gerät"),
+                    Action::Launch("orchard-settings --about-device || kinfocenter".into()),
+                ),
                 MenuItem::separator(),
                 MenuItem::new(t("System Settings…", "Systemeinstellungen …"), Action::Launch("orchard-settings || systemsettings".into())),
                 MenuItem::separator(),

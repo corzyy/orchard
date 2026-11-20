@@ -56,16 +56,16 @@ pub fn general(ui: &mut Ui, cx: &mut Cx) {
 // ---------------------------------------------------------------- About
 
 #[derive(Clone, Default)]
-struct AboutInfo {
-    hostname: String,
-    os: String,
-    kernel: String,
-    model: String,
-    chassis: String,
-    cpu: String,
-    gpus: Vec<String>,
-    memory: String,
-    uptime: String,
+pub struct AboutInfo {
+    pub hostname: String,
+    pub os: String,
+    pub kernel: String,
+    pub model: String,
+    pub chassis: String,
+    pub cpu: String,
+    pub gpus: Vec<String>,
+    pub memory: String,
+    pub uptime: String,
 }
 
 fn gib(bytes: f64) -> String {
@@ -77,7 +77,7 @@ fn gib(bytes: f64) -> String {
     }
 }
 
-fn load_about() -> AboutInfo {
+pub fn load_about() -> AboutInfo {
     let mut a = AboutInfo::default();
     if let Some(j) = output("hostnamectl", &["--json=short"]).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
         let s = |k: &str| j[k].as_str().unwrap_or_default().to_string();
@@ -86,6 +86,14 @@ fn load_about() -> AboutInfo {
         a.kernel = s("KernelRelease");
         a.chassis = s("Chassis");
         a.model = format!("{} {}", s("HardwareVendor"), s("HardwareModel")).trim().to_string();
+    }
+    if a.hostname.is_empty() {
+        a.hostname = read_trim("/etc/hostname")
+            .or_else(|| output("uname", &["-n"]).map(|s| s.trim().to_string()))
+            .unwrap_or_default();
+    }
+    if a.kernel.is_empty() {
+        a.kernel = output("uname", &["-r"]).map(|s| s.trim().to_string()).unwrap_or_default();
     }
     if a.os.is_empty() {
         a.os = std::fs::read_to_string("/etc/os-release")

@@ -5,6 +5,7 @@
 //! (Wi‑Fi, Bluetooth, sound, time, …) go through the usual Linux tools:
 //! nmcli, bluetoothctl, pactl, timedatectl, xdg-mime.
 
+mod about_window;
 mod icons;
 mod pages;
 mod style;
@@ -364,8 +365,8 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl App {
+    fn update_ui(&mut self, ctx: &egui::Context) {
         self.restyle(ctx);
         let p = pal();
         let start_page = self.page;
@@ -472,6 +473,12 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_ui(ctx);
+    }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if self.settings != self.saved {
@@ -480,7 +487,125 @@ impl eframe::App for App {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_app(ctx: &egui::Context) -> App {
+        style::install_fonts(ctx);
+        let settings = Settings::default();
+        App {
+            saved: settings.clone(),
+            settings,
+            dirty_at: None,
+            page: Appearance,
+            back: Vec::new(),
+            forward: Vec::new(),
+            search: String::new(),
+            icons: Icons::default(),
+            styled: None,
+            last_dark_check: Instant::now() - Duration::from_secs(10),
+            st: pages::State::default(),
+            compositor_live: None,
+        }
+    }
+
+    fn raw(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 660.0))),
+            time: Some(time),
+            events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn probe_page_switch_frames() {
+        let ctx = egui::Context::default();
+        let mut app = make_app(&ctx);
+        let mut t = 1.0;
+
+        // Warmup 3 frames
+        for _ in 0..3 {
+            let _ = ctx.run(raw(t, vec![]), |c| app.update_ui(c));
+            t += 0.016;
+        }
+
+        // Click Desktop & Dock in sidebar (rough y positions for sidebar items)
+        for y in [220.0_f32, 260.0, 300.0, 340.0, 380.0, 420.0, 460.0] {
+            let pos = pos2(100.0, y);
+            let before_page = app.page;
+            let _ = ctx.run(
+                raw(
+                    t,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                ),
+                |c| app.update_ui(c),
+            );
+            t += 0.016;
+            let click_out = ctx.run(
+                raw(
+                    t,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    }],
+                ),
+                |c| app.update_ui(c),
+            );
+            t += 0.016;
+            let next_out = ctx.run(raw(t, vec![]), |c| app.update_ui(c));
+            t += 0.016;
+            let next2_out = ctx.run(raw(t, vec![]), |c| app.update_ui(c));
+            t += 0.016;
+
+            println!(
+                "y={y}: {:?} -> {:?} | passes={} | shapes: click={} next={} next2={} | click==next: {} | next==next2: {}",
+                before_page,
+                app.page,
+                click_out.platform_output.num_completed_passes,
+                click_out.shapes.len(),
+                next_out.shapes.len(),
+                next2_out.shapes.len(),
+                click_out.shapes == next_out.shapes,
+                next_out.shapes == next2_out.shapes,
+            );
+            if click_out.shapes != next_out.shapes {
+                let min_len = click_out.shapes.len().min(next_out.shapes.len());
+                let mut diffs = 0;
+                for i in 0..min_len {
+                    if click_out.shapes[i] != next_out.shapes[i] {
+                        if diffs < 5 {
+                            println!("  diff shape[{i}]:");
+                            println!("    click: clip={:?} shape={:?}", click_out.shapes[i].clip_rect, format!("{:?}", click_out.shapes[i].shape).chars().take(120).collect::<String>());
+                            println!("    next : clip={:?} shape={:?}", next_out.shapes[i].clip_rect, format!("{:?}", next_out.shapes[i].shape).chars().take(120).collect::<String>());
+                        }
+                        diffs += 1;
+                    }
+                }
+                println!("  total differing indices: {diffs}, len diff: {} vs {}", click_out.shapes.len(), next_out.shapes.len());
+            }
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--about-device" | "--about" | "about-device")
+    ) {
+        return about_window::run();
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("System Settings")
