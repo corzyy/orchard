@@ -30,6 +30,8 @@ pub enum BarItem {
     AppMenu(u8),
     /// "Rebuild Desktop" (only when running from a source checkout)
     Dev,
+    /// System tray icon (index into `visible_tray_indices`)
+    Tray(usize),
 }
 
 pub struct MenuBar {
@@ -52,6 +54,8 @@ pub struct MenuBar {
     pub dev: Option<crate::devbuild::DevBuild>,
     /// advances once a second; turns the Rebuild icon while a build runs
     pub dev_spin: u8,
+    /// system tray items (StatusNotifierItem)
+    pub tray_items: Vec<crate::tray::TrayItem>,
     german: bool,
 }
 
@@ -70,15 +74,40 @@ impl MenuBar {
             app_menus: Vec::new(),
             dev: crate::devbuild::DevBuild::detect(),
             dev_spin: 0,
+            tray_items: Vec::new(),
             german: std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false),
+        }
+    }
+
+    /// Refresh only the clock text. Returns true if it changed.
+    pub fn refresh_clock(&mut self) -> bool {
+        let clock = status::clock_text(&self.cfg);
+        if clock != self.clock {
+            self.clock = clock;
+            true
+        } else {
+            false
         }
     }
 
     /// Refresh clock / battery / network. Returns true if anything changed.
     pub fn refresh_status(&mut self) -> bool {
+        self.refresh_status_with(false)
+    }
+
+    /// Refresh clock, plus battery/network only when shown (or needed for battery-saver).
+    pub fn refresh_status_with(&mut self, need_battery: bool) -> bool {
         let clock = status::clock_text(&self.cfg);
-        let battery = status::battery();
-        let network = status::network();
+        let battery = if self.cfg.show_battery || need_battery {
+            status::battery()
+        } else {
+            self.battery.clone()
+        };
+        let network = if self.cfg.show_network {
+            status::network()
+        } else {
+            self.network
+        };
         let changed = clock != self.clock || battery != self.battery || network != self.network;
         self.clock = clock;
         self.battery = battery;
@@ -93,7 +122,7 @@ impl MenuBar {
             BarItem::Window => if self.german { "Fenster" } else { "Window" }.into(),
             BarItem::Help => if self.german { "Hilfe" } else { "Help" }.into(),
             BarItem::Clock => self.clock.clone(),
-            BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Dev => String::new(),
+            BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Dev | BarItem::Tray(_) => String::new(),
             BarItem::AppMenu(i) => self.app_menus.get(i as usize).cloned().unwrap_or_default(),
         }
     }
@@ -173,6 +202,44 @@ impl MenuBar {
             .unwrap_or_else(|| self.control_range(fonts, width).0)
     }
 
+    /// Left edge after DND moon and battery (system tray icons sit to the left of this).
+    fn tray_right_edge(&self, fonts: &Fonts, width: f32) -> f32 {
+        let mut x = self.status_left_edge(fonts, width) - 4.0;
+        if self.dnd {
+            x -= 22.0;
+        }
+        if self.cfg.show_battery {
+            if let Some(b) = &self.battery {
+                x -= 30.0;
+                if self.cfg.battery_percentage {
+                    let label = format!("{}%", b.percent);
+                    let lw = fonts.measure(&label, 12.0, Weight::Regular);
+                    x -= lw + 6.0;
+                }
+            }
+        }
+        x - 4.0
+    }
+
+    /// `(tray_items_index, x0, x1)` for each visible system tray item, right-to-left.
+    pub fn tray_ranges(&self, fonts: &Fonts, width: f32) -> Vec<(usize, f32, f32)> {
+        let mut x = self.tray_right_edge(fonts, width);
+        let min_x = self.left_items(fonts).last().map(|(_, _, b)| *b + 12.0).unwrap_or(120.0);
+        let mut out = Vec::new();
+        for (i, item) in self.tray_items.iter().enumerate() {
+            if !item.visible() {
+                continue;
+            }
+            let x0 = x - 24.0;
+            if x0 < min_x {
+                break;
+            }
+            out.push((i, x0, x - 2.0));
+            x = x0;
+        }
+        out
+    }
+
     pub fn hit(&self, fonts: &Fonts, x: f32, width: f32) -> Option<BarItem> {
         if let Some((item, _, _)) = self.left_items(fonts).into_iter().find(|(_, a, b)| x >= *a && x < *b) {
             return Some(item);
@@ -200,10 +267,15 @@ impl MenuBar {
                 return Some(BarItem::Dev);
             }
         }
+        for (idx, a, b) in self.tray_ranges(fonts, width) {
+            if x >= a && x < b {
+                return Some(BarItem::Tray(idx));
+            }
+        }
         None
     }
 
-    pub fn paint(&self, pm: &mut Pixmap, scale: f32, fonts: &Fonts, theme: &Theme) {
+    pub fn paint(&self, pm: &mut Pixmap, scale: f32, fonts: &Fonts, apps: &crate::apps::Apps, theme: &Theme) {
         let s = scale;
         let w = pm.width() as f32 / s;
         // tint over the compositor's frosted backdrop
@@ -283,7 +355,61 @@ impl MenuBar {
                 }
             }
         }
+
+        // System tray icons (StatusNotifierItem)
+        let icon_px = (16.0 * s).round().max(16.0);
+        for (idx, a, b) in self.tray_ranges(fonts, w) {
+            if self.open == Some(BarItem::Tray(idx)) {
+                fill_rounded(pm, a * s, 3.0 * s, (b - a) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+            }
+            let Some(item) = self.tray_items.get(idx) else { continue };
+            let cx = ((a + b) * 0.5) * s;
+            let cy = (HEIGHT * 0.5) * s;
+            let drew = draw_tray_icon(pm, item, apps, cx, cy, icon_px);
+            if !drew {
+                // Fallback dot if no icon could be loaded
+                crate::draw::fill_circle(pm, cx, cy, 4.5 * s, theme.bar_text);
+            }
+        }
     }
+}
+
+fn draw_tray_icon(
+    pm: &mut Pixmap,
+    item: &crate::tray::TrayItem,
+    apps: &crate::apps::Apps,
+    cx: f32,
+    cy: f32,
+    target_px: f32,
+) -> bool {
+    let draw_src = |dst: &mut Pixmap, src: tiny_skia::PixmapRef<'_>| {
+        let iw = src.width() as f32;
+        let ih = src.height() as f32;
+        if iw <= 0.0 || ih <= 0.0 {
+            return false;
+        }
+        let sc = target_px / iw.max(ih);
+        let dx = cx - iw * sc * 0.5;
+        let dy = cy - ih * sc * 0.5;
+        let p = tiny_skia::PixmapPaint {
+            opacity: 1.0,
+            quality: tiny_skia::FilterQuality::Bilinear,
+            ..Default::default()
+        };
+        dst.draw_pixmap(0, 0, src, &p, Transform::from_scale(sc, sc).post_translate(dx, dy), None);
+        true
+    };
+    if let Some((w, h, ref rgba)) = item.icon_pixmap {
+        if let Some(src) = tiny_skia::PixmapRef::from_bytes(rgba, w, h) {
+            return draw_src(pm, src);
+        }
+    }
+    if let Some(name) = item.icon_name.as_deref() {
+        if let Some(ico) = apps.icon_any(name, target_px.round() as u32) {
+            return draw_src(pm, ico.as_ref().as_ref());
+        }
+    }
+    false
 }
 
 /// Rebuild: a circular arrow (rotated by `turn` radians while building).

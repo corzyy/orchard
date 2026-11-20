@@ -180,6 +180,8 @@ pub struct Effects {
     /// ⌘⇧4 selection (drawn above everything but the cursor)
     pub shot_overlay: Option<crate::screenshot::Overlay>,
     pub shot_bufs: [smithay::backend::renderer::element::solid::SolidColorBuffer; 5],
+    /// hide the `orchard-screenshot` layer surface while capturing a screenshot
+    pub hide_screenshot_ui: bool,
     /// live-blur textures of the frosted-glass backdrops
     pub blur: blur::LiveBlur,
     /// lock screen backdrop: blurred wallpaper + a light dim (stable ids)
@@ -188,6 +190,9 @@ pub struct Effects {
     pub lock_fallback: smithay::backend::renderer::element::solid::SolidColorBuffer,
     /// when the session was unlocked: the lock backdrop fades out over the desktop
     pub unlock_fade: Option<Duration>,
+    /// green traffic-light Move & Resize popover
+    pub tile_menu: Option<crate::chrome::tile_menu::TileMenu>,
+    pub tile_menu_arm: Option<crate::chrome::tile_menu::TileMenuArm>,
 }
 
 /// An element id created on first use (`Id` has no `Default`).

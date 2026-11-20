@@ -5,8 +5,11 @@
 //! activation and frosted-glass backdrops.
 
 mod apps;
-mod dock;
+mod ddc;
+mod desktop;
 mod devbuild;
+mod dialog;
+mod dock;
 mod draw;
 mod globalmenu;
 mod ipc;
@@ -19,10 +22,12 @@ mod notify;
 mod osd;
 mod panel;
 mod panel_app;
+mod screenshot;
 mod status;
 mod switcher;
 mod text;
 mod theme;
+mod tray;
 
 use orchard_config::{DockAutohide, DockPosition};
 use std::{
@@ -96,6 +101,9 @@ enum Which {
     Notify,
     Panel,
     Launchpad,
+    Screenshot,
+    Dialog,
+    Desktop,
 }
 
 struct Surf {
@@ -109,6 +117,10 @@ struct Surf {
     frame_since: Option<Instant>,
     /// Content changed; drawn by `flush_draws` / the next frame callback.
     dirty: bool,
+    /// Per-surface SHM pool: dropped immediately when a transient overlay closes.
+    pool: Option<SlotPool>,
+    /// Reusable CPU render buffer so animations don't allocate/free 30-60 MB per frame.
+    pixmap: Option<Pixmap>,
 }
 
 impl Surf {
@@ -122,6 +134,8 @@ impl Surf {
             frame_pending: false,
             frame_since: None,
             dirty: false,
+            pool: None,
+            pixmap: None,
         }
     }
 }
@@ -130,6 +144,7 @@ impl Surf {
 enum MenuOwner {
     Bar(BarItem),
     Dock(usize),
+    Desktop,
 }
 
 struct App {
@@ -139,7 +154,6 @@ struct App {
     compositor: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
-    pool: SlotPool,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
 
@@ -156,6 +170,10 @@ struct App {
     launcher_surf: Option<Surf>,
     switcher: Option<switcher::Switcher>,
     launcher: Option<launcher::Launcher>,
+    /// Spotlight's file index, usage memory and background work
+    spot: launcher::Spot,
+    /// keyboard modifiers right now
+    mods: Modifiers,
     qh: QueueHandle<App>,
 
     menubar: MenuBar,
@@ -169,6 +187,7 @@ struct App {
     apps: Apps,
     fonts: Fonts,
     theme: Theme,
+    perf: orchard_config::PerformanceSettings,
     ipc: Option<Ipc>,
     last_step: Instant,
     last_backdrop: Option<(f32, f32, f32, f32)>,
@@ -182,6 +201,7 @@ struct App {
     osd_tx: Sender<osd::Level>,
     notes: notify::Center,
     notes_surf: Option<Surf>,
+    last_notes_backdrop: Option<Vec<(f32, f32, f32, f32)>>,
     /// session bus connection that owns org.freedesktop.Notifications
     dbus: Option<zbus::blocking::Connection>,
 
@@ -193,6 +213,11 @@ struct App {
     launchpad_step: Instant,
     /// last backdrop opacity sent for Launchpad
     launchpad_backdrop: f32,
+    /// macOS-style interactive screenshot tool (Print / ⌘⇧5)
+    screenshot: Option<screenshot::ScreenshotTool>,
+    screenshot_surf: Option<Surf>,
+    screenshot_prefs: screenshot::Prefs,
+    last_shot_backdrop: Vec<(f32, f32, f32, f32, f32)>,
     control_tx: Sender<panel::ControlState>,
     control_cache: panel::ControlState,
     last_slider_cmd: Instant,
@@ -206,6 +231,15 @@ struct App {
     menu_addr: Option<(String, String)>,
     app_menu_ids: Vec<i32>,
     gmenu_tx: Sender<(Option<(String, String)>, Vec<(i32, String)>)>,
+
+    /// power / session confirmation dialog
+    dialog: Option<dialog::ConfirmDialog>,
+    dialog_surf: Option<Surf>,
+    /// system tray (StatusNotifierWatcher)
+    tray: Option<tray::Tray>,
+    /// desktop icons (Layer::Bottom)
+    desktop: desktop::Desktop,
+    desktop_surf: Option<Surf>,
 }
 
 fn main() {
@@ -227,7 +261,6 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm");
-    let pool = SlotPool::new(1920 * 200 * 4, &shm).expect("shm pool");
 
     let settings = orchard_config::Settings::load();
     let apps = Apps::load(settings.appearance.icon_theme.clone());
@@ -278,6 +311,14 @@ fn main() {
             }
         })
         .expect("control channel");
+    let (spot_tx, spot_rx) = channel::channel::<launcher::Msg>();
+    loop_handle
+        .insert_source(spot_rx, |ev, _, app: &mut App| {
+            if let channel::Event::Msg(msg) = ev {
+                app.on_spot_msg(msg);
+            }
+        })
+        .expect("spotlight channel");
     let (vol_tx, vol_rx) = channel::channel::<Option<(f32, bool)>>();
     loop_handle
         .insert_source(vol_rx, |ev, _, app: &mut App| {
@@ -289,6 +330,17 @@ fn main() {
             }
         })
         .expect("volume channel");
+    let (tray_tx, tray_rx) = channel::channel::<Vec<tray::TrayItem>>();
+    loop_handle
+        .insert_source(tray_rx, |ev, _, app: &mut App| {
+            if let channel::Event::Msg(items) = ev {
+                app.menubar.tray_items = items;
+                app.redraw(Which::Bar);
+            }
+        })
+        .expect("tray channel");
+    let tray = tray::Tray::start(tray_tx);
+    let desktop = desktop::Desktop::new(settings.windows.show_desktop_icons);
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -297,7 +349,6 @@ fn main() {
         compositor,
         layer_shell,
         shm,
-        pool,
         pointer: None,
         keyboard: None,
         output: None,
@@ -311,6 +362,8 @@ fn main() {
         launcher_surf: None,
         switcher: None,
         launcher: None,
+        spot: launcher::Spot::new(spot_tx),
+        mods: Modifiers::default(),
         qh: qh.clone(),
         menubar: MenuBar::new(),
         dock: Dock::new(pinned),
@@ -322,6 +375,7 @@ fn main() {
         apps,
         fonts: Fonts::load(),
         theme,
+        perf: settings.performance.clone(),
         ipc,
         last_step: Instant::now(),
         last_backdrop: None,
@@ -334,6 +388,7 @@ fn main() {
         osd_tx,
         notes: notify::Center::default(),
         notes_surf: None,
+        last_notes_backdrop: None,
         dbus,
         panel: None,
         panel_surf: None,
@@ -341,6 +396,10 @@ fn main() {
         launchpad: None,
         launchpad_step: Instant::now(),
         launchpad_backdrop: -1.0,
+        screenshot: None,
+        screenshot_surf: None,
+        screenshot_prefs: screenshot::Prefs::default(),
+        last_shot_backdrop: Vec::new(),
         control_tx,
         control_cache: Default::default(),
         last_slider_cmd: Instant::now(),
@@ -351,6 +410,11 @@ fn main() {
         menu_addr: None,
         app_menu_ids: Vec::new(),
         gmenu_tx,
+        dialog: None,
+        dialog_surf: None,
+        tray,
+        desktop,
+        desktop_surf: None,
     };
     app.dock.cfg = settings.dock.clone();
     app.menubar.cfg = settings.menu_bar.clone();
@@ -373,29 +437,63 @@ fn main() {
             .expect("ipc source");
     }
 
-    // status refresh (clock, battery, network, volume)
+    // Event-driven volume monitor via `pactl subscribe` (replaces 2s wpctl polling)
+    app.start_volume_watcher();
+
+    // status refresh: 1s only when showing seconds or during an active dev build,
+    // otherwise minute/10s-aligned (or 30s in Power Saver / on battery) to keep the shell asleep when idle.
+    let mut last_slow_poll = Instant::now();
     loop_handle
-        .insert_source(Timer::from_duration(Duration::from_secs(1)), |_, _, app: &mut App| {
-            if app.menubar.refresh_status() {
+        .insert_source(Timer::from_duration(Duration::from_secs(1)), move |_, _, app: &mut App| {
+            let slow_secs = app.slow_poll_interval();
+            let slow_due = last_slow_poll.elapsed() >= Duration::from_secs(slow_secs);
+            let status_changed = if slow_due {
+                last_slow_poll = Instant::now();
+                app.refresh_apps();
+                app.menubar.refresh_status_with(app.perf.battery_saver)
+            } else {
+                app.menubar.refresh_clock()
+            };
+            if status_changed {
                 app.redraw(Which::Bar);
             }
             app.status_tick = app.status_tick.wrapping_add(1);
-            if app.menubar.cfg.show_volume && app.status_tick.is_multiple_of(2) {
-                app.refresh_volume();
-            }
             // X11 apps register their menu some time after mapping
-            app.refresh_app_menu();
+            if app.app_menu_ids.is_empty() {
+                app.refresh_app_menu();
+            }
             // Rebuild item: pending sources / build state
+            let mut dev_running = false;
             if let Some(dev) = app.menubar.dev.as_mut() {
-                let running = dev.build == devbuild::Build::Running;
-                if running {
+                dev_running = dev.build == devbuild::Build::Running;
+                if dev_running {
                     app.menubar.dev_spin = app.menubar.dev_spin.wrapping_add(1);
                 }
-                if (running || app.status_tick.is_multiple_of(3)) && (dev.refresh() | running) {
+                if (dev_running || slow_due) && (dev.refresh() | dev_running) {
                     app.redraw(Which::Bar);
                 }
             }
-            TimeoutAction::ToDuration(Duration::from_secs(1))
+            let mut dialog_active = false;
+            if let Some(d) = app.dialog.as_ref() {
+                if d.expired() {
+                    app.confirm_dialog();
+                } else {
+                    dialog_active = true;
+                    app.redraw(Which::Dialog);
+                }
+            }
+            if slow_due && app.desktop.check_refresh() {
+                app.redraw(Which::Desktop);
+            }
+            let next = if app.menubar.cfg.show_seconds || dev_running || dialog_active {
+                Duration::from_secs(1)
+            } else {
+                // Wake on the next minute boundary or slow-poll boundary, whichever is sooner
+                let now_secs = chrono::Local::now().timestamp().rem_euclid(60) as u64;
+                let to_min = (60 - now_secs).max(1);
+                Duration::from_secs(to_min.min(slow_secs))
+            };
+            TimeoutAction::ToDuration(next)
         })
         .expect("timer");
 
@@ -412,7 +510,8 @@ fn main() {
     }
 
     while !app.exit {
-        if let Err(e) = event_loop.dispatch(Duration::from_millis(500), &mut app) {
+        let timeout = app.next_dispatch_timeout();
+        if let Err(e) = event_loop.dispatch(timeout, &mut app) {
             tracing::info!("compositor connection closed: {e}");
             return;
         }
@@ -422,6 +521,44 @@ fn main() {
 }
 
 impl App {
+    /// Listen for PipeWire/PulseAudio sink changes via a single persistent `pactl subscribe`
+    /// process instead of spawning `wpctl` every 2 seconds.
+    fn start_volume_watcher(&self) {
+        let tx = self.vol_tx.clone();
+        let _ = std::thread::Builder::new().name("volume-watch".into()).spawn(move || {
+            use std::io::{BufRead, BufReader};
+            use std::process::{Command, Stdio};
+            loop {
+                let child = Command::new("pactl")
+                    .arg("subscribe")
+                    .env("LC_ALL", "C")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn();
+                let Ok(mut child) = child else {
+                    // Fallback if pactl is unavailable: gentle 10s poll
+                    std::thread::sleep(Duration::from_secs(10));
+                    let _ = tx.send(status::volume());
+                    continue;
+                };
+                if let Some(stdout) = child.stdout.take() {
+                    let reader = BufReader::new(stdout);
+                    let mut last_query = Instant::now() - Duration::from_secs(1);
+                    for line in reader.lines().map_while(Result::ok) {
+                        if (line.contains("sink") || line.contains("server"))
+                            && last_query.elapsed() >= Duration::from_millis(80)
+                        {
+                            last_query = Instant::now();
+                            let _ = tx.send(status::volume());
+                        }
+                    }
+                }
+                let _ = child.wait();
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+
     /// Query current default sink volume on a helper thread (at most one in flight).
     fn refresh_volume(&self) {
         if self.vol_pending.swap(true, Ordering::AcqRel) {
@@ -509,6 +646,192 @@ impl App {
         self.last_tiles.clear();
     }
 
+    fn create_desktop_surface(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Bottom,
+            Some("orchard-desktop"),
+            Some(output),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.commit();
+        self.desktop_surf = Some(Surf::new(layer));
+    }
+
+    // ---- Power / Session confirmation dialogs ---------------------------
+
+    pub(crate) fn open_dialog(&mut self, kind: dialog::DialogKind) {
+        self.close_menu();
+        self.close_panel();
+        if self.launcher.is_some() {
+            self.close_launcher_now();
+        }
+        self.dialog = Some(dialog::ConfirmDialog::new(kind));
+        if self.dialog_surf.is_none() {
+            let surface = self.compositor.create_surface(&self.qh);
+            let layer = self.layer_shell.create_layer_surface(
+                &self.qh,
+                surface,
+                Layer::Overlay,
+                Some("orchard-dialog"),
+                self.output.as_ref(),
+            );
+            layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+            layer.set_exclusive_zone(-1);
+            layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            layer.commit();
+            self.dialog_surf = Some(Surf::new(layer));
+        } else {
+            self.redraw(Which::Dialog);
+        }
+    }
+
+    fn close_dialog(&mut self) {
+        if self.dialog.take().is_none() && self.dialog_surf.is_none() {
+            return;
+        }
+        self.dialog_surf = None;
+        self.set_backdrop("orchard-dialog", None);
+    }
+
+    fn confirm_dialog(&mut self) {
+        let Some(d) = self.dialog.take() else { return };
+        self.dialog_surf = None;
+        self.set_backdrop("orchard-dialog", None);
+        match d.kind {
+            dialog::DialogKind::ShutDown => self.spawn("systemctl poweroff"),
+            dialog::DialogKind::Restart => self.spawn("systemctl reboot"),
+            dialog::DialogKind::Sleep => self.spawn("systemctl suspend"),
+            dialog::DialogKind::LogOut => {
+                if let Some(ipc) = self.ipc.as_mut() {
+                    ipc.request("action", json!({ "name": "quit" }));
+                }
+            }
+        }
+    }
+
+    fn dialog_pointer(&mut self, kind: &PointerEventKind, x: f64, y: f64) {
+        let (x, y) = (x as f32, y as f32);
+        match kind {
+            PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                if let Some(d) = self.dialog.as_mut() {
+                    let h = d.hit(x, y);
+                    if h != d.hovered {
+                        d.hovered = h;
+                        self.redraw(Which::Dialog);
+                    }
+                }
+            }
+            PointerEventKind::Leave { .. } => {
+                if let Some(d) = self.dialog.as_mut() {
+                    if d.hovered.take().is_some() {
+                        self.redraw(Which::Dialog);
+                    }
+                }
+            }
+            PointerEventKind::Press { button: BTN_LEFT, .. } => {
+                let (hit, inside) = match self.dialog.as_ref() {
+                    Some(d) => (d.hit(x, y), d.in_dialog(x, y)),
+                    None => (None, false),
+                };
+                match hit {
+                    Some(dialog::DialogButton::Cancel) => self.close_dialog(),
+                    Some(dialog::DialogButton::Confirm) => self.confirm_dialog(),
+                    None if !inside => self.close_dialog(),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn dialog_key(&mut self, event: &KeyEvent) {
+        match event.keysym {
+            Keysym::Escape => self.close_dialog(),
+            Keysym::Return | Keysym::KP_Enter => self.confirm_dialog(),
+            _ => {}
+        }
+    }
+
+    // ---- Desktop icons --------------------------------------------------
+
+    fn open_desktop_path(&mut self, path: &std::path::Path) {
+        if let Some(exec) = self
+            .desktop
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .and_then(|e| e.exec.clone())
+        {
+            self.spawn(&exec);
+            return;
+        }
+        let quoted = path.to_string_lossy().replace('\'', "'\\''");
+        self.spawn(&format!("xdg-open '{quoted}'"));
+    }
+
+    fn desktop_pointer(&mut self, qh: &QueueHandle<Self>, kind: &PointerEventKind, x: f64, y: f64) {
+        let (x, y) = (x as f32, y as f32);
+        match kind {
+            PointerEventKind::Press { button: BTN_LEFT, .. } => {
+                if self.menu.is_some() {
+                    self.close_menu();
+                }
+                let (changed, open_idx) = self.desktop.left_click(x, y);
+                if changed {
+                    self.redraw(Which::Desktop);
+                }
+                if let Some(idx) = open_idx {
+                    if let Some(path) = self.desktop.entries.get(idx).map(|e| e.path.clone()) {
+                        self.open_desktop_path(&path);
+                    }
+                }
+            }
+            PointerEventKind::Press { button: BTN_RIGHT, .. } => {
+                let hit = self.desktop.hit(x, y);
+                if self.desktop.selected != hit {
+                    self.desktop.selected = hit;
+                    self.redraw(Which::Desktop);
+                }
+                let de = self.german;
+                let t = |en: &str, de_s: &str| if de { de_s.to_string() } else { en.to_string() };
+                let items = match hit.and_then(|i| self.desktop.entries.get(i).cloned()) {
+                    Some(ent) => vec![
+                        MenuItem::new(t("Open", "Öffnen"), Action::DesktopOpen(ent.path.clone())),
+                        MenuItem::new(
+                            t("Copy Path", "Pfad kopieren"),
+                            Action::CopyText(ent.path.to_string_lossy().into_owned()),
+                        ),
+                        MenuItem::separator(),
+                        MenuItem::new(t("Move to Trash", "In den Papierkorb legen"), Action::DesktopTrash(ent.path)),
+                    ],
+                    None => vec![
+                        MenuItem::new(t("New Folder", "Neuer Ordner"), Action::DesktopNewFolder),
+                        MenuItem::new(
+                            t("Open Desktop in Files", "Schreibtisch in Dateien öffnen"),
+                            Action::DesktopOpen(self.desktop.dir.clone()),
+                        ),
+                        MenuItem::separator(),
+                        MenuItem::new(t("Sort by Name", "Nach Name sortieren"), Action::DesktopSort(desktop::SortBy::Name)),
+                        MenuItem::new(t("Sort by Date", "Nach Datum sortieren"), Action::DesktopSort(desktop::SortBy::Date)),
+                        MenuItem::new(t("Sort by Kind", "Nach Art sortieren"), Action::DesktopSort(desktop::SortBy::Kind)),
+                        MenuItem::separator(),
+                        MenuItem::new(
+                            t("Change Wallpaper…", "Hintergrundbild ändern …"),
+                            Action::Launch("orchard-settings Wallpaper".into()),
+                        ),
+                    ],
+                };
+                self.open_menu(qh, MenuOwner::Desktop, Menu::new(items, x, y));
+            }
+            _ => {}
+        }
+    }
+
     /// Top-left of the Dock surface on its output (logical px).
     fn dock_origin(&self) -> (f32, f32) {
         let Some(s) = self.dock_surf.as_ref() else { return (0.0, 0.0) };
@@ -526,7 +849,7 @@ impl App {
             self.close_menu();
         }
         if self.launcher.is_some() {
-            self.close_launcher();
+            self.close_launcher_now();
         }
         self.switcher = None;
         self.switcher_surf = None;
@@ -534,6 +857,9 @@ impl App {
         self.osd_surf = None;
         self.panel = None;
         self.panel_surf = None;
+        self.close_dialog();
+        self.desktop_surf = None;
+        self.close_screenshot_tool();
         // banners stay in the model and come back on the new output
         self.notes_surf = None;
         self.bar = None;
@@ -566,6 +892,9 @@ impl App {
         self.bar = Some(Surf::new(bar));
 
         self.create_dock_surface(qh, &output);
+        if self.desktop.enabled {
+            self.create_desktop_surface(qh, &output);
+        }
 
         if let Some(ipc) = self.ipc.as_mut() {
             ipc.request(
@@ -590,6 +919,9 @@ impl App {
             Which::Notify => self.notes_surf.as_mut(),
             Which::Panel => self.panel_surf.as_mut(),
             Which::Launchpad => self.launchpad_surf.as_mut(),
+            Which::Screenshot => self.screenshot_surf.as_mut(),
+            Which::Dialog => self.dialog_surf.as_mut(),
+            Which::Desktop => self.desktop_surf.as_mut(),
         }
     }
 
@@ -612,6 +944,12 @@ impl App {
             Some(Which::Panel)
         } else if self.launchpad_surf.as_ref().map(|s| s.layer.wl_surface() == surface).unwrap_or(false) {
             Some(Which::Launchpad)
+        } else if self.screenshot_surf.as_ref().map(|s| s.layer.wl_surface() == surface).unwrap_or(false) {
+            Some(Which::Screenshot)
+        } else if self.dialog_surf.as_ref().map(|s| s.layer.wl_surface() == surface).unwrap_or(false) {
+            Some(Which::Dialog)
+        } else if self.desktop_surf.as_ref().map(|s| s.layer.wl_surface() == surface).unwrap_or(false) {
+            Some(Which::Desktop)
         } else {
             None
         }
@@ -650,6 +988,27 @@ impl App {
                     }
                     Some("launcher_toggle") => self.toggle_launcher(),
                     Some("launchpad_toggle") => self.toggle_launchpad(),
+                    Some("screenshot_tool") => {
+                        let output = v["output"].as_str().unwrap_or_default().to_string();
+                        let windows = v["windows"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|w| {
+                                        Some(screenshot::ShotWindow {
+                                            id: w["id"].as_u64()?,
+                                            x: w["x"].as_f64()? as f32,
+                                            y: w["y"].as_f64()? as f32,
+                                            w: w["w"].as_f64()? as f32,
+                                            h: w["h"].as_f64()? as f32,
+                                            title: w["title"].as_str().unwrap_or_default().to_string(),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        self.toggle_screenshot_tool(output, windows);
+                    }
                     Some("settings_changed") => self.reload_settings(),
                     Some("dock_obstructed") => {
                         let obstructed = v["obstructed"].as_bool().unwrap_or(false);
@@ -683,10 +1042,11 @@ impl App {
             self.retarget_output();
         }
         self.theme = Theme::from_settings(&s);
+        self.perf = s.performance.clone();
         let icons_changed = self.apps.set_icon_theme(s.appearance.icon_theme.clone());
         let was_showing_volume = self.menubar.cfg.show_volume;
         self.menubar.cfg = s.menu_bar.clone();
-        self.menubar.refresh_status();
+        self.menubar.refresh_status_with(self.perf.battery_saver);
         if self.menubar.cfg.show_volume && !was_showing_volume {
             self.refresh_volume();
         }
@@ -737,7 +1097,23 @@ impl App {
             self.redraw(Which::Menu);
         }
         if icons_changed {
+            self.desktop.clear_icon_cache();
             self.redraw_icon_surfaces();
+        }
+        let show_desk = s.windows.show_desktop_icons;
+        if self.desktop.enabled != show_desk {
+            self.desktop.enabled = show_desk;
+            if show_desk {
+                self.desktop.rescan();
+                if let Some(output) = self.output.clone() {
+                    let qh = self.qh.clone();
+                    self.create_desktop_surface(&qh, &output);
+                }
+            } else {
+                self.desktop_surf = None;
+            }
+        } else if show_desk {
+            self.redraw(Which::Desktop);
         }
         self.flush_frames(&self.qh.clone());
     }
@@ -877,6 +1253,40 @@ impl App {
         }
     }
 
+    /// Slow status-poll cadence (seconds): relaxed on battery or in Power Saver.
+    fn slow_poll_interval(&self) -> u64 {
+        let on_battery = self.menubar.battery.as_ref().map(|b| !b.charging).unwrap_or(false);
+        if self.perf.preset == orchard_config::PerformancePreset::PowerSaver
+            || (self.perf.battery_saver && on_battery)
+        {
+            30
+        } else {
+            10
+        }
+    }
+
+    /// Only wake up on a timeout if a dirty surface is waiting on a potentially stale
+    /// frame callback; otherwise sleep completely until the next Wayland/IPC/timer event.
+    fn next_dispatch_timeout(&self) -> Option<Duration> {
+        let surfaces = [
+            self.bar.as_ref(),
+            self.dock_surf.as_ref(),
+            self.menu_surf.as_ref(),
+            self.switcher_surf.as_ref(),
+            self.launcher_surf.as_ref(),
+            self.osd_surf.as_ref(),
+            self.notes_surf.as_ref(),
+            self.panel_surf.as_ref(),
+            self.launchpad_surf.as_ref(),
+            self.screenshot_surf.as_ref(),
+        ];
+        if surfaces.into_iter().flatten().any(|s| s.dirty && s.frame_pending) {
+            Some(Duration::from_millis(260))
+        } else {
+            None
+        }
+    }
+
     fn redraw(&mut self, which: Which) {
         if let Some(s) = self.surf(which) {
             s.dirty = true;
@@ -885,7 +1295,7 @@ impl App {
 
     /// Paint every dirty surface that is not waiting for a frame callback.
     fn flush_draws(&mut self) {
-        const ALL: [Which; 9] = [
+        const ALL: [Which; 12] = [
             Which::Launchpad,
             Which::Bar,
             Which::Dock,
@@ -895,6 +1305,9 @@ impl App {
             Which::Osd,
             Which::Notify,
             Which::Panel,
+            Which::Screenshot,
+            Which::Dialog,
+            Which::Desktop,
         ];
         for which in ALL {
             let Some(s) = self.surf(which) else { continue };
@@ -916,21 +1329,30 @@ impl App {
     }
 
     fn draw(&mut self, which: Which) {
-        let (w, h, scale) = match self.surf(which) {
+        let (w, h, scale, existing_pm) = match self.surf(which) {
             Some(s) if s.configured => {
                 s.dirty = false;
-                (s.width, s.height, s.scale)
+                (s.width, s.height, s.scale, s.pixmap.take())
             }
             _ => return,
         };
         let pw = w as i32 * scale;
         let ph = h as i32 * scale;
-        let Some(mut pm) = Pixmap::new(pw as u32, ph as u32) else { return };
+        let mut pm = match existing_pm {
+            Some(mut pm) if pm.width() == pw as u32 && pm.height() == ph as u32 => {
+                pm.fill(tiny_skia::Color::TRANSPARENT);
+                pm
+            }
+            _ => match Pixmap::new(pw as u32, ph as u32) {
+                Some(pm) => pm,
+                None => return,
+            },
+        };
         let fscale = scale as f32;
 
         let mut animating = false;
         match which {
-            Which::Bar => self.menubar.paint(&mut pm, fscale, &self.fonts, &self.theme),
+            Which::Bar => self.menubar.paint(&mut pm, fscale, &self.fonts, &self.apps, &self.theme),
             Which::Dock => {
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_step).as_secs_f32().min(0.05);
@@ -952,12 +1374,10 @@ impl App {
                     sw.paint(&mut pm, fscale, &self.apps, &self.fonts, &self.theme);
                 }
             }
-            Which::Launcher => {
-                if let Some(l) = &self.launcher {
-                    let (x, y) = self.launcher_origin();
-                    l.paint(&mut pm, x, y, fscale, &self.apps, &self.fonts, &self.theme, self.german);
-                }
-            }
+            Which::Launcher => match self.paint_launcher(&mut pm, fscale) {
+                Some(a) => animating = a,
+                None => return,
+            },
             Which::Osd => {
                 if let Some(o) = &self.osd {
                     o.paint(&mut pm, fscale, &self.theme);
@@ -1001,18 +1421,63 @@ impl App {
                 }
                 self.send_panel_backdrop();
             }
+            Which::Screenshot => {
+                if let Some(st) = self.screenshot.as_mut() {
+                    st.paint(&mut pm, fscale, &self.fonts, &self.theme, self.german);
+                }
+                self.send_screenshot_backdrop();
+            }
+            Which::Dialog => {
+                if let Some(d) = self.dialog.as_mut() {
+                    d.paint(&mut pm, fscale, &self.fonts, &self.theme, self.german);
+                    let (x, y, dw, dh) = d.rect;
+                    self.set_backdrop("orchard-dialog", Some((x, y, dw, dh, 16.0)));
+                }
+            }
+            Which::Desktop => {
+                self.desktop.paint(&mut pm, fscale, &self.fonts, &mut self.apps, &self.theme);
+            }
         }
 
-        let (buffer, canvas) = match self.pool.create_buffer(pw, ph, pw * 4, wl_shm::Format::Argb8888) {
+        let qh = self.qh.clone();
+        let shm = &self.shm;
+        let s = match which {
+            Which::Bar => self.bar.as_mut(),
+            Which::Dock => self.dock_surf.as_mut(),
+            Which::Menu => self.menu_surf.as_mut(),
+            Which::Switcher => self.switcher_surf.as_mut(),
+            Which::Launcher => self.launcher_surf.as_mut(),
+            Which::Osd => self.osd_surf.as_mut(),
+            Which::Notify => self.notes_surf.as_mut(),
+            Which::Panel => self.panel_surf.as_mut(),
+            Which::Launchpad => self.launchpad_surf.as_mut(),
+            Which::Screenshot => self.screenshot_surf.as_mut(),
+            Which::Dialog => self.dialog_surf.as_mut(),
+            Which::Desktop => self.desktop_surf.as_mut(),
+        };
+        let Some(s) = s else { return };
+        let initial_bytes = ((pw as usize) * (ph as usize) * 4).max(4096);
+        let pool = match s.pool.as_mut() {
+            Some(p) => p,
+            None => match SlotPool::new(initial_bytes, shm) {
+                Ok(p) => s.pool.insert(p),
+                Err(e) => {
+                    tracing::warn!("shm pool: {e}");
+                    s.pixmap = Some(pm);
+                    return;
+                }
+            },
+        };
+        let (buffer, canvas) = match pool.create_buffer(pw, ph, pw * 4, wl_shm::Format::Argb8888) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!("shm buffer: {e}");
+                s.pixmap = Some(pm);
                 return;
             }
         };
         draw::blit_to_shm(&pm, canvas);
-        let qh = self.qh.clone();
-        let Some(s) = self.surf(which) else { return };
+        s.pixmap = Some(pm);
         let surface = s.layer.wl_surface().clone();
         surface.damage_buffer(0, 0, pw, ph);
         // Every commit asks for a frame callback: further repaints wait for it
@@ -1048,22 +1513,43 @@ impl App {
         if let Some(s) = self.dock_surf.as_ref() {
             if let Ok(region) = Region::new(&self.compositor) {
                 let (w, h) = (s.width as i32, s.height as i32);
-                if hidden {
-                    // auto-hidden: a thin strip at the screen edge brings it back
-                    let strip = dock::REVEAL_STRIP as i32;
+                let strip = dock::REVEAL_STRIP as i32;
+                if !hidden {
+                    // the bar plus room for magnified icons on the inner side,
+                    // extended all the way to the monitor edge (no dead gap)
+                    let grow = (self.dock.icon_max() - self.dock.icon()).ceil() as i32 + 4;
+                    let (x, y, bw, bh) = (bg.0.round() as i32, bg.1.round() as i32, bg.2.round() as i32, bg.3.round() as i32);
+                    match self.dock.edge() {
+                        DockPosition::Bottom => {
+                            let top = (y - grow).clamp(0, h);
+                            let rh = h - top;
+                            if rh > 0 && bw > 0 {
+                                region.add(x, top, bw, rh);
+                            }
+                        }
+                        DockPosition::Left => {
+                            let right = (x + bw + grow).clamp(0, w);
+                            if right > 0 && bh > 0 {
+                                region.add(0, y, right, bh);
+                            }
+                        }
+                        DockPosition::Right => {
+                            let left = (x - grow).clamp(0, w);
+                            let rw = w - left;
+                            if rw > 0 && bh > 0 {
+                                region.add(left, y, rw, bh);
+                            }
+                        }
+                    }
+                }
+                if hidden || self.dock.cfg.autohide != DockAutohide::Never {
+                    // keep the edge reveal strip active while hidden and during
+                    // reveal/hide so hitting the monitor edge anywhere opens the
+                    // Dock and never drops pointer focus mid-animation
                     match self.dock.edge() {
                         DockPosition::Bottom => region.add(0, h - strip, w, strip),
                         DockPosition::Left => region.add(0, 0, strip, h),
                         DockPosition::Right => region.add(w - strip, 0, strip, h),
-                    }
-                } else {
-                    // the bar plus room for magnified icons on the inner side
-                    let grow = (self.dock.icon_max() - self.dock.icon()) as i32 + 4;
-                    let (x, y, bw, bh) = (bg.0 as i32, bg.1 as i32, bg.2 as i32, bg.3 as i32);
-                    match self.dock.edge() {
-                        DockPosition::Bottom => region.add(x, y - grow, bw, bh + grow),
-                        DockPosition::Left => region.add(x, y, bw + grow, bh),
-                        DockPosition::Right => region.add(x - grow, y, bw + grow, bh),
                     }
                 }
                 s.layer.wl_surface().set_input_region(Some(region.wl_region()));
@@ -1078,6 +1564,154 @@ impl App {
                 .unwrap_or_default();
             ipc.request("set_backdrop", json!({"namespace": namespace, "rects": rects}));
         }
+    }
+
+    // ---- macOS-style Screenshot tool (Print / ⌘⇧5) -------------------------
+
+    fn toggle_screenshot_tool(&mut self, output_name: String, windows: Vec<screenshot::ShotWindow>) {
+        if self.screenshot.is_some() {
+            self.close_screenshot_tool();
+            return;
+        }
+        if self.menu.is_some() {
+            self.close_menu();
+        }
+        if self.panel.is_some() {
+            self.close_panel();
+        }
+        if self.launcher.is_some() {
+            self.close_launcher_now();
+        }
+        self.close_launchpad();
+
+        let target_output = self
+            .output_state
+            .outputs()
+            .find(|o| {
+                self.output_state
+                    .info(o)
+                    .and_then(|i| i.name)
+                    .as_deref()
+                    == Some(output_name.as_str())
+            })
+            .or_else(|| self.output.clone());
+
+        let tool = screenshot::ScreenshotTool::new(output_name, windows, &self.screenshot_prefs);
+        self.screenshot = Some(tool);
+        self.last_shot_backdrop.clear();
+
+        let surface = self.compositor.create_surface(&self.qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            Layer::Overlay,
+            Some("orchard-screenshot"),
+            target_output.as_ref(),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
+        self.screenshot_surf = Some(Surf::new(layer));
+    }
+
+    fn close_screenshot_tool(&mut self) {
+        if let Some(tool) = self.screenshot.take() {
+            tool.save_prefs(&mut self.screenshot_prefs);
+        }
+        if self.screenshot_surf.take().is_some() {
+            self.set_backdrop("orchard-screenshot", None);
+            self.last_shot_backdrop.clear();
+        }
+    }
+
+    fn send_screenshot_backdrop(&mut self) {
+        let Some(tool) = self.screenshot.as_ref() else { return };
+        let rects = tool.backdrop_rects();
+        if rects == self.last_shot_backdrop {
+            return;
+        }
+        self.last_shot_backdrop = rects.clone();
+        if let Some(ipc) = self.ipc.as_mut() {
+            let v: Vec<serde_json::Value> = rects
+                .iter()
+                .map(|(x, y, w, h, r)| json!({"x": x, "y": y, "w": w, "h": h, "radius": r}))
+                .collect();
+            ipc.request("set_backdrop", json!({"namespace": "orchard-screenshot", "rects": v}));
+        }
+    }
+
+    fn execute_screenshot_capture(&mut self, spec: screenshot::CaptureSpec) {
+        self.close_screenshot_tool();
+        if let Some(ipc) = self.ipc.as_mut() {
+            let rect = spec.rect.map(|(x, y, w, h)| json!({"x": x, "y": y, "w": w, "h": h}));
+            ipc.request(
+                "screenshot_capture",
+                json!({
+                    "mode": spec.mode.as_str(),
+                    "output": spec.output,
+                    "rect": rect,
+                    "window_id": spec.window_id,
+                    "target": spec.save_to.as_str(),
+                    "include_cursor": spec.show_cursor,
+                }),
+            );
+        }
+    }
+
+    fn handle_screenshot_action(&mut self, action: screenshot::Action) {
+        match action {
+            screenshot::Action::None => {}
+            screenshot::Action::Redraw => self.redraw(Which::Screenshot),
+            screenshot::Action::Close => self.close_screenshot_tool(),
+            screenshot::Action::CaptureNow(spec) => self.execute_screenshot_capture(spec),
+            screenshot::Action::StartCountdown => {
+                self.redraw(Which::Screenshot);
+                let _ = self.loop_handle.insert_source(
+                    Timer::from_duration(Duration::from_millis(200)),
+                    |_, _, app: &mut App| {
+                        let ready = app.screenshot.as_mut().and_then(|s| s.take_ready_capture());
+                        if let Some(spec) = ready {
+                            app.execute_screenshot_capture(spec);
+                            return TimeoutAction::Drop;
+                        }
+                        if app.screenshot.as_ref().is_some_and(|s| s.countdown.is_some()) {
+                            app.redraw(Which::Screenshot);
+                            TimeoutAction::ToDuration(Duration::from_millis(200))
+                        } else {
+                            TimeoutAction::Drop
+                        }
+                    },
+                );
+            }
+        }
+    }
+
+    fn screenshot_pointer(&mut self, kind: &PointerEventKind, x: f64, y: f64) {
+        let (x, y) = (x as f32, y as f32);
+        let action = match self.screenshot.as_mut() {
+            Some(tool) => match kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => tool.pointer_motion(x, y),
+                PointerEventKind::Leave { .. } => {
+                    tool.hover = None;
+                    screenshot::Action::Redraw
+                }
+                PointerEventKind::Press { button: BTN_LEFT, .. } => tool.pointer_press(x, y),
+                PointerEventKind::Release { button: BTN_LEFT, .. } => tool.pointer_release(),
+                _ => screenshot::Action::None,
+            },
+            None => return,
+        };
+        self.handle_screenshot_action(action);
+    }
+
+    fn screenshot_key(&mut self, event: &KeyEvent) {
+        let shift = self.mods.shift;
+        let action = match self.screenshot.as_mut() {
+            Some(tool) => tool.key_press(event.keysym, shift),
+            None => return,
+        };
+        self.handle_screenshot_action(action);
     }
 
     // ---- switcher / launcher ---------------------------------------------
@@ -1113,62 +1747,34 @@ impl App {
         self.set_backdrop("orchard-switcher", Some((0.0, 0.0, w as f32, h as f32, 22.0)));
     }
 
-    fn launcher_origin(&self) -> (f32, f32) {
-        let (w, h) = self
-            .launcher_surf
-            .as_ref()
-            .map(|s| (s.width as f32, s.height as f32))
-            .unwrap_or((self.output_size.0 as f32, self.output_size.1 as f32));
-        ((w - launcher::WIDTH) / 2.0, h * 0.22)
-    }
-
-    fn toggle_launcher(&mut self) {
+    /// Reload desktop entries and app icons if any application directory changed.
+    pub(crate) fn refresh_apps(&mut self) -> bool {
+        if !self.apps.refresh() {
+            return false;
+        }
+        if let Some(lp) = self.launchpad.as_mut() {
+            lp.refresh(&self.apps);
+            self.redraw(Which::Launchpad);
+        }
         if self.launcher.is_some() {
-            self.close_launcher();
-            return;
+            self.launcher_changed();
         }
-        self.launcher = Some(launcher::Launcher::default());
-        let surface = self.compositor.create_surface(&self.qh);
-        let layer = self.layer_shell.create_layer_surface(
-            &self.qh,
-            surface,
-            Layer::Overlay,
-            Some("orchard-launcher"),
-            self.output.as_ref(),
-        );
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer.commit();
-        self.launcher_surf = Some(Surf::new(layer));
-    }
-
-    fn close_launcher(&mut self) {
-        self.launcher = None;
-        self.launcher_surf = None;
-        self.set_backdrop("orchard-launcher", None);
-    }
-
-    fn launcher_changed(&mut self) {
-        if let Some(l) = self.launcher.as_mut() {
-            l.update(&self.apps);
+        let apps = &self.apps;
+        self.dock.rebuild(apps, &self.windows);
+        self.redraw(Which::Dock);
+        self.send_dock_tiles();
+        if let Some(w) = self.windows.iter().find(|w| w.focused) {
+            let name = self
+                .apps
+                .for_app_id(&w.app_id)
+                .map(|e| e.name.clone())
+                .unwrap_or_else(|| if w.title.is_empty() { w.app_id.clone() } else { w.title.clone() });
+            if self.menubar.app_name != name {
+                self.menubar.app_name = name;
+                self.redraw(Which::Bar);
+            }
         }
-        let (x, y) = self.launcher_origin();
-        let h = self.launcher.as_ref().map(|l| l.height()).unwrap_or(0.0);
-        self.set_backdrop("orchard-launcher", Some((x, y, launcher::WIDTH, h, 14.0)));
-        self.redraw(Which::Launcher);
-    }
-
-    fn launch_selected(&mut self) {
-        let cmd = self
-            .launcher
-            .as_ref()
-            .and_then(|l| l.selected_entry(&self.apps))
-            .and_then(|e| e.command());
-        self.close_launcher();
-        if let Some(cmd) = cmd {
-            self.perform(Action::Launch(cmd));
-        }
+        true
     }
 
     // ---- Launchpad --------------------------------------------------------
@@ -1178,6 +1784,7 @@ impl App {
             Some(l) if !l.closing => return self.close_launchpad(),
             Some(_) => {
                 // reopen while it is still fading out
+                self.refresh_apps();
                 if let Some(l) = self.launchpad.as_mut() {
                     l.closing = false;
                 }
@@ -1187,9 +1794,10 @@ impl App {
             None => {}
         }
         if self.launcher.is_some() {
-            self.close_launcher();
+            self.close_launcher_now();
         }
         self.close_menu();
+        self.refresh_apps();
         self.launchpad = Some(launchpad::Launchpad::new(&self.apps));
         self.launchpad_step = Instant::now();
         self.launchpad_backdrop = -1.0;
@@ -1427,13 +2035,14 @@ impl App {
                 MenuItem::new(t("Force Quit…", "Sofort beenden …"), Action::Launch("plasma-systemmonitor || ksysguard".into()))
                     .with_shortcut("⌥⌘⎋"),
                 MenuItem::separator(),
-                MenuItem::new(t("Sleep", "Ruhezustand"), Action::System("systemctl suspend".into())),
-                MenuItem::new(t("Restart…", "Neustart …"), Action::System("systemctl reboot".into())),
-                MenuItem::new(t("Shut Down…", "Ausschalten …"), Action::System("systemctl poweroff".into())),
+                MenuItem::new(t("Sleep", "Ruhezustand"), Action::Confirm(dialog::DialogKind::Sleep)),
+                MenuItem::new(t("Restart…", "Neustart …"), Action::Confirm(dialog::DialogKind::Restart)),
+                MenuItem::new(t("Shut Down…", "Ausschalten …"), Action::Confirm(dialog::DialogKind::ShutDown)),
                 MenuItem::separator(),
                 MenuItem::new(t("Lock Screen", "Bildschirm sperren"), Action::Wm("lock"))
                     .with_shortcut("⌃⌘Q"),
-                MenuItem::new(t("Log Out", "Abmelden"), Action::LogOut).with_shortcut("⌥⇧⌘Q"),
+                MenuItem::new(t("Log Out…", "Abmelden …"), Action::Confirm(dialog::DialogKind::LogOut))
+                    .with_shortcut("⌥⇧⌘Q"),
             ],
             BarItem::App => {
                 let name = self.menubar.app_name.clone();
@@ -1490,6 +2099,21 @@ impl App {
                 t("Open Calendar", "Kalender öffnen"),
                 Action::Launch("merkuro-calendar || korganizer || gnome-calendar".into()),
             )],
+            BarItem::Tray(idx) => {
+                let Some(item) = self.menubar.tray_items.get(idx) else {
+                    return Vec::new();
+                };
+                if let (Some(menu_path), Some(g)) = (item.menu_path.as_deref(), self.gmenu.as_ref()) {
+                    let items = g
+                        .fetch(&item.service, menu_path, 0)
+                        .map(|n| globalmenu::to_items(&n, &item.service, menu_path))
+                        .unwrap_or_default();
+                    if !items.is_empty() {
+                        return items;
+                    }
+                }
+                vec![MenuItem::disabled(item.title.clone())]
+            }
         }
     }
 
@@ -1589,6 +2213,44 @@ impl App {
                     ipc.request("action", json!({ "name": "quit" }));
                 }
             }
+            Action::Confirm(kind) => self.open_dialog(kind),
+            Action::DesktopOpen(path) => self.open_desktop_path(&path),
+            Action::DesktopTrash(path) => {
+                let p = path.clone();
+                let _ = std::process::Command::new("gio").arg("trash").arg(&p).status();
+                self.desktop.rescan();
+                self.redraw(Which::Desktop);
+            }
+            Action::DesktopNewFolder => {
+                let base = if self.german { "Neuer Ordner" } else { "New Folder" };
+                let mut cand = self.desktop.dir.join(base);
+                let mut n = 2u32;
+                while cand.exists() {
+                    cand = self.desktop.dir.join(format!("{base} {n}"));
+                    n += 1;
+                }
+                let _ = std::fs::create_dir_all(&cand);
+                self.desktop.rescan();
+                self.redraw(Which::Desktop);
+            }
+            Action::DesktopSort(sort) => {
+                self.desktop.set_sort(sort);
+                self.redraw(Which::Desktop);
+            }
+            Action::CopyText(text) => {
+                let _ = std::thread::Builder::new().name("wl-copy".into()).spawn(move || {
+                    use std::io::Write;
+                    if let Ok(mut child) = std::process::Command::new("wl-copy")
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                    {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = stdin.write_all(text.as_bytes());
+                        }
+                        let _ = child.wait();
+                    }
+                });
+            }
         }
     }
 
@@ -1638,6 +2300,35 @@ impl App {
     fn bar_pointer(&mut self, qh: &QueueHandle<Self>, kind: &PointerEventKind, x: f64) {
         let width = self.bar.as_ref().map(|s| s.width).unwrap_or(0) as f32;
         let hit = self.menubar.hit(&self.fonts, x as f32, width);
+        if let PointerEventKind::Press { button: BTN_RIGHT, .. } = kind {
+            if let Some(BarItem::Tray(idx)) = hit {
+                self.close_panel();
+                let open_menu = self
+                    .menubar
+                    .tray_items
+                    .get(idx)
+                    .map(|i| i.menu_path.is_some())
+                    .unwrap_or(false);
+                if open_menu {
+                    let tx = self
+                        .menubar
+                        .tray_ranges(&self.fonts, width)
+                        .into_iter()
+                        .find(|(i, _, _)| *i == idx)
+                        .map(|(_, a, _)| a)
+                        .unwrap_or(x as f32);
+                    let items = self.bar_menu(BarItem::Tray(idx));
+                    if !items.is_empty() {
+                        self.open_menu(qh, MenuOwner::Bar(BarItem::Tray(idx)), Menu::new(items, tx, menubar::HEIGHT + 2.0));
+                        return;
+                    }
+                }
+                if let (Some(item), Some(tray)) = (self.menubar.tray_items.get(idx), self.tray.as_ref()) {
+                    tray.context_menu(item.service.clone(), item.path.clone(), x as i32, menubar::HEIGHT as i32);
+                }
+                return;
+            }
+        }
         if let PointerEventKind::Press { button: BTN_LEFT, .. } = kind {
             match hit {
                 Some(BarItem::Clock) => return self.toggle_panel(BarItem::Clock, panel::Kind::Notifications, None),
@@ -1647,6 +2338,28 @@ impl App {
                 }
                 Some(BarItem::Network) => {
                     return self.toggle_panel(BarItem::Network, panel::Kind::Control, Some(panel::Submenu::Wifi))
+                }
+                Some(BarItem::Tray(idx)) => {
+                    self.close_panel();
+                    let Some(item) = self.menubar.tray_items.get(idx).cloned() else { return };
+                    if item.item_is_menu && item.menu_path.is_some() {
+                        let tx = self
+                            .menubar
+                            .tray_ranges(&self.fonts, width)
+                            .into_iter()
+                            .find(|(i, _, _)| *i == idx)
+                            .map(|(_, a, _)| a)
+                            .unwrap_or(x as f32);
+                        let items = self.bar_menu(BarItem::Tray(idx));
+                        if !items.is_empty() {
+                            self.open_menu(qh, MenuOwner::Bar(BarItem::Tray(idx)), Menu::new(items, tx, menubar::HEIGHT + 2.0));
+                            return;
+                        }
+                    }
+                    if let Some(tray) = self.tray.as_ref() {
+                        tray.activate(item.service, item.path, x as i32, menubar::HEIGHT as i32);
+                    }
+                    return;
                 }
                 Some(_) => self.close_panel(),
                 None => {}
@@ -1678,6 +2391,7 @@ impl App {
         match kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                 // magnification follows the position along the Dock
+                let prev_hovered = self.dock.hovered;
                 self.dock.hover_x = Some(self.dock.unmap_point(x as f32, y as f32, sw, sh).0);
                 if self.dock.drag_motion(x as f32, y as f32, sw, sh) {
                     self.dock.hovered = None;
@@ -1685,7 +2399,12 @@ impl App {
                     return;
                 }
                 self.dock.hovered = self.dock.hit(x as f32, y as f32, sw, sh);
-                self.redraw(Which::Dock);
+                if self.dock.cfg.magnification
+                    || self.dock.hovered != prev_hovered
+                    || matches!(kind, PointerEventKind::Enter { .. })
+                {
+                    self.redraw(Which::Dock);
+                }
             }
             PointerEventKind::Leave { .. } => {
                 self.dock.hover_x = None;
@@ -1887,7 +2606,7 @@ impl LayerShellHandler for App {
         match self.which(layer.wl_surface()) {
             Some(Which::Menu) => self.menu_surf = None,
             Some(Which::Switcher) => self.switcher_surf = None,
-            Some(Which::Launcher) => self.close_launcher(),
+            Some(Which::Launcher) => self.close_launcher_now(),
             Some(Which::Osd) => {
                 self.osd = None;
                 self.osd_surf = None;
@@ -1895,6 +2614,9 @@ impl LayerShellHandler for App {
             Some(Which::Notify) => self.notes_surf = None,
             Some(Which::Panel) => self.close_panel(),
             Some(Which::Launchpad) => self.drop_launchpad(),
+            Some(Which::Screenshot) => self.close_screenshot_tool(),
+            Some(Which::Dialog) => self.close_dialog(),
+            Some(Which::Desktop) => self.desktop_surf = None,
             // the compositor closes layers of an output that went away
             Some(Which::Bar | Which::Dock) => {
                 self.drop_surfaces();
@@ -1942,7 +2664,17 @@ impl SeatHandler for App {
             self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
         }
         if cap == Capability::Keyboard && self.keyboard.is_none() {
-            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+            let repeat: smithay_client_toolkit::seat::keyboard::repeat::RepeatCallback<App> = Box::new(|app: &mut App, _, event| {
+                // only text editing repeats; Escape or Return must not
+                if app.launcher_active() && !matches!(event.keysym, Keysym::Escape | Keysym::Return | Keysym::KP_Enter) {
+                    app.launcher_key(&event);
+                    app.flush_draws();
+                }
+            });
+            self.keyboard = self
+                .seat_state
+                .get_keyboard_with_repeat(qh, &seat, None, self.loop_handle.clone(), repeat)
+                .ok();
         }
     }
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, cap: Capability) {
@@ -1979,6 +2711,9 @@ impl PointerHandler for App {
                 Which::Notify => self.notes_pointer(&ev.kind, x, y),
                 Which::Panel => self.panel_pointer(&ev.kind, x, y),
                 Which::Launchpad => self.launchpad_pointer(&ev.kind, x, y),
+                Which::Screenshot => self.screenshot_pointer(&ev.kind, x, y),
+                Which::Dialog => self.dialog_pointer(&ev.kind, x, y),
+                Which::Desktop => self.desktop_pointer(qh, &ev.kind, x, y),
             }
         }
         self.flush_frames(qh);
@@ -2005,36 +2740,6 @@ delegate_seat!(App);
 delegate_pointer!(App);
 delegate_keyboard!(App);
 
-impl App {
-    fn launcher_pointer(&mut self, kind: &PointerEventKind, x: f64, y: f64) {
-        let Some(l) = self.launcher.as_ref() else { return };
-        let (ox, oy) = self.launcher_origin();
-        let (lx, ly) = (x as f32 - ox, y as f32 - oy);
-        let inside = lx >= 0.0 && lx <= launcher::WIDTH && ly >= 0.0 && ly <= l.height();
-        match kind {
-            PointerEventKind::Motion { .. } => {
-                if let Some(row) = l.row_at(ly).filter(|_| inside) {
-                    if row != l.selected {
-                        self.launcher.as_mut().unwrap().selected = row;
-                        self.redraw(Which::Launcher);
-                    }
-                }
-            }
-            PointerEventKind::Press { .. } => {
-                if !inside {
-                    self.close_launcher();
-                }
-            }
-            PointerEventKind::Release { .. } => {
-                if inside && l.row_at(ly).is_some() {
-                    self.launch_selected();
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 impl KeyboardHandler for App {
     fn enter(
         &mut self,
@@ -2049,56 +2754,33 @@ impl KeyboardHandler for App {
     }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
-        if self.launchpad.as_ref().map(|l| !l.closing).unwrap_or(false) && self.launcher.is_none() {
+        if self.dialog.is_some() {
+            self.dialog_key(&event);
+            return;
+        }
+        if self.screenshot.is_some() {
+            self.screenshot_key(&event);
+            return;
+        }
+        if self.launchpad.as_ref().map(|l| !l.closing).unwrap_or(false) && !self.launcher_active() {
             self.launchpad_key(event);
             return;
         }
-        if self.launcher.is_none() {
-            if event.keysym == Keysym::Escape && self.menu.is_some() {
-                self.close_menu();
-            }
-            if event.keysym == Keysym::Escape && self.panel.is_some() {
-                if self.panel.as_ref().is_some_and(|p| p.submenu.is_some() && !p.standalone) {
-                    if let Some(p) = self.panel.as_mut() {
-                        p.close_submenu();
-                    }
-                    self.redraw(Which::Panel);
-                } else {
-                    self.close_panel();
-                }
-            }
+        if self.launcher_active() {
+            self.launcher_key(&event);
             return;
         }
-        match event.keysym {
-            Keysym::Escape => self.close_launcher(),
-            Keysym::Return | Keysym::KP_Enter => self.launch_selected(),
-            Keysym::Down => {
-                if let Some(l) = self.launcher.as_mut() {
-                    if l.selected + 1 < l.results.len() {
-                        l.selected += 1;
-                    }
+        if event.keysym == Keysym::Escape && self.menu.is_some() {
+            self.close_menu();
+        }
+        if event.keysym == Keysym::Escape && self.panel.is_some() {
+            if self.panel.as_ref().is_some_and(|p| p.submenu.is_some() && !p.standalone) {
+                if let Some(p) = self.panel.as_mut() {
+                    p.close_submenu();
                 }
-                self.redraw(Which::Launcher);
-            }
-            Keysym::Up => {
-                if let Some(l) = self.launcher.as_mut() {
-                    l.selected = l.selected.saturating_sub(1);
-                }
-                self.redraw(Which::Launcher);
-            }
-            Keysym::BackSpace => {
-                if let Some(l) = self.launcher.as_mut() {
-                    l.query.pop();
-                }
-                self.launcher_changed();
-            }
-            _ => {
-                if let Some(text) = event.utf8.filter(|t| !t.chars().any(|c| c.is_control())) {
-                    if let Some(l) = self.launcher.as_mut() {
-                        l.query.push_str(&text);
-                    }
-                    self.launcher_changed();
-                }
+                self.redraw(Which::Panel);
+            } else {
+                self.close_panel();
             }
         }
     }
@@ -2109,9 +2791,10 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: u32,
     ) {
+        self.mods = modifiers;
     }
 }
 delegate_layer!(App);

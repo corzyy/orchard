@@ -107,9 +107,10 @@ pub fn desktop_dock(ui: &mut Ui, s: &mut Settings) {
 
         ui.row_toggle("Animate opening applications", None, &mut s.dock.animate_launch);
         ui.row_toggle("Show indicators for open applications", None, &mut s.dock.show_indicators);
+        ui.row_toggle("Show items on desktop", None, &mut s.windows.show_desktop_icons);
     });
 
-    ui.section("Windows & Mission Control");
+    ui.section("Windows");
     ui.group("dock-win", |ui| {
         let dbl_opts = vec![
             ("zoom".into(), "Zoom".into()),
@@ -133,9 +134,13 @@ pub fn desktop_dock(ui: &mut Ui, s: &mut Settings) {
             Some("Keyboard focus moves to the window under the pointer"),
             &mut s.windows.focus_follows_mouse,
         );
+    });
+
+    ui.section("Mission Control");
+    ui.group("dock-mc", |ui| {
         ui.row_toggle(
-            "Switch Space when activating an app",
-            Some("Jump to a Space that has open windows for the app"),
+            "When switching to an application, switch to a Space with open windows for the application",
+            None,
             &mut s.desktop.switch_space_on_activate,
         );
     });
@@ -211,6 +216,8 @@ struct Output {
     mode_w: i32,
     mode_h: i32,
     primary: bool,
+    vrr_supported: bool,
+    vrr_enabled: bool,
 }
 
 fn hz(mhz: i32) -> String {
@@ -244,6 +251,8 @@ fn load_outputs() -> Vec<Output> {
                         mode_w: o["mode_w"].as_i64().unwrap_or(0) as i32,
                         mode_h: o["mode_h"].as_i64().unwrap_or(0) as i32,
                         primary: o["primary"].as_bool().unwrap_or(false),
+                        vrr_supported: o["vrr_supported"].as_bool().unwrap_or(false),
+                        vrr_enabled: o["vrr_enabled"].as_bool().unwrap_or(false),
                     })
                 })
                 .collect()
@@ -337,6 +346,15 @@ pub fn displays(ui: &mut Ui, s: &mut Settings, st: &mut DesktopState, wake: &Wak
             } else if o.refresh > 0 {
                 ui.row_value("Refresh rate", &hz(o.refresh));
             }
+
+            let vrr_status = if o.vrr_enabled {
+                "Active"
+            } else if o.vrr_supported {
+                "Supported"
+            } else {
+                "Not supported"
+            };
+            ui.row_value("Adaptive Sync (VRR)", vrr_status);
 
             if outputs.len() > 1 {
                 let mut main = o.primary;

@@ -201,11 +201,18 @@ impl<BackendData: Backend> PointerTarget<OrchardState<BackendData>> for SSD {
         event: &MotionEvent,
     ) {
         let client = self.0.client_geometry().size;
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(event.location);
-            data.cursor_status = ssd_cursor(event.location, client.w, client.h);
-        }
+        let on_zoom = {
+            let mut state = self.0.decoration_state();
+            if state.is_ssd {
+                state.header_bar.pointer_enter(event.location);
+                data.cursor_status = ssd_cursor(event.location, client.w, client.h);
+                crate::chrome::titlebar::TrafficLight::hit(event.location.x, event.location.y)
+                    == Some(crate::chrome::titlebar::TrafficLight::Zoom)
+            } else {
+                false
+            }
+        };
+        data.tile_menu_hover(&self.0, on_zoom);
     }
     fn motion(
         &self,
@@ -214,11 +221,18 @@ impl<BackendData: Backend> PointerTarget<OrchardState<BackendData>> for SSD {
         event: &MotionEvent,
     ) {
         let client = self.0.client_geometry().size;
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_enter(event.location);
-            data.cursor_status = ssd_cursor(event.location, client.w, client.h);
-        }
+        let on_zoom = {
+            let mut state = self.0.decoration_state();
+            if state.is_ssd {
+                state.header_bar.pointer_enter(event.location);
+                data.cursor_status = ssd_cursor(event.location, client.w, client.h);
+                crate::chrome::titlebar::TrafficLight::hit(event.location.x, event.location.y)
+                    == Some(crate::chrome::titlebar::TrafficLight::Zoom)
+            } else {
+                false
+            }
+        };
+        data.tile_menu_hover(&self.0, on_zoom);
     }
     fn relative_motion(
         &self,
@@ -252,14 +266,17 @@ impl<BackendData: Backend> PointerTarget<OrchardState<BackendData>> for SSD {
     fn leave(
         &self,
         _seat: &Seat<OrchardState<BackendData>>,
-        _data: &mut OrchardState<BackendData>,
+        data: &mut OrchardState<BackendData>,
         _serial: Serial,
         _time: u32,
     ) {
-        let mut state = self.0.decoration_state();
-        if state.is_ssd {
-            state.header_bar.pointer_leave();
+        {
+            let mut state = self.0.decoration_state();
+            if state.is_ssd {
+                state.header_bar.pointer_leave();
+            }
         }
+        data.tile_menu_hover(&self.0, false);
     }
     fn gesture_swipe_begin(
         &self,
@@ -495,6 +512,7 @@ impl AsRenderElements<GlesRenderer> for WindowElement {
                 pressed: state.header_bar.pressed,
                 title,
                 fullscreen: false,
+                alt_held: chrome::alt_held(),
             };
 
             let mut vec: Vec<WindowRenderElement> = Vec::new();
@@ -520,12 +538,19 @@ impl AsRenderElements<GlesRenderer> for WindowElement {
             let main_id = self.wl_surface().map(|s| Id::from_wayland_resource(&*s));
             let program = crate::effects::rounded::program(renderer);
             let radius = (theme::corner_radius() as f64 * scale.x) as f32;
+            let rim_rgba = match (theme::appearance(), active) {
+                (theme::Appearance::Dark, true) => [1.0, 1.0, 1.0, 0.14],
+                (theme::Appearance::Dark, false) => [1.0, 1.0, 1.0, 0.07],
+                (theme::Appearance::Light, true) => [0.0, 0.0, 0.0, 0.10],
+                (theme::Appearance::Light, false) => [0.0, 0.0, 0.0, 0.06],
+            };
+            let rim_w = (scale.x as f32).max(1.0);
             let client_elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
                 AsRenderElements::render_elements(&self.0, renderer, client_location, scale, alpha);
             for e in client_elems {
                 match (&program, &main_id) {
                     (Some(p), Some(id)) if e.id() == id => vec.push(WindowRenderElement::Rounded(
-                        RoundedElement::new(e, p.clone(), radius, Corners::BOTTOM),
+                        RoundedElement::new(e, p.clone(), radius, Corners::BOTTOM).with_rim(rim_rgba, rim_w),
                     )),
                     _ => vec.push(WindowRenderElement::Window(e)),
                 }

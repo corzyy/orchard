@@ -127,7 +127,7 @@ fn layer_elements(
     pending: &mut Vec<PendingBackdrop>,
     out: &mut Vec<OutputRenderElements>,
 ) {
-    layer_elements_where(renderer, output, layer, scale, blur, backdrops, pending, out, |_| true)
+    layer_elements_filtered(renderer, output, layer, scale, blur, backdrops, pending, out, |_, _| true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -142,11 +142,26 @@ fn layer_elements_where(
     out: &mut Vec<OutputRenderElements>,
     keep: impl Fn(Rectangle<i32, Logical>) -> bool,
 ) {
+    layer_elements_filtered(renderer, output, layer, scale, blur, backdrops, pending, out, |_, geo| keep(geo))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn layer_elements_filtered(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    layer: Layer,
+    scale: f64,
+    blur: bool,
+    backdrops: &Backdrops,
+    pending: &mut Vec<PendingBackdrop>,
+    out: &mut Vec<OutputRenderElements>,
+    keep: impl Fn(&str, Rectangle<i32, Logical>) -> bool,
+) {
     let map = layer_map_for_output(output);
     for surface in layers_top_first(&map, layer) {
         let surface = &surface;
         let Some(geo) = map.layer_geometry(surface) else { continue };
-        if !keep(geo) {
+        if !keep(surface.namespace(), geo) {
             continue;
         }
         let loc = geo.loc.to_physical_precise_round(scale);
@@ -204,7 +219,7 @@ fn resolve_backdrops(
     }
     fx.blur.evict(now);
     let program = crate::effects::rounded::program(renderer);
-    let live = crate::effects::blur::enabled();
+    let live = crate::settings::effective_live_blur();
     for p in pending.into_iter().rev() {
         let blurred = if live {
             fx.blur
@@ -282,6 +297,7 @@ fn fs_reveal_elements(
             pressed: r.pressed,
             title: window.title(),
             fullscreen: true,
+            alt_held: false,
         };
         (r.menu_h, r.chrome.titlebar(params).cloned())
     }) else {
@@ -968,7 +984,10 @@ fn output_elements_inner(
         .and_then(|f| f.get())
         .filter(|_| !mc_here)
     {
-        layer_elements(renderer, output, Layer::Overlay, scale, false, backdrops, &mut Vec::new(), &mut out);
+        let hide_shot = ctx.fx.hide_screenshot_ui;
+        layer_elements_filtered(renderer, output, Layer::Overlay, scale, false, backdrops, &mut Vec::new(), &mut out, |ns, _| {
+            !(hide_shot && ns == "orchard-screenshot")
+        });
         let mut pending = Vec::new();
         fs_reveal_elements(renderer, output, output_geo, &window, scale, backdrops, &mut pending, &mut out);
         window_elements(renderer, output_geo, &window, output_geo.loc, 0.0, scale, now, &mut out);
@@ -995,7 +1014,10 @@ fn output_elements_inner(
             wallpaper_tex = Some((wp.sharp_texture.clone(), (wp.size.w, wp.size.h)));
         }
     }
-    layer_elements(renderer, output, Layer::Overlay, scale, true, backdrops, &mut pending, &mut out);
+    let hide_shot = ctx.fx.hide_screenshot_ui;
+    layer_elements_filtered(renderer, output, Layer::Overlay, scale, true, backdrops, &mut pending, &mut out, |ns, _| {
+        !(hide_shot && ns == "orchard-screenshot")
+    });
     // animating snapshots float above regular windows; the genie also passes
     // over the Dock (and the menu bar), like on macOS
     let transient_on = |t: &crate::effects::Transient| {
@@ -1024,6 +1046,21 @@ fn output_elements_inner(
         mission_control_elements(renderer, output, output_geo, mc, ctx, wallpaper_tex.clone(), leave_off, scale, now, &mut out);
     }
 
+    // Green traffic-light Move & Resize popover (drawn above windows, frosted glass)
+    if let Some(menu) = ctx.fx.tile_menu.as_mut() {
+        let id = menu.backdrop_id.clone();
+        if let Some((el, phys, radius)) = menu.render_element(renderer, output_geo, scale) {
+            out.push(OutputRenderElements::Label(el));
+            pending.push(PendingBackdrop {
+                index: out.len(),
+                id,
+                region: phys,
+                radius,
+                alpha: 1.0,
+            });
+        }
+    }
+
     // tile drop preview: right below the dragged (topmost) window
     let mut preview = ctx
         .fx
@@ -1039,6 +1076,33 @@ fn output_elements_inner(
         }
         if let Some(loc) = space.element_location(window) {
             window_elements(renderer, output_geo, window, loc, enter_off, scale, now, &mut out);
+            // Client-requested blur (org_kde_kwin_blur): insert a live Kawase
+            // frosted-glass backdrop right behind this window's client area.
+            if mc.is_none() && enter_off.abs() < 0.5 && !window.is_fullscreen() {
+                if let Some(blur_id) = crate::kde_blur::window_blur_id(window) {
+                    let is_ssd = window.is_ssd();
+                    let client_geo = window.client_geometry();
+                    let top_off = if is_ssd { crate::shell::ssd::HEADER_BAR_HEIGHT } else { 0 };
+                    let rect = Rectangle::<f64, Logical>::new(
+                        (
+                            (loc.x - output_geo.loc.x) as f64,
+                            (loc.y - output_geo.loc.y + top_off) as f64,
+                        )
+                            .into(),
+                        (client_geo.size.w as f64, client_geo.size.h as f64).into(),
+                    )
+                    .to_physical_precise_round(scale);
+                    let (_, alpha) = window.anim().transform(now);
+                    let radius = (crate::chrome::theme::corner_radius() as f64 * scale) as f32;
+                    pending.push(PendingBackdrop {
+                        index: out.len(),
+                        id: blur_id,
+                        region: rect,
+                        radius,
+                        alpha,
+                    });
+                }
+            }
         }
         if let Some((r, a)) = preview.take() {
             tile_preview_elements(ctx.fx, r, a, output_geo, scale, &mut out);

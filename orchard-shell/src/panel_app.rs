@@ -91,6 +91,22 @@ impl App {
 
     /// Query (and optionally change) Wi-Fi, Bluetooth, volume … on a helper thread.
     pub(crate) fn refresh_control(&mut self, target: Option<Target>, value: Option<f32>) {
+        // Fast path for volume/brightness sliders & mute: apply without spawning the
+        // full 15-subprocess `query_control()` on every drag tick.
+        if let Some(ref t) = target {
+            if matches!(t, Target::Volume(..) | Target::Brightness(..) | Target::VolumeMute) {
+                let t = t.clone();
+                if let Some(p) = self.panel.as_ref() {
+                    self.control_cache.volume = p.control.volume;
+                    self.control_cache.displays = p.control.displays.clone();
+                }
+                let displays = self.control_cache.displays.clone();
+                let _ = std::thread::Builder::new().name("control-slider".into()).spawn(move || {
+                    panel::run_control_slider(&t, value, &displays);
+                });
+                return;
+            }
+        }
         let tx = self.control_tx.clone();
         let current = self.control_cache.clone();
         let _ = std::thread::Builder::new().name("control-center".into()).spawn(move || {
@@ -112,12 +128,16 @@ impl App {
         if let Some(p) = self.panel.as_mut() {
             // keep the slider where the user holds it
             let volume = p.control.volume;
-            let brightness = p.control.brightness;
+            let displays = p.control.displays.clone();
             p.control = st;
             p.busy_item = None;
             match p.dragging {
                 Some(Target::Volume(..)) => p.control.volume = volume,
-                Some(Target::Brightness(..)) => p.control.brightness = brightness,
+                Some(Target::Brightness(idx, ..)) => {
+                    if let (Some(old), Some(cur)) = (displays.get(idx), p.control.displays.get_mut(idx)) {
+                        cur.value = old.value;
+                    }
+                }
                 _ => {}
             }
             self.redraw(Which::Panel);
@@ -149,7 +169,11 @@ impl App {
                         self.redraw(Which::Bar);
                     }
                 }
-                Target::Brightness(..) => p.control.brightness = Some(v),
+                Target::Brightness(idx, ..) => {
+                    if let Some(d) = p.control.displays.get_mut(*idx) {
+                        d.value = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -166,21 +190,18 @@ impl App {
         let (x, y) = (x as f32, y as f32);
         match kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                let (dragging, prev_hit, is_nc) = match self.panel.as_ref() {
+                let (dragging, prev_hit) = match self.panel.as_ref() {
                     Some(p) => (
                         p.dragging.clone(),
                         p.hover.and_then(|(hx, hy)| p.hit(hx, hy)),
-                        p.kind == Kind::Notifications,
                     ),
-                    None => (None, None, false),
+                    None => (None, None),
                 };
                 if let Some(p) = self.panel.as_mut() {
                     p.hover = Some((x, y));
                 }
                 if let Some(t) = dragging {
                     self.set_slider(&t, x);
-                } else if is_nc {
-                    self.redraw(Which::Panel);
                 } else {
                     let new_hit = self.panel.as_ref().and_then(|p| p.hit(x, y));
                     if new_hit != prev_hit {

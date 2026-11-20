@@ -81,8 +81,8 @@ pub struct ControlState {
     /// 0..1, muted
     pub volume: Option<(f32, bool)>,
     pub audio_sinks: Vec<AudioSink>,
-    /// 0..1 (only with a backlight)
-    pub brightness: Option<f32>,
+    /// Controllable displays (built-in backlight + DDC/CI external monitors)
+    pub displays: Vec<crate::ddc::DisplayBrightness>,
     pub media: Option<Media>,
 }
 
@@ -118,7 +118,8 @@ pub enum Target {
     /// slider: x range of the track
     Volume(f32, f32),
     VolumeMute,
-    Brightness(f32, f32),
+    /// `(display_index, min_x, max_x)`
+    Brightness(usize, f32, f32),
     MediaPrev,
     MediaPlay,
     MediaNext,
@@ -234,7 +235,7 @@ impl Panel {
     /// Slider value for pointer x.
     pub fn slider_value(target: &Target, x: f32) -> Option<f32> {
         match target {
-            Target::Volume(a, b) | Target::Brightness(a, b) => Some(((x - a) / (b - a)).clamp(0.0, 1.0)),
+            Target::Volume(a, b) | Target::Brightness(_, a, b) => Some(((x - a) / (b - a)).clamp(0.0, 1.0)),
             _ => None,
         }
     }
@@ -432,8 +433,11 @@ impl Panel {
 
         // compute height first
         let mut height = pad + 110.0 + pad;
-        if self.control.brightness.is_some() {
+        let disp_count = self.control.displays.len();
+        if disp_count == 1 {
             height += 64.0 + pad;
+        } else if disp_count > 1 {
+            height += 28.0 + disp_count as f32 * 44.0 + 6.0 + pad;
         }
         height += 64.0 + pad; // sound
         if self.control.media.is_some() {
@@ -544,16 +548,44 @@ impl Panel {
 
         // sliders
         let mut y = y + 110.0 + pad;
-        if let Some(b) = self.control.brightness {
+        if self.control.displays.len() == 1 {
+            let d = &self.control.displays[0];
             fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
             stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
             let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
             fonts.draw(pm, t("Display", "Display"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
-            draw_pill_slider(pm, s, inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0, b, 0, false, off);
+            if d.bus.is_some() {
+                let name = fonts.elide(&d.name, 11.0 * s, Weight::Regular, (inner_w - 86.0) * s);
+                let nw = fonts.measure(&name, 11.0 * s, Weight::Regular);
+                let nb = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 11.0 * s, Weight::Regular);
+                fonts.draw(pm, &name, (inner_x + inner_w - 12.0) * s - nw, nb, 11.0 * s, Weight::Regular, sub);
+            }
+            draw_pill_slider(pm, s, inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0, d.value, 0, false, off);
             let (tx, ty, tw, th) = (inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0);
-            self.targets
-                .push(((tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0), Target::Brightness(tx + th / 2.0, tx + tw - th / 2.0)));
+            self.targets.push((
+                (tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0),
+                Target::Brightness(0, tx + th / 2.0, tx + tw - th / 2.0),
+            ));
             y += 64.0 + pad;
+        } else if self.control.displays.len() > 1 {
+            let card_h = 28.0 + self.control.displays.len() as f32 * 44.0 + 6.0;
+            fill_rounded(pm, inner_x * s, y * s, inner_w * s, card_h * s, 14.0 * s, card);
+            stroke_rounded(pm, inner_x * s, y * s, inner_w * s, card_h * s, 14.0 * s, 0.75 * s, card_border);
+            let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
+            fonts.draw(pm, t("Displays", "Displays"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
+            for (idx, d) in self.control.displays.iter().enumerate() {
+                let ry = y + 28.0 + idx as f32 * 44.0;
+                let lb = fonts.baseline_centered(ry * s, 14.0 * s, 11.0 * s, Weight::Regular);
+                let label = fonts.elide(&d.name, 11.0 * s, Weight::Regular, (inner_w - 24.0) * s);
+                fonts.draw(pm, &label, (inner_x + 12.0) * s, lb, 11.0 * s, Weight::Regular, sub);
+                let (tx, ty, tw, th) = (inner_x + 12.0, ry + 16.0, inner_w - 24.0, 22.0);
+                draw_pill_slider(pm, s, tx, ty, tw, th, d.value, 0, false, off);
+                self.targets.push((
+                    (tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0),
+                    Target::Brightness(idx, tx + th / 2.0, tx + tw - th / 2.0),
+                ));
+            }
+            y += card_h + pad;
         }
 
         // Sound card (header opens Sound submenu, slider adjusts volume)
@@ -1648,11 +1680,7 @@ pub fn query_control() -> ControlState {
     let volume = cmd("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).and_then(|o| crate::osd::parse_wpctl(&o));
     let audio_sinks = query_audio_sinks();
 
-    let brightness = std::fs::read_dir("/sys/class/backlight")
-        .ok()
-        .and_then(|mut d| d.next())
-        .and_then(|_| cmd("brightnessctl", &["-m"]))
-        .and_then(|o| crate::osd::parse_brightnessctl(&o));
+    let displays = crate::ddc::query_displays();
 
     let media = sh("playerctl metadata --format '{{status}}\t{{title}}\t{{artist}}'").and_then(|o| {
         let mut parts = o.trim_end_matches('\n').splitn(3, '\t');
@@ -1671,8 +1699,30 @@ pub fn query_control() -> ControlState {
         bt_devices,
         volume,
         audio_sinks,
-        brightness,
+        displays,
         media,
+    }
+}
+
+/// Fast path for sliders & mute: only applies the system change without running
+/// the 15-subprocess full `query_control()`.
+pub fn run_control_slider(target: &Target, value: Option<f32>, displays: &[crate::ddc::DisplayBrightness]) {
+    match target {
+        Target::Volume(..) => {
+            if let Some(v) = value {
+                let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
+                let _ = cmd("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{:.3}", v)]);
+            }
+        }
+        Target::VolumeMute => {
+            let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]);
+        }
+        Target::Brightness(idx, ..) => {
+            if let (Some(v), Some(d)) = (value, displays.get(*idx)) {
+                crate::ddc::set_brightness(d.bus, v);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1722,9 +1772,9 @@ pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) 
         Target::VolumeMute => {
             let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]);
         }
-        Target::Brightness(..) => {
-            if let Some(v) = value {
-                let _ = cmd("brightnessctl", &["-q", "set", &format!("{}%", (v * 100.0).round().max(1.0))]);
+        Target::Brightness(idx, ..) => {
+            if let (Some(v), Some(d)) = (value, current.displays.get(*idx)) {
+                crate::ddc::set_brightness(d.bus, v);
             }
         }
         Target::MediaPrev => {

@@ -20,8 +20,16 @@ pub enum Action {
     TogglePin(String),
     OpenTrash,
     LogOut,
+    /// macOS-style confirmation dialog (Shut Down, Restart, Log Out, Sleep)
+    Confirm(crate::dialog::DialogKind),
     /// click an item of an app's global menu
     DbusMenu { service: String, path: String, id: i32 },
+    /// desktop icon actions
+    DesktopOpen(std::path::PathBuf),
+    DesktopTrash(std::path::PathBuf),
+    DesktopNewFolder,
+    DesktopSort(crate::desktop::SortBy),
+    CopyText(String),
 }
 
 #[derive(Debug, Clone)]

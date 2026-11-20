@@ -18,6 +18,7 @@ pub mod fs_reveal;
 #[cfg(feature = "headless")]
 pub mod headless;
 pub mod input_handler;
+pub mod kde_blur;
 pub mod mission_control;
 pub mod ipc;
 pub mod protocols;

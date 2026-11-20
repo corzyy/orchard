@@ -145,6 +145,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             KeyAction::ScreenshotArea(clip) => self.start_area_screenshot(clip),
             KeyAction::ScreenshotCancel => self.cancel_area_screenshot(),
             KeyAction::ScreenshotWindowMode => self.toggle_screenshot_window_mode(),
+            KeyAction::ScreenshotTool => self.open_screenshot_tool(),
             KeyAction::Media(key, fine) => self.ipc_broadcast(&crate::ipc::Event::MediaKey { key, fine }),
             KeyAction::Tile(t) => {
                 if let Some(w) = self.focused_window() {
@@ -276,6 +277,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         let action = keyboard
             .input(self, keycode, state, serial, time, |st, modifiers, handle| {
                 let keysym = handle.modified_sym();
+                crate::chrome::set_alt_held(modifiers.alt);
 
                 debug!(
                     ?state,
@@ -384,6 +386,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         }
 
         if self.fs_reveal_button(button, state == wl_pointer::ButtonState::Pressed) {
+            return;
+        }
+        if self.tile_menu_button(button, state == wl_pointer::ButtonState::Pressed) {
             return;
         }
         if wl_pointer::ButtonState::Pressed == state {
@@ -511,7 +516,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         }
         let output = self.space.outputs().find(|o| {
             let geometry = self.space.output_geometry(o).unwrap();
-            geometry.contains(pos.to_i32_round())
+            geometry.contains(pos.to_i32_floor())
         })?;
         let output_geo = self.space.output_geometry(output).unwrap();
         let layers = layer_map_for_output(output);
@@ -701,7 +706,12 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     ) {
         let output_geo = self.space.output_geometry(output).unwrap();
 
-        let pos = evt.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+        let raw = evt.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+        let pos: Point<f64, Logical> = (
+            raw.x.clamp(output_geo.loc.x as f64, (output_geo.loc.x + output_geo.size.w - 1).max(output_geo.loc.x) as f64),
+            raw.y.clamp(output_geo.loc.y as f64, (output_geo.loc.y + output_geo.size.h - 1).max(output_geo.loc.y) as f64),
+        )
+            .into();
         let serial = SCOUNTER.next_serial();
         if self.mc.is_some() {
             self.mc_motion(pos);
@@ -779,6 +789,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if self.fs_reveal_button(button, pressed) {
             return;
         }
+        if self.tile_menu_button(button, pressed) {
+            return;
+        }
         let serial = SCOUNTER.next_serial();
         if pressed {
             let logo = self.seat.get_keyboard().map(|k| k.modifier_state().logo).unwrap_or(false)
@@ -831,6 +844,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             "screenshot-area" => KeyAction::ScreenshotArea(false),
             "screenshot-cancel" => KeyAction::ScreenshotCancel,
             "screenshot-window" => KeyAction::ScreenshotWindowMode,
+            "screenshot-tool" => KeyAction::ScreenshotTool,
             "lock" => KeyAction::Run(crate::settings::locker()),
             "terminal" => KeyAction::Run(crate::settings::terminal()),
             "volume-up" => KeyAction::Media("volume_up", false),
@@ -901,7 +915,8 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         let serial = SCOUNTER.next_serial();
 
         let pointer = self.pointer.clone();
-        let under = self.surface_under(pointer_location);
+        let over_tile_menu = self.tile_menu_motion(pointer_location);
+        let under = if over_tile_menu { None } else { self.surface_under(pointer_location) };
 
         // The constraint belongs to the surface with pointer focus. (Looking
         // it up under the cursor let anything drawn above the game, a panel,
@@ -966,8 +981,15 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if self.mc.is_some() {
             self.mc_motion(pointer_location);
         }
+        let over_tile_menu = self.tile_menu_motion(pointer_location);
 
-        let new_under = if constrained { constrained_target.clone() } else { self.surface_under(pointer_location) };
+        let new_under = if over_tile_menu {
+            None
+        } else if constrained {
+            constrained_target.clone()
+        } else {
+            self.surface_under(pointer_location)
+        };
 
         // focus the surface the pointer moved onto (not the one it left)
         pointer.motion(
@@ -1009,18 +1031,19 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             .space
             .outputs()
             .fold(0, |acc, o| acc + self.space.output_geometry(o).unwrap().size.w);
-        let clamped_x = pos_x.clamp(0.0, max_x as f64);
-        let max_y = self
+        let clamped_x = pos_x.clamp(0.0, (max_x as f64 - 1.0).max(0.0));
+        let y_bounds = self
             .space
             .outputs()
-            .find(|o| {
-                let geo = self.space.output_geometry(o).unwrap();
-                geo.contains((clamped_x as i32, 0))
-            })
-            .map(|o| self.space.output_geometry(o).unwrap().size.h);
+            .find_map(|o| {
+                let geo = self.space.output_geometry(o)?;
+                let cx = clamped_x as i32;
+                (cx >= geo.loc.x && cx < geo.loc.x + geo.size.w)
+                    .then_some((geo.loc.y as f64, (geo.loc.y + geo.size.h - 1).max(geo.loc.y) as f64))
+            });
 
-        if let Some(max_y) = max_y {
-            let clamped_y = pos_y.clamp(0.0, max_y as f64);
+        if let Some((min_y, max_y)) = y_bounds {
+            let clamped_y = pos_y.clamp(min_y, max_y);
             (clamped_x, clamped_y).into()
         } else {
             (clamped_x, pos_y).into()
@@ -1263,7 +1286,8 @@ impl OrchardState<UdevData> {
         pointer_location = self.clamp_coords(pointer_location);
 
         let pointer = self.pointer.clone();
-        let under = self.surface_under(pointer_location);
+        let over_tile_menu = self.tile_menu_motion(pointer_location);
+        let under = if over_tile_menu { None } else { self.surface_under(pointer_location) };
 
         pointer.motion(
             self,
@@ -1687,6 +1711,8 @@ enum KeyAction {
     /// Escape / Space while picking an area
     ScreenshotCancel,
     ScreenshotWindowMode,
+    /// Print / Super+Shift+5: macOS-style interactive screenshot toolbar
+    ScreenshotTool,
     /// volume / brightness / media keys, handled by orchard-shell (key, fine step)
     Media(&'static str, bool),
     /// Option+Cmd+arrows: tile the focused window
@@ -1727,6 +1753,10 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(if modifiers.ctrl { KeyAction::ScreenshotToClipboard } else { KeyAction::Screenshot })
     } else if cmd && modifiers.shift && (keysym == Keysym::_4 || keysym == Keysym::dollar) {
         Some(KeyAction::ScreenshotArea(modifiers.ctrl))
+    } else if (!cmd && !modifiers.ctrl && !modifiers.alt && keysym == Keysym::Print)
+        || (cmd && modifiers.shift && (keysym == Keysym::_5 || keysym == Keysym::percent))
+    {
+        Some(KeyAction::ScreenshotTool)
     } else if cmd && modifiers.alt && modifiers.shift && keysym == Keysym::Escape {
         Some(KeyAction::ForceQuit)
     } else if cmd && modifiers.alt && !modifiers.shift && keysym == Keysym::Escape {

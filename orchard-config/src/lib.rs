@@ -256,6 +256,8 @@ pub struct WindowSettings {
     pub double_click_titlebar: TitlebarDoubleClick,
     /// Focus follows the pointer (no raise).
     pub focus_follows_mouse: bool,
+    /// Show files and folders from ~/Desktop on the desktop background.
+    pub show_desktop_icons: bool,
 }
 
 impl Default for WindowSettings {
@@ -263,6 +265,7 @@ impl Default for WindowSettings {
         Self {
             double_click_titlebar: TitlebarDoubleClick::Zoom,
             focus_follows_mouse: false,
+            show_desktop_icons: true,
         }
     }
 }
@@ -448,6 +451,86 @@ impl Default for AppSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VrrMode {
+    #[default]
+    Off,
+    /// Enable VRR automatically while a fullscreen window is active on the output.
+    Fullscreen,
+    /// Always enable VRR on outputs that support it.
+    On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformancePreset {
+    #[default]
+    Balanced,
+    /// Lowest latency: VRR for fullscreen, direct scanout, tighter frame pacing.
+    Performance,
+    /// Battery-friendly: static wallpaper blur and reduced background polling.
+    PowerSaver,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PerformanceSettings {
+    pub preset: PerformancePreset,
+    /// Variable Refresh Rate (Adaptive Sync / FreeSync / G-Sync) policy.
+    pub vrr: VrrMode,
+    /// Bypass composition for fullscreen windows on supported GPUs.
+    pub direct_scanout: bool,
+    /// Reduce compositor repaint delay for lower input-to-photon latency.
+    pub low_latency: bool,
+    /// Live frosted-glass blur behind panels (false = fast pre-blurred wallpaper).
+    pub live_blur: bool,
+    /// Automatically disable live blur and slow down shell polling while on battery.
+    pub battery_saver: bool,
+}
+
+impl Default for PerformanceSettings {
+    fn default() -> Self {
+        Self {
+            preset: PerformancePreset::Balanced,
+            vrr: VrrMode::Off,
+            direct_scanout: true,
+            low_latency: false,
+            live_blur: true,
+            battery_saver: true,
+        }
+    }
+}
+
+impl PerformanceSettings {
+    pub fn apply_preset(&mut self, preset: PerformancePreset) {
+        self.preset = preset;
+        match preset {
+            PerformancePreset::Balanced => {
+                self.vrr = VrrMode::Off;
+                self.direct_scanout = true;
+                self.low_latency = false;
+                self.live_blur = true;
+                self.battery_saver = true;
+            }
+            PerformancePreset::Performance => {
+                self.vrr = VrrMode::Fullscreen;
+                self.direct_scanout = true;
+                self.low_latency = true;
+                self.live_blur = true;
+                self.battery_saver = false;
+            }
+            PerformancePreset::PowerSaver => {
+                self.vrr = VrrMode::Off;
+                self.direct_scanout = true;
+                self.low_latency = false;
+                self.live_blur = false;
+                self.battery_saver = true;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
@@ -461,6 +544,7 @@ pub struct Settings {
     pub lock: LockSettings,
     pub displays: DisplaySettings,
     pub apps: AppSettings,
+    pub performance: PerformanceSettings,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -672,5 +756,23 @@ mod tests {
         let (s_false, p2) = Settings::from_json_lenient(r#"{"dock":{"autohide":false}}"#);
         assert!(p2.is_empty(), "{p2:?}");
         assert_eq!(s_false.dock.autohide, DockAutohide::Never);
+    }
+
+    #[test]
+    fn performance_settings_and_presets_round_trip() {
+        let mut s = Settings::default();
+        s.performance.apply_preset(PerformancePreset::Performance);
+        assert_eq!(s.performance.vrr, VrrMode::Fullscreen);
+        assert!(s.performance.low_latency);
+        assert!(!s.performance.battery_saver);
+
+        let json = serde_json::to_string(&s).unwrap();
+        let (loaded, problems) = Settings::from_json_lenient(&json);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(loaded.performance, s.performance);
+
+        s.performance.apply_preset(PerformancePreset::PowerSaver);
+        assert!(!s.performance.live_blur);
+        assert!(s.performance.battery_saver);
     }
 }

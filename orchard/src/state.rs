@@ -816,6 +816,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             });
         let screencopy_state = crate::screencopy::ScreencopyState::new::<BackendData>(&dh);
         crate::appmenu::init::<BackendData>(&dh);
+        crate::kde_blur::init::<BackendData>(&dh);
         let mut state = OrchardState {
             backend_data,
             display_handle: dh,

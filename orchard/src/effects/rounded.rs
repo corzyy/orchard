@@ -36,6 +36,8 @@ pub fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
                 UniformName::new("corners", UniformType::_4f),
                 UniformName::new("src_off", UniformType::_2f),
                 UniformName::new("src_scale", UniformType::_2f),
+                UniformName::new("rim", UniformType::_4f),
+                UniformName::new("rim_width", UniformType::_1f),
             ],
         )
         .map_err(|e| tracing::error!("failed to compile rounded-corner shader: {e:?}"))
@@ -77,6 +79,10 @@ pub struct RoundedElement<E = WaylandSurfaceRenderElement<GlesRenderer>> {
     corners: Corners,
     /// size of the whole texture when the element only samples a crop of it
     tex_size: Option<(f64, f64)>,
+    /// optional inner hairline rim: (r, g, b, alpha)
+    rim: (f32, f32, f32, f32),
+    /// rim thickness in physical pixels
+    rim_width: f32,
 }
 
 impl<E> RoundedElement<E> {
@@ -88,12 +94,21 @@ impl<E> RoundedElement<E> {
             radius,
             corners,
             tex_size: None,
+            rim: (0.0, 0.0, 0.0, 0.0),
+            rim_width: 1.0,
         }
     }
 
     /// The inner element samples `src` out of a texture of this size (buffer px).
     pub fn with_texture_size(mut self, w: f64, h: f64) -> Self {
         self.tex_size = Some((w, h));
+        self
+    }
+
+    /// Draw a crisp inner hairline rim highlight along the rounded contour.
+    pub fn with_rim(mut self, rgba: [f32; 4], width_phys: f32) -> Self {
+        self.rim = (rgba[0], rgba[1], rgba[2], rgba[3]);
+        self.rim_width = width_phys.max(1.0);
         self
     }
 }
@@ -181,6 +196,8 @@ impl<E: RenderElement<GlesRenderer>> RenderElement<GlesRenderer> for RoundedElem
                 Uniform::new("corners", (f(c[0]), f(c[1]), f(c[2]), f(c[3]))),
                 Uniform::new("src_off", off),
                 Uniform::new("src_scale", scale),
+                Uniform::new("rim", self.rim),
+                Uniform::new("rim_width", self.rim_width),
             ],
         );
         let res = RenderElement::<GlesRenderer>::draw(&self.inner, frame, src, dst, damage, opaque_regions);

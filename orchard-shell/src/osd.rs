@@ -262,10 +262,9 @@ pub fn run_key(key: &str, fine: bool) -> Option<Level> {
                 sh(&format!("brightnessctl -q set {dir}"));
                 parse_brightnessctl(&sh("brightnessctl -m")?)?
             } else {
-                // external monitors: DDC/CI (needs the i2c-dev module and access to /dev/i2c-*)
+                // external monitors: DDC/CI across all detected displays
                 let amount = step.round().max(1.0) as i32;
-                sh(&format!("ddcutil --noverify setvcp 10 {sign} {amount}"))?;
-                parse_ddcutil(&sh("ddcutil getvcp 10 --brief")?)?
+                crate::ddc::adjust_all_ddc(sign, amount)?
             };
             Some(Level {
                 kind: Kind::Brightness,

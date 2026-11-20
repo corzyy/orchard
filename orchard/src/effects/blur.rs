@@ -57,6 +57,7 @@ fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
             &[
                 UniformName::new("halfpixel", UniformType::_2f),
                 UniformName::new("up", UniformType::_1f),
+                UniformName::new("final_pass", UniformType::_1f),
                 UniformName::new("clampbox", UniformType::_4f),
             ],
         )
@@ -148,6 +149,7 @@ fn pass(
     dst_size: Size<i32, Buffer>,
     dst_used: Size<i32, Buffer>,
     up: bool,
+    final_pass: bool,
 ) -> Result<(), GlesError> {
     let mut dst = dst.clone();
     let mut target = renderer.bind(&mut dst)?;
@@ -180,6 +182,7 @@ fn pass(
         &[
             Uniform::new("halfpixel", hp),
             Uniform::new("up", if up { 1.0f32 } else { 0.0 }),
+            Uniform::new("final_pass", if final_pass { 1.0f32 } else { 0.0 }),
             Uniform::new("clampbox", clampbox),
         ],
     )?;
@@ -411,7 +414,7 @@ fn render_blur<E: RenderElement<GlesRenderer>>(
     for i in 1..cache.levels.len() {
         let (tex, size) = cache.levels[i].clone();
         let u = used[i];
-        pass(renderer, prog, &src.0, src.1, src.2, &tex, size, u, false)?;
+        pass(renderer, prog, &src.0, src.1, src.2, &tex, size, u, false, false)?;
         src = (tex, size, Rectangle::from_size(u));
     }
     for i in (0..cache.levels.len().saturating_sub(1)).rev() {
@@ -427,6 +430,7 @@ fn render_blur<E: RenderElement<GlesRenderer>>(
             to_size,
             used[i],
             true,
+            i == 0,
         )?;
     }
     cache.used = used[0];

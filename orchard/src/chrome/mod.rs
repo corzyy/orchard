@@ -3,12 +3,26 @@
 pub mod font;
 pub mod shadow;
 pub mod theme;
+pub mod tile_menu;
 pub mod titlebar;
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
+
+static ALT_HELD: AtomicBool = AtomicBool::new(false);
+
+pub fn set_alt_held(held: bool) {
+    ALT_HELD.store(held, Ordering::Relaxed);
+}
+
+pub fn alt_held() -> bool {
+    ALT_HELD.load(Ordering::Relaxed)
+}
 
 use smithay::{
     backend::{
@@ -27,16 +41,34 @@ fn scale_key(scale: f64) -> u32 {
     (scale * 1000.0).round() as u32
 }
 
-/// Shadows are expensive to blur, so they are generated once per (scale, active).
-fn nine_slice(scale: f64, active: bool) -> Arc<NineSlice> {
-    static CACHE: OnceLock<Mutex<HashMap<(u32, bool, u32), Arc<NineSlice>>>> = OnceLock::new();
+/// Shadows are expensive to blur and upload, so both the NineSlice and its 8
+/// `MemoryRenderBuffer`s are shared globally across all windows per
+/// `(scale, active, corner_radius)`. This eliminates N× shadow RAM/VRAM
+/// duplication and avoids re-uploading 8 textures on every focus change.
+fn shared_shadow(scale: f64, active: bool) -> Arc<ShadowBuffers> {
+    static CACHE: OnceLock<Mutex<HashMap<(u32, bool, u32), Arc<ShadowBuffers>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     let mut cache = cache.lock().unwrap();
     cache
         .entry((scale_key(scale), active, theme::corner_radius().to_bits()))
         .or_insert_with(|| {
             let style = if active { shadow::ACTIVE } else { shadow::INACTIVE };
-            Arc::new(shadow::build(style, scale))
+            let nine = Arc::new(shadow::build(style, scale));
+            let buffers = nine
+                .slices
+                .iter()
+                .map(|s| {
+                    MemoryRenderBuffer::from_slice(
+                        &s.rgba,
+                        Fourcc::Abgr8888,
+                        (s.w as i32, s.h as i32),
+                        1,
+                        Transform::Normal,
+                        None,
+                    )
+                })
+                .collect();
+            Arc::new(ShadowBuffers { nine, buffers })
         })
         .clone()
 }
@@ -56,7 +88,7 @@ pub struct ShadowBuffers {
 #[derive(Default)]
 pub struct WindowChrome {
     titlebar: Option<(TitlebarParams, MemoryRenderBuffer)>,
-    shadow: Option<((u32, bool, u32), ShadowBuffers)>,
+    shadow: Option<((u32, bool, u32), Arc<ShadowBuffers>)>,
 }
 
 impl std::fmt::Debug for WindowChrome {
@@ -87,22 +119,7 @@ impl WindowChrome {
         let key = (scale_key(scale), active, theme::corner_radius().to_bits());
         let fresh = !matches!(&self.shadow, Some((k, _)) if *k == key);
         if fresh {
-            let nine = nine_slice(scale, active);
-            let buffers = nine
-                .slices
-                .iter()
-                .map(|s| {
-                    MemoryRenderBuffer::from_slice(
-                        &s.rgba,
-                        Fourcc::Abgr8888,
-                        (s.w as i32, s.h as i32),
-                        1,
-                        Transform::Normal,
-                        None,
-                    )
-                })
-                .collect();
-            self.shadow = Some((key, ShadowBuffers { nine, buffers }));
+            self.shadow = Some((key, shared_shadow(scale, active)));
         }
         &self.shadow.as_ref().unwrap().1
     }

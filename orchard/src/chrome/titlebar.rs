@@ -69,6 +69,8 @@ pub struct TitlebarParams {
     pub title: String,
     /// green leaves full screen (arrows) instead of maximizing (+)
     pub fullscreen: bool,
+    /// Option/Alt is held: live-swap the green + glyph to fullscreen arrows
+    pub alt_held: bool,
 }
 
 fn color(c: Rgba) -> Color {
@@ -179,7 +181,7 @@ pub fn paint_titlebar(p: &TitlebarParams) -> Option<Pixmap> {
                         pm.stroke_path(&g, &paint(pal.minimize_glyph), &st, ts, None);
                     }
                 }
-                TrafficLight::Zoom if !p.fullscreen => {
+                TrafficLight::Zoom if !(p.fullscreen || p.alt_held) => {
                     // + (maximize)
                     let mut g = PathBuilder::new();
                     g.move_to(cx - 3.4, cy);
@@ -259,6 +261,7 @@ mod tests {
             pressed: None,
             title: "Konsole".into(),
             fullscreen: false,
+            alt_held: false,
         })
         .unwrap();
         assert_eq!(pm.width(), 800);
