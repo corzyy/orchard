@@ -161,8 +161,6 @@ pub struct MissionControl {
     pub drag: Option<McDrag>,
     /// focus this window once the closing animation ends
     pub pick: Option<WindowElement>,
-    /// switch this display to this Space once closed
-    pub switch_to: Option<(Output, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -442,7 +440,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             selected: None,
             drag: None,
             pick: None,
-            switch_to: None,
         });
         self.render_space_thumbs();
         self.mc_log_layout();
@@ -478,9 +475,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             let mc = self.mc.take().unwrap();
             if let Some(w) = mc.pick {
                 self.focus_window(&w);
-            }
-            if let Some((output, i)) = mc.switch_to {
-                self.switch_space(&output, i);
             }
             let pos = self.pointer.current_location();
             self.inject_pointer_motion(pos, 0);
@@ -644,9 +638,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 self.mc_rebuild_strip(si);
                 self.render_space_thumbs();
             } else if i != active {
-                if let Some(mc) = self.mc.as_mut() {
-                    mc.switch_to = Some((output, i));
-                }
+                // slide to the Space right away, while Mission Control closes:
+                // the old Space's windows fly back from the grid and slide out
+                self.switch_space(&output, i);
                 self.close_mission_control(None);
             } else {
                 self.close_mission_control(None);

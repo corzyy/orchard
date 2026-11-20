@@ -606,6 +606,7 @@ fn mission_control_elements(
     mc: &MissionControl,
     ctx: &mut RenderCtx<'_>,
     wallpaper_tex: Option<(GlesTexture, (i32, i32))>,
+    leave_off: f64,
     scale: f64,
     now: Duration,
     out: &mut Vec<OutputRenderElements>,
@@ -662,7 +663,16 @@ fn mission_control_elements(
         if dragging.map(|d| d.window == w.window).unwrap_or(false) {
             continue;
         }
-        let r = w.rect_at(p, mc.closing, now);
+        let mut r = w.rect_at(p, mc.closing, now);
+        // switched Space while closing: the old Space's windows slide out too
+        let leaving = fx
+            .space_transition
+            .as_ref()
+            .map(|t| t.from.iter().any(|(x, _)| *x == w.window))
+            .unwrap_or(false);
+        if leaving {
+            r.loc.x += leave_off;
+        }
         mc_window(renderer, &w.window, w.real, r, origin, scale, out);
         if !mc.closing && highlighted.as_ref() == Some(&w.window) {
             let k = if w.real.size.w > 0.0 { r.size.w / w.real.size.w } else { 1.0 };
@@ -1000,11 +1010,6 @@ fn output_elements_inner(
         out.push(OutputRenderElements::Mesh(t.element(output_geo.loc, scale, now)));
     }
 
-    let mc = ctx.mc.filter(|m| m.screen_of(output).is_some());
-    if let Some(mc) = mc {
-        mission_control_elements(renderer, output, output_geo, mc, ctx, wallpaper_tex.clone(), scale, now, &mut out);
-    }
-
     // Space slide: entering windows come in from one side, leaving ones exit the other
     let (enter_off, leave_off) = ctx
         .fx
@@ -1013,6 +1018,11 @@ fn output_elements_inner(
         .filter(|t| t.output == output.name())
         .map(|t| crate::spaces::transition_offsets(t, output_geo.size.w as f64, now))
         .unwrap_or((0.0, 0.0));
+
+    let mc = ctx.mc.filter(|m| m.screen_of(output).is_some());
+    if let Some(mc) = mc {
+        mission_control_elements(renderer, output, output_geo, mc, ctx, wallpaper_tex.clone(), leave_off, scale, now, &mut out);
+    }
 
     // tile drop preview: right below the dragged (topmost) window
     let mut preview = ctx
@@ -1038,7 +1048,11 @@ fn output_elements_inner(
         tile_preview_elements(ctx.fx, r, a, output_geo, scale, &mut out);
     }
     if let Some(t) = ctx.fx.space_transition.as_ref().filter(|t| t.output == output.name()) {
-        for (window, loc) in t.from.iter().rev() {
+        // windows still in the closing Mission Control grid are drawn there
+        let in_mc = |w: &WindowElement| {
+            mc.and_then(|m| m.screen_of(output)).map(|s| s.wins.iter().any(|x| x.window == *w)).unwrap_or(false)
+        };
+        for (window, loc) in t.from.iter().rev().filter(|(w, _)| !in_mc(w)) {
             window_elements(renderer, output_geo, window, *loc, leave_off, scale, now, &mut out);
         }
     }
