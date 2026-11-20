@@ -16,7 +16,6 @@ use crate::{
 use crate::{
     state::{DndIcon, SurfaceDmabufFeedback},
 };
-#[cfg(feature = "renderer_sync")]
 use smithay::backend::drm::compositor::PrimaryPlaneElement;
 #[cfg(feature = "egl")]
 use smithay::backend::renderer::ImportEgl;
@@ -1822,9 +1821,11 @@ fn render_surface(
         .drm_output
         .render_frame(renderer, &elements, clear_color, frame_mode)
         .map(|render_frame_result| {
-            #[cfg(feature = "renderer_sync")]
+            // Wait for the GPU to finish rendering the primary swapchain buffer
+            // before handing it to DRM, preventing monitor-wide scanout flicker
+            // (white dot/noise flashes) on NVIDIA.
             if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
-                element.sync.wait();
+                let _ = element.sync.wait();
             }
             (!render_frame_result.is_empty, render_frame_result.states)
         })
