@@ -99,14 +99,17 @@ use tracing::{debug, error, info, trace, warn};
 // - some formats might perform terribly
 // - we might need some work-arounds, if one supports modifiers, but the other does not
 //
-// So lets just pick `ARGB2101010` (10-bit) or `ARGB8888` (8-bit) for now, they are widely supported.
-const SUPPORTED_FORMATS: &[Fourcc] = &[
+// Default: opaque 8-bit (`XRGB8888`), like niri and cosmic-comp. The 10-bit
+// formats (anvil's default) put NVIDIA on a 2101010 scanout buffer with a
+// 2-bit alpha channel, which flashes white speckles while windows redraw;
+// they are opt-in with ORCHARD_ENABLE_10BIT=1.
+const SUPPORTED_FORMATS_10BIT: &[Fourcc] = &[
     Fourcc::Abgr2101010,
     Fourcc::Argb2101010,
     Fourcc::Abgr8888,
     Fourcc::Argb8888,
 ];
-const SUPPORTED_FORMATS_8BIT_ONLY: &[Fourcc] = &[Fourcc::Abgr8888, Fourcc::Argb8888];
+const SUPPORTED_FORMATS_8BIT: &[Fourcc] = &[Fourcc::Xrgb8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Abgr8888];
 
 
 
@@ -991,10 +994,10 @@ impl OrchardState<UdevData> {
 
         let framebuffer_exporter = GbmFramebufferExporter::new(gbm.clone(), render_node);
 
-        let color_formats = if std::env::var("ORCHARD_DISABLE_10BIT").is_ok() {
-            SUPPORTED_FORMATS_8BIT_ONLY
+        let color_formats = if std::env::var("ORCHARD_ENABLE_10BIT").is_ok() {
+            SUPPORTED_FORMATS_10BIT
         } else {
-            SUPPORTED_FORMATS
+            SUPPORTED_FORMATS_8BIT
         };
         let mut renderer = self
             .backend_data
