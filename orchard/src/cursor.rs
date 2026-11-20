@@ -61,6 +61,11 @@ impl Cursor {
         }
     }
 
+    /// Pointer size from the settings (nominal xcursor size).
+    pub fn nominal_size(&self) -> u32 {
+        self.size
+    }
+
     pub fn get_image(&self, scale: u32, time: Duration) -> Image {
         let (_, img, _) = self.get_image_cached(scale, time);
         (*img).clone()

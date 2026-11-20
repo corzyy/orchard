@@ -449,6 +449,8 @@ pub struct PointerSettings {
     pub secondary_click: SecondaryClick,
     /// Scroll speed multiplier
     pub scroll_factor: f64,
+    /// Shaking the mouse briefly enlarges the pointer.
+    pub shake_to_locate: bool,
 }
 
 impl Default for PointerSettings {
@@ -464,6 +466,7 @@ impl Default for PointerSettings {
             disable_while_typing: true,
             secondary_click: SecondaryClick::TwoFingers,
             scroll_factor: 1.0,
+            shake_to_locate: true,
         }
     }
 }

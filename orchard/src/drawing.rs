@@ -11,7 +11,7 @@ use smithay::{
     },
     input::pointer::CursorImageStatus,
     render_elements,
-    utils::{Physical, Point, Scale},
+    utils::{Logical, Physical, Point, Scale, Size},
 };
 #[cfg(feature = "debug")]
 use smithay::{
@@ -20,7 +20,7 @@ use smithay::{
         utils::CommitCounter,
         Frame,
     },
-    utils::{Buffer, Logical, Rectangle, Size, Transform},
+    utils::{Buffer, Rectangle, Transform},
 };
 
 pub static CLEAR_COLOR: Color32F = Color32F::new(0.0, 0.0, 0.0, 1.0);
@@ -29,6 +29,9 @@ pub static CLEAR_COLOR_FULLSCREEN: Color32F = Color32F::new(0.0, 0.0, 0.0, 0.0);
 pub struct PointerElement {
     buffer: Option<MemoryRenderBuffer>,
     status: CursorImageStatus,
+    /// shake to locate: size factor, and the size to draw a named cursor at
+    zoom: f64,
+    named_size: Option<Size<i32, Logical>>,
 }
 
 impl Default for PointerElement {
@@ -36,11 +39,24 @@ impl Default for PointerElement {
         Self {
             buffer: Default::default(),
             status: CursorImageStatus::default_named(),
+            zoom: 1.0,
+            named_size: None,
         }
     }
 }
 
 impl PointerElement {
+    /// Draw the pointer `zoom` times its size; `named_size` is the logical size
+    /// for a themed cursor image (None: its own size).
+    pub fn set_zoom(&mut self, zoom: f64, named_size: Option<Size<i32, Logical>>) {
+        self.zoom = zoom;
+        self.named_size = named_size;
+    }
+
+    pub fn zoom(&self) -> f64 {
+        self.zoom
+    }
+
     pub fn set_status(&mut self, status: CursorImageStatus) {
         self.status = status;
     }
@@ -92,7 +108,7 @@ where
                         buffer,
                         None,
                         None,
-                        None,
+                        self.named_size,
                         Kind::Cursor,
                     ) {
                         Ok(e) => vec![PointerRenderElement::<R>::from(e).into()],
@@ -109,7 +125,7 @@ where
                         renderer,
                         surface,
                         location,
-                        scale,
+                        Scale::from((scale.x * self.zoom, scale.y * self.zoom)),
                         alpha,
                         Kind::Cursor,
                     );

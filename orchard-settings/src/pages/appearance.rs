@@ -283,6 +283,12 @@ pub fn accessibility(s: &Settings, st: &mut AppearanceState, wake: &Wake) -> El 
                     }
                 })
             }),
+            form::toggle_row(
+                "Shake mouse pointer to locate",
+                some("Quickly move the mouse back and forth to make the pointer bigger for a moment"),
+                s.pointer.shake_to_locate,
+                |v| edit(move |s| s.pointer.shake_to_locate = v),
+            ),
         ]),
     ]
     .into()

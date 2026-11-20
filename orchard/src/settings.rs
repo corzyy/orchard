@@ -353,6 +353,13 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
 
     /// After every pointer motion: hot corners, focus follows mouse.
     pub fn after_pointer_motion(&mut self, pos: Point<f64, Logical>) {
+        if get().pointer.shake_to_locate
+            && !self.pointer.is_grabbed()
+            && !matches!(self.cursor_status, smithay::input::pointer::CursorImageStatus::Hidden)
+        {
+            let now: std::time::Duration = self.clock.now().into();
+            self.fx.shake.motion(pos, now);
+        }
         self.update_fs_reveal(pos);
         self.fs_reveal_cursor(pos);
         self.check_hot_corner(pos);

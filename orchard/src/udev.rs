@@ -1660,19 +1660,23 @@ impl OrchardState<UdevData> {
 
         let start = Instant::now();
 
-        // TODO get scale from the rendersurface when supporting HiDPI
+        // shake to locate: draw a larger theme size rather than scaling pixels up
+        let shake_now: Duration = self.clock.now().into();
+        self.fx.shake.settle(shake_now);
+        let zoom = self.fx.shake.zoom(shake_now);
+        let mult = if zoom > 1.001 { zoom.ceil() as u32 } else { 1 };
         let (cursor_id, frame, cursor_animated) = match &self.cursor_status {
             CursorImageStatus::Named(icon) => {
                 let mut names = vec![icon.name()];
                 names.extend(icon.alt_names().iter().copied());
                 self.backend_data
                     .pointer_image
-                    .get_named_image_cached(&names, 1 /*scale*/, self.clock.now().into())
+                    .get_named_image_cached(&names, mult, self.clock.now().into())
             }
             _ => self
                 .backend_data
                 .pointer_image
-                .get_image_cached(1 /*scale*/, self.clock.now().into()),
+                .get_image_cached(mult, self.clock.now().into()),
         };
 
         let primary_gpu = self.backend_data.primary_gpu;
@@ -1708,8 +1712,25 @@ impl OrchardState<UdevData> {
                 )
             })
             .clone();
-        let named_hotspot: Point<i32, Logical> = (frame.xhot as i32, frame.yhot as i32).into();
-        self.backend_data.last_cursor = Some((pointer_image.clone(), named_hotspot));
+        // relative to the configured size, whichever theme size was picked
+        let k = if mult > 1 && frame.size > 0 {
+            zoom * self.backend_data.pointer_image.nominal_size() as f64 / frame.size as f64
+        } else {
+            zoom
+        };
+        let named_hotspot: Point<i32, Logical> =
+            ((frame.xhot as f64 * k).round() as i32, (frame.yhot as f64 * k).round() as i32).into();
+        let named_size = (mult > 1 || zoom > 1.001).then(|| {
+            smithay::utils::Size::<i32, Logical>::from((
+                (frame.width as f64 * k).round().max(1.0) as i32,
+                (frame.height as f64 * k).round().max(1.0) as i32,
+            ))
+        });
+        self.backend_data.pointer_element.set_zoom(zoom, named_size);
+        // screen recordings keep the normal-size pointer
+        if mult == 1 {
+            self.backend_data.last_cursor = Some((pointer_image.clone(), named_hotspot));
+        }
 
         let mut ctx = RenderCtx {
             fx: &mut self.fx,
@@ -1895,6 +1916,9 @@ fn render_surface(
                     .unwrap()
                     .hotspot
             })
+            .to_f64()
+            .upscale(pointer_element.zoom())
+            .to_i32_round()
         } else {
             // xcursor images have their hotspot too (the crosshair is centered)
             named_hotspot

@@ -213,7 +213,7 @@ impl Page {
             DateTime => "date time timezone ntp clock",
             LoginItems => "login items autostart startup",
             DefaultApps => "default apps browser terminal file manager text editor",
-            Accessibility => "accessibility reduce motion transparency pointer cursor size theme",
+            Accessibility => "accessibility reduce motion transparency pointer cursor size theme shake locate find mouse",
             Appearance => "appearance dark light mode accent color colour theme corner radius icon glass blur kawase liquid glass transparency frosted",
             MenuBar => "menu bar control center clock battery percentage date seconds",
             DesktopDock => "desktop dock magnification minimize hot corners mission control windows title bar focus",
