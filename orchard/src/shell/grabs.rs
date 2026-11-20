@@ -483,9 +483,11 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let location = data.space.element_location(&self.window).unwrap();
-                x11.configure(Rectangle::new(location, self.last_window_size))
-                    .unwrap();
+                // unmapped mid-resize (closed, moved to another Space, minimized)
+                let Some(location) = data.space.element_location(&self.window) else { return };
+                if let Err(err) = x11.configure(Rectangle::new(location, self.last_window_size)) {
+                    tracing::debug!("resize: configure failed: {err:?}");
+                }
             }
         }
     }
@@ -525,21 +527,22 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
                     xdg.send_pending_configure();
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                         let geometry = self.window.client_geometry();
-                        let mut location = data.space.element_location(&self.window).unwrap();
-
-                        if self.edges.intersects(ResizeEdge::LEFT) {
-                            location.x = self.initial_window_location.x
-                                + (self.initial_window_size.w - geometry.size.w);
+                        // skip the reposition if it was unmapped meanwhile, but still finish the resize
+                        if let Some(mut location) = data.space.element_location(&self.window) {
+                            if self.edges.intersects(ResizeEdge::LEFT) {
+                                location.x = self.initial_window_location.x
+                                    + (self.initial_window_size.w - geometry.size.w);
+                            }
+                            if self.edges.intersects(ResizeEdge::TOP) {
+                                location.y = self.initial_window_location.y
+                                    + (self.initial_window_size.h - geometry.size.h);
+                            }
+                            data.space.map_element(self.window.clone(), location, true);
                         }
-                        if self.edges.intersects(ResizeEdge::TOP) {
-                            location.y = self.initial_window_location.y
-                                + (self.initial_window_size.h - geometry.size.h);
-                        }
-
-                        data.space.map_element(self.window.clone(), location, true);
                     }
 
-                    with_states(&self.window.wl_surface().unwrap(), |states| {
+                    let Some(surface) = self.window.wl_surface() else { return };
+                    with_states(&surface, |states| {
                         let mut data = states
                             .data_map
                             .get::<RefCell<SurfaceData>>()
@@ -548,13 +551,14 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
                         if let ResizeState::Resizing(resize_data) = data.resize_state {
                             data.resize_state = ResizeState::WaitingForFinalAck(resize_data, event.serial);
                         } else {
-                            panic!("invalid resize state: {:?}", data.resize_state);
+                            tracing::warn!("resize ended in unexpected state {:?}", data.resize_state);
+                            data.resize_state = ResizeState::NotResizing;
                         }
                     });
                 }
                 #[cfg(feature = "xwayland")]
                 WindowSurface::X11(x11) => {
-                    let mut location = data.space.element_location(&self.window).unwrap();
+                    let Some(mut location) = data.space.element_location(&self.window) else { return };
                     if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                         let geometry = self.window.client_geometry();
 
@@ -569,8 +573,9 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
 
                         data.space.map_element(self.window.clone(), location, true);
                     }
-                    x11.configure(Rectangle::new(location, self.last_window_size))
-                        .unwrap();
+                    if let Err(err) = x11.configure(Rectangle::new(location, self.last_window_size)) {
+                        tracing::debug!("resize: configure failed: {err:?}");
+                    }
 
                     let Some(surface) = self.window.wl_surface() else {
                         // X11 Window got unmapped, abort
@@ -585,7 +590,8 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
                         if let ResizeState::Resizing(resize_data) = data.resize_state {
                             data.resize_state = ResizeState::WaitingForCommit(resize_data);
                         } else {
-                            panic!("invalid resize state: {:?}", data.resize_state);
+                            tracing::warn!("resize ended in unexpected state {:?}", data.resize_state);
+                            data.resize_state = ResizeState::NotResizing;
                         }
                     });
                 }
@@ -740,21 +746,22 @@ impl<BackendData: Backend> TouchGrab<OrchardState<BackendData>> for TouchResizeS
                 xdg.send_pending_configure();
                 if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                     let geometry = self.window.client_geometry();
-                    let mut location = data.space.element_location(&self.window).unwrap();
-
-                    if self.edges.intersects(ResizeEdge::LEFT) {
-                        location.x =
-                            self.initial_window_location.x + (self.initial_window_size.w - geometry.size.w);
+                    // skip the reposition if it was unmapped meanwhile, but still finish the resize
+                    if let Some(mut location) = data.space.element_location(&self.window) {
+                        if self.edges.intersects(ResizeEdge::LEFT) {
+                            location.x =
+                                self.initial_window_location.x + (self.initial_window_size.w - geometry.size.w);
+                        }
+                        if self.edges.intersects(ResizeEdge::TOP) {
+                            location.y =
+                                self.initial_window_location.y + (self.initial_window_size.h - geometry.size.h);
+                        }
+                        data.space.map_element(self.window.clone(), location, true);
                     }
-                    if self.edges.intersects(ResizeEdge::TOP) {
-                        location.y =
-                            self.initial_window_location.y + (self.initial_window_size.h - geometry.size.h);
-                    }
-
-                    data.space.map_element(self.window.clone(), location, true);
                 }
 
-                with_states(&self.window.wl_surface().unwrap(), |states| {
+                let Some(surface) = self.window.wl_surface() else { return };
+                with_states(&surface, |states| {
                     let mut data = states
                         .data_map
                         .get::<RefCell<SurfaceData>>()
@@ -763,13 +770,14 @@ impl<BackendData: Backend> TouchGrab<OrchardState<BackendData>> for TouchResizeS
                     if let ResizeState::Resizing(resize_data) = data.resize_state {
                         data.resize_state = ResizeState::WaitingForFinalAck(resize_data, event.serial);
                     } else {
-                        panic!("invalid resize state: {:?}", data.resize_state);
+                        tracing::warn!("resize ended in unexpected state {:?}", data.resize_state);
+                            data.resize_state = ResizeState::NotResizing;
                     }
                 });
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let mut location = data.space.element_location(&self.window).unwrap();
+                let Some(mut location) = data.space.element_location(&self.window) else { return };
                 if self.edges.intersects(ResizeEdge::TOP_LEFT) {
                     let geometry = self.window.client_geometry();
 
@@ -784,8 +792,9 @@ impl<BackendData: Backend> TouchGrab<OrchardState<BackendData>> for TouchResizeS
 
                     data.space.map_element(self.window.clone(), location, true);
                 }
-                x11.configure(Rectangle::new(location, self.last_window_size))
-                    .unwrap();
+                if let Err(err) = x11.configure(Rectangle::new(location, self.last_window_size)) {
+                    tracing::debug!("resize: configure failed: {err:?}");
+                }
 
                 let Some(surface) = self.window.wl_surface() else {
                     // X11 Window got unmapped, abort
@@ -800,7 +809,8 @@ impl<BackendData: Backend> TouchGrab<OrchardState<BackendData>> for TouchResizeS
                     if let ResizeState::Resizing(resize_data) = data.resize_state {
                         data.resize_state = ResizeState::WaitingForCommit(resize_data);
                     } else {
-                        panic!("invalid resize state: {:?}", data.resize_state);
+                        tracing::warn!("resize ended in unexpected state {:?}", data.resize_state);
+                            data.resize_state = ResizeState::NotResizing;
                     }
                 });
             }
@@ -882,9 +892,11 @@ impl<BackendData: Backend> TouchGrab<OrchardState<BackendData>> for TouchResizeS
             }
             #[cfg(feature = "xwayland")]
             WindowSurface::X11(x11) => {
-                let location = data.space.element_location(&self.window).unwrap();
-                x11.configure(Rectangle::new(location, self.last_window_size))
-                    .unwrap();
+                // unmapped mid-resize (closed, moved to another Space, minimized)
+                let Some(location) = data.space.element_location(&self.window) else { return };
+                if let Err(err) = x11.configure(Rectangle::new(location, self.last_window_size)) {
+                    tracing::debug!("resize: configure failed: {err:?}");
+                }
             }
         }
     }
