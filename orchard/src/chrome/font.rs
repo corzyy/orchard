@@ -1,6 +1,6 @@
 //! Minimal text rendering for compositor-drawn UI (window titles).
 //!
-//! Uses fontconfig (`fc-match`) once to find an Inter/sans font file and
+//! Uses fontconfig (`fc-match`) once to find an SF Pro/Inter/sans font file and
 //! rasterises glyphs with `fontdue`.
 
 use std::{collections::HashMap, sync::Mutex, sync::OnceLock};
@@ -26,7 +26,15 @@ fn find_font(pattern: &str) -> Option<(String, u32)> {
 }
 
 fn load(pattern: &str) -> Option<Font> {
+    load_matching(pattern, "")
+}
+
+/// Load `pattern`, rejecting fontconfig fallbacks whose file name lacks `needle`.
+fn load_matching(pattern: &str, needle: &str) -> Option<Font> {
     let (file, index) = find_font(pattern)?;
+    if !file.to_lowercase().contains(needle) {
+        return None;
+    }
     let data = std::fs::read(&file).ok()?;
     let font = Font::from_bytes(
         data,
@@ -42,11 +50,12 @@ fn load(pattern: &str) -> Option<Font> {
     Some(font)
 }
 
-/// The font used for window titles (Inter Semibold, falling back to sans-serif).
+/// The font used for window titles (SF Pro Text Semibold, then Inter Semibold, then sans-serif).
 pub fn title_font() -> Option<&'static TextRenderer> {
     static FONT: OnceLock<Option<TextRenderer>> = OnceLock::new();
     FONT.get_or_init(|| {
-        let font = load("Inter:weight=semibold")
+        let font = load_matching("SF Pro Text:style=Semibold", "sf-pro")
+            .or_else(|| load("Inter:weight=semibold"))
             .or_else(|| load("sans-serif:weight=medium"))
             .or_else(|| load("sans-serif"))?;
         Some(TextRenderer {

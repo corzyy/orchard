@@ -19,6 +19,20 @@ fn find_font(pattern: &str) -> Option<(String, u32)> {
 
 fn load(pattern: &str) -> Option<Font> {
     let (file, index) = find_font(pattern)?;
+    load_file(file, index)
+}
+
+/// Like `load`, but only accepts the match if its file name contains `needle`
+/// (fontconfig always falls back to *something*).
+fn load_family(pattern: &str, needle: &str) -> Option<Font> {
+    let (file, index) = find_font(pattern)?;
+    if !file.to_lowercase().contains(needle) {
+        return None;
+    }
+    load_file(file, index)
+}
+
+fn load_file(file: String, index: u32) -> Option<Font> {
     let data = std::fs::read(&file).ok()?;
     Font::from_bytes(
         data,
@@ -45,10 +59,14 @@ pub struct Fonts {
 
 impl Fonts {
     pub fn load() -> Fonts {
-        let regular = load("Inter:weight=medium")
+        // SF Pro (Apple's system font) when installed, else Inter, else sans-serif.
+        let regular = load_family("SF Pro Text:style=Regular", "sf-pro")
+            .or_else(|| load("Inter:weight=medium"))
             .or_else(|| load("sans-serif"))
             .expect("no usable font found (fc-match)");
-        let bold = load("Inter:weight=bold").or_else(|| load("sans-serif:bold"));
+        let bold = load_family("SF Pro Text:style=Semibold", "sf-pro")
+            .or_else(|| load("Inter:weight=bold"))
+            .or_else(|| load("sans-serif:bold"));
         Fonts {
             bold: bold.unwrap_or_else(|| regular.clone()),
             regular,

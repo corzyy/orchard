@@ -113,11 +113,13 @@ fn load_font(pattern: &str, want_family: &str) -> Option<FontData> {
 pub fn install_fonts(ctx: &egui::Context) {
     let mut defs = FontDefinitions::default();
     let mut bold_family = Vec::new();
-    // Inter is the closest freely available match for SF Pro.
-    let regular = load_font("Inter:style=Regular", "inter")
+    // SF Pro when installed; Inter is the closest freely available match.
+    let regular = load_font("SF Pro Text:style=Regular", "sf-pro")
+        .or_else(|| load_font("Inter:style=Regular", "inter"))
         .or_else(|| load_font("Cantarell:style=Regular", "cantarell"))
         .or_else(|| load_font("Noto Sans:style=Regular", "noto"));
-    let semibold = load_font("Inter:style=SemiBold", "inter")
+    let semibold = load_font("SF Pro Text:style=Semibold", "sf-pro")
+        .or_else(|| load_font("Inter:style=SemiBold", "inter"))
         .or_else(|| load_font("Inter:style=Bold", "inter"))
         .or_else(|| load_font("Noto Sans:style=Bold", "noto"));
     if let Some(r) = regular {
