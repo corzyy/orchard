@@ -203,6 +203,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             fx: &mut self.fx,
             backdrops: &self.ipc.backdrops,
             mc: None,
+            stage: Some(&self.stage),
             space_info: self.spaces.info(&output.name()),
             locked: self.protocols.locked,
             lock_surface: crate::protocols::lock_surface_of(output),

@@ -449,10 +449,12 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             .values()
             .flat_map(|o| o.slots.iter())
             .flat_map(|s| s.windows.iter().map(|(w, _)| w).chain(s.fullscreen.iter()));
+        let in_stage = self.stage.all_staged_windows();
         self.space
             .elements()
             .chain(self.minimized.iter())
             .chain(in_spaces)
+            .chain(in_stage.iter().map(|(_, _, sw)| &sw.window))
             .find(|w| w.ipc_id().0 == id)
             .cloned()
     }
@@ -508,10 +510,17 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 Some(Event::Ok)
             }
             Request::QuitApp { app_id } => {
+                let staged: Vec<WindowElement> = self
+                    .stage
+                    .all_staged_windows()
+                    .into_iter()
+                    .map(|(_, _, sw)| sw.window.clone())
+                    .collect();
                 let windows: Vec<_> = self
                     .space
                     .elements()
                     .chain(self.minimized.iter())
+                    .chain(staged.iter())
                     .filter(|w| w.app_id() == app_id)
                     .cloned()
                     .collect();
@@ -669,6 +678,27 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 }
             })
             .collect();
+        for (name, space_idx, sw) in self.stage.all_staged_windows() {
+            let w = &sw.window;
+            if w.alive() && !out.iter().any(|i| i.id == w.ipc_id().0) {
+                out.push(WindowInfo {
+                    id: w.ipc_id().0,
+                    app_id: w.app_id(),
+                    title: w.title(),
+                    focused: false,
+                    minimized: false,
+                    zoomed: self.is_zoomed(w),
+                    hidden: false,
+                    menu: None,
+                    x11_id: None,
+                    gtk_menu: None,
+                    pid: None,
+                    output: Some(name.to_string()),
+                    space: Some(space_idx + 1),
+                    thumb: None,
+                });
+            }
+        }
         for (name, spaces) in &self.spaces.outputs {
             for (i, slot) in spaces.slots.iter().enumerate() {
                 for w in slot.windows.iter().map(|(w, _)| w).chain(slot.fullscreen.iter()) {
@@ -738,6 +768,9 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
         for w in self.space.elements().rev() {
             push(w.app_id());
+        }
+        for (_, _, sw) in self.stage.all_staged_windows() {
+            push(sw.window.app_id());
         }
         for o in self.spaces.outputs.values() {
             for s in &o.slots {
@@ -986,6 +1019,9 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
 
     /// `switch_space`: may jump to another Space holding the app's windows.
     pub fn activate_app_ext(&mut self, app_id: &str, switch_space: bool) {
+        if self.stage_activate_app(app_id, switch_space) {
+            return;
+        }
         let visible: Vec<WindowElement> = self
             .space
             .elements()

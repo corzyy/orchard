@@ -67,6 +67,7 @@ smithay::backend::renderer::element::render_elements! {
     Window=RescaleRenderElement<WindowRenderElement>,
     Texture=TextureRenderElement<GlesTexture>,
     Mesh=MeshElement,
+    Perspective=crate::effects::perspective::PerspectiveElement,
     Backdrop=RoundedElement<TextureRenderElement<GlesTexture>>,
     McWindow=RelocateRenderElement<RescaleRenderElement<WindowRenderElement>>,
     Solid=SolidColorRenderElement,
@@ -511,6 +512,7 @@ pub struct RenderCtx<'a> {
     pub fx: &'a mut Effects,
     pub backdrops: &'a Backdrops,
     pub mc: Option<&'a MissionControl>,
+    pub stage: Option<&'a crate::stage_manager::StageManager>,
     /// (active Space, number of Spaces) of the output being rendered
     pub space_info: (usize, usize),
     /// session locked: show only the lock surface (or black)
@@ -635,6 +637,29 @@ fn label_element(
     MemoryRenderBufferRenderElement::from_buffer(renderer, loc, buf, Some(alpha), None, Some((w, h).into()), Kind::Unspecified)
         .ok()
         .map(OutputRenderElements::Label)
+}
+
+/// Translucent pill label used by Stage Manager for hovered strip thumbnails.
+pub(crate) fn stage_label_element(
+    renderer: &mut GlesRenderer,
+    fx: &mut Effects,
+    text: &str,
+    center_x: f64,
+    top: f64,
+    scale: f64,
+    alpha: f32,
+) -> Option<OutputRenderElements> {
+    label_element(renderer, fx, text, LabelStyle::Pill, center_x, top, scale, alpha)
+}
+
+/// Subtle rounded drop-zone highlight along the Stage Manager strip when peeling a window out.
+pub(crate) fn stage_peel_highlight(
+    renderer: &mut GlesRenderer,
+    fx: &mut Effects,
+    rect: Rectangle<f64, Logical>,
+    scale: f64,
+) -> Option<OutputRenderElements> {
+    rounded_fill(renderer, fx, 512, rect, 16.0, [255, 255, 255], 0.14, scale)
 }
 
 /// A plain colour as a tiny texture, so it can be drawn with rounded corners.
@@ -1168,12 +1193,32 @@ fn output_elements_inner(
         }
     }
 
+    // Stage Manager: recent-apps 3D strip + transition glides (hidden while Mission Control is open)
+    if mc.is_none() {
+        if let Some(stage) = ctx.stage {
+            crate::stage_manager::stage_manager_elements(
+                renderer,
+                output,
+                output_geo,
+                stage,
+                ctx.space_info.0,
+                ctx.fx,
+                scale,
+                now,
+                &mut out,
+            );
+        }
+    }
+
     // tile drop preview: right below the dragged (topmost) window
     let mut preview = ctx
         .fx
         .tile_preview_at(now)
         .filter(|(r, _)| r.to_i32_round::<i32>().overlaps(output_geo) && mc.is_none());
     for window in space.elements_for_output(output).rev() {
+        if mc.is_none() && ctx.stage.is_some_and(|st| st.is_gliding_onto_stage(window, now)) {
+            continue;
+        }
         if let Some(mc) = mc {
             let in_mc = mc.screens.iter().any(|s| s.wins.iter().any(|w| w.window == *window));
             // App Exposé hides other apps' windows

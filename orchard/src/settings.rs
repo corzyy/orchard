@@ -283,7 +283,12 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         if s.windows.tiling_mode != self.dwindle.mode {
             self.dwindle.mode = s.windows.tiling_mode;
             match s.windows.tiling_mode {
-                orchard_config::TilingMode::Tiling => self.retile_all(),
+                orchard_config::TilingMode::Tiling => {
+                    if self.stage.enabled {
+                        self.stage_manager_disable();
+                    }
+                    self.retile_all();
+                }
                 orchard_config::TilingMode::Floating => self.untile_all_dwindle(),
             }
         } else if scaled || s.tiling.clamped() != self.dwindle.cfg.clamped() {
@@ -291,6 +296,13 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             self.refit_all_windows();
         }
         self.dwindle.cfg = s.tiling.clone();
+
+        // Stage Manager (mutually exclusive with Dwindle Tiling mode)
+        if s.windows.tiling_mode == orchard_config::TilingMode::Floating {
+            self.stage_apply_settings(&s.stage_manager);
+        } else if self.stage.enabled {
+            self.stage_manager_disable();
+        }
 
         // pointer theme, and the appearance settings apps read
         self.backend_data.reload_cursor();
@@ -367,6 +379,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
         self.update_fs_reveal(pos);
         self.fs_reveal_cursor(pos);
+        self.stage_pointer_motion(pos);
         self.check_hot_corner(pos);
         if FOCUS_FOLLOWS_MOUSE.load(Ordering::Relaxed) {
             self.focus_under_pointer(pos);

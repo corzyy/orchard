@@ -285,6 +285,7 @@ pub fn run_winit() {
             let fx = &mut state.fx;
             let backdrops = &state.ipc.backdrops;
             let mc = &state.mc;
+            let stage = &state.stage;
             let space_info = state.spaces.info(&output.name());
             let locked = state.protocols.locked;
             let lock_surface = crate::protocols::lock_surface_of(&output);
@@ -364,6 +365,7 @@ pub fn run_winit() {
                     fx,
                     backdrops,
                     mc: mc.as_ref(),
+                    stage: Some(stage),
                     space_info,
                     locked,
                     lock_surface,

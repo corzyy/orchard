@@ -83,6 +83,7 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
         data.space
             .map_element(self.window.clone(), new_location.to_i32_round(), true);
         if !data.is_tiling_mode() {
+            data.stage_on_live_drag_motion(&self.window, event.location);
             self.tile = data.update_tile_preview(&self.window, event.location, self.initial_window_location, self.tile);
         }
     }
@@ -112,9 +113,18 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
                     let pointer = data.pointer.current_location();
                     data.dwindle_drop_drag(&window, pointer);
                 }
-            } else if let Some((tile, area)) = self.tile.take() {
+            } else {
                 let window = self.window.clone();
-                data.tile_window_in(&window, tile, area);
+                let pointer = data.pointer.current_location();
+                let peeled = self.dragged && data.stage_on_live_drag_end(&window, pointer);
+                if !peeled {
+                    if let Some((tile, area)) = self.tile.take() {
+                        data.tile_window_in(&window, tile, area);
+                        if let Some(o) = data.window_output(&window) {
+                            data.stage_update_autohide(&o);
+                        }
+                    }
+                }
             }
             // No more buttons are pressed, release the grab.
             handle.unset_grab(self, data, event.serial, event.time, true);
@@ -216,6 +226,7 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
 
     fn unset(&mut self, data: &mut OrchardState<BackendData>) {
         data.clear_tile_preview();
+        data.stage.peel_target = None;
         reset_grab_cursor(data);
     }
 }
@@ -693,6 +704,9 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
     }
 
     fn unset(&mut self, data: &mut OrchardState<BackendData>) {
+        if let Some(o) = data.window_output(&self.window) {
+            data.stage_update_autohide(&o);
+        }
         reset_grab_cursor(data);
     }
 }

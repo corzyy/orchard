@@ -160,7 +160,12 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             self.dwindle_place_new(window);
             return;
         }
-        let Some(area) = self.usable_area_for(window) else { return };
+        let area = self
+            .window_output(window)
+            .or_else(|| self.active_output())
+            .and_then(|o| self.stage_placement_area(&o))
+            .or_else(|| self.usable_area_for(window));
+        let Some(area) = area else { return };
         let mut x = area.loc.x + (area.size.w - size.w) / 2;
         let mut y = area.loc.y + ((area.size.h - size.h) as f64 * CENTER_BIAS_Y) as i32;
         x = x.max(area.loc.x);
@@ -181,6 +186,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         self.space.map_element(window.clone(), (x, y), false);
         window.start_open_animation(self.clock.now().into());
         // new windows come to the front with keyboard focus, like on macOS
+        self.stage_on_new_window(window);
         self.focus_window(window);
     }
 
@@ -264,6 +270,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             toplevel.send_pending_configure();
             self.animate_frame(window, area);
             self.space.map_element(window.clone(), area.loc, true);
+        }
+        if let Some(o) = self.window_output(window) {
+            self.stage_update_autohide(&o);
         }
     }
 
@@ -447,6 +456,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         self.prune_spaces();
         self.sync_foreign_toplevels();
         self.tick_mission_control();
+        self.tick_stage_manager();
         self.update_game_mode();
         self.ipc_broadcast_if_changed();
         let now: std::time::Duration = self.clock.now().into();
@@ -471,6 +481,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             if let TransientKind::Restore { window, location } = t.kind {
                 if window.alive() {
                     self.space.map_element(window.clone(), location, true);
+                    self.stage_on_window_restored(&window);
                     self.focus_window(&window);
                     mapped = true;
                 }
@@ -525,6 +536,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         self.space.unmap_elem(window);
         self.minimized.retain(|w| w != window);
         self.minimized.push(window.clone());
+        self.stage_on_window_removed(window);
         if self.is_tiling_mode() {
             self.dwindle.remove_everywhere(window.ipc_id().0);
             self.retile_all();
@@ -578,6 +590,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             None => {
                 self.space.map_element(window.clone(), loc, true);
                 self.refit_all_windows();
+                self.stage_on_window_restored(&window);
                 self.focus_window(&window);
             }
         }
@@ -598,20 +611,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     }
 
     pub fn focus_window(&mut self, window: &WindowElement) {
-        self.space.raise_element(window, true);
-        if self.is_locked() {
-            // raised for later, but the keyboard stays with the lock screen
+        if self.stage_reveal_and_focus(window) {
             return;
         }
-        let serial = SERIAL_COUNTER.next_serial();
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, Some(window.clone().into()), serial);
-        }
-        self.space.elements().for_each(|w| {
-            if let Some(t) = w.0.toplevel() {
-                t.send_pending_configure();
-            }
-        });
+        self.focus_window_internal(window);
     }
 
     /// Focus follows mouse: give keyboard focus to the window under the
@@ -762,7 +765,8 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             w.decoration_state().hidden = true;
             self.space.unmap_elem(&w);
             self.minimized.retain(|m| m != &w);
-            self.minimized.push(w);
+            self.minimized.push(w.clone());
+            self.stage_on_window_removed(&w);
         }
         if self.is_tiling_mode() {
             self.retile_all();
@@ -798,6 +802,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 .map(|p| *p.borrow())
                 .unwrap_or_default();
             self.space.map_element(w.clone(), loc, true);
+            self.stage_on_window_restored(w);
         }
         if let Some(top) = hidden.last() {
             if self.is_tiling_mode() {

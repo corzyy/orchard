@@ -238,6 +238,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         } else {
             self.untile_dwindled_on_output(output);
             self.refit_windows_on_output(output);
+            self.stage_after_space_switch(output);
         }
         self.focus_topmost();
     }
@@ -318,6 +319,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         } else {
             spaces.slots[target].windows.extend(slot.windows);
         }
+        self.stage_on_space_removed(output, idx, target);
         tracing::info!(output = %name, space = idx + 1, "removed Space");
         self.spaces.save();
     }
@@ -334,8 +336,20 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if window.is_fullscreen() {
             self.exit_fullscreen_space(window);
         }
-        let Some(loc) = self.space.element_location(window) else { return false };
-        let src = self.window_output(window);
+        let Some(loc) = self.space.element_location(window).or_else(|| {
+            self.stage
+                .all_staged_windows()
+                .into_iter()
+                .find(|(_, _, sw)| sw.window == *window)
+                .map(|(_, _, sw)| sw.saved_loc)
+        }) else {
+            return false;
+        };
+        let src = self.window_output(window).or_else(|| {
+            self.stage
+                .find_in_strip(window)
+                .and_then(|(n, _, _)| self.space.outputs().find(|o| o.name() == n).cloned())
+        });
         let same_output = src.as_ref() == Some(output);
         if same_output && idx == active {
             return false;
@@ -350,8 +364,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             _ => loc,
         };
         self.space.unmap_elem(window);
+        self.stage_on_window_removed(window);
         if idx == active {
             self.space.map_element(window.clone(), loc, true);
+            self.stage_on_new_window(window);
         } else {
             self.spaces.for_output(&name).slots[idx].windows.push((window.clone(), loc));
         }
@@ -426,19 +442,19 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         }
     }
 
-    /// All windows of an output's inactive Spaces (for Mission Control thumbnails).
+    /// All windows of an output's Spaces (for Mission Control thumbnails).
     pub fn space_windows(&self, output: &Output, idx: usize) -> Vec<(WindowElement, Point<i32, Logical>)> {
         let name = output.name();
         let (active, _) = self.spaces.info(&name);
+        let mut out = self.stage.strip_windows_for(&name, idx);
         if idx == active {
-            return self.windows_on_output(output);
+            out.extend(self.windows_on_output(output));
+            return out;
         }
-        self.spaces
-            .outputs
-            .get(&name)
-            .and_then(|o| o.slots.get(idx))
-            .map(|s| s.windows.clone())
-            .unwrap_or_default()
+        if let Some(slot) = self.spaces.outputs.get(&name).and_then(|o| o.slots.get(idx)) {
+            out.extend(slot.windows.clone());
+        }
+        out
     }
 
     /// Which Space (output name, index) currently holds a window, if inactive.
@@ -595,6 +611,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 self.retile_all();
             }
             self.backend_data.reset_buffers(&output);
+            self.stage_update_autohide(&output);
             self.focus_window(window);
         } else if let Some(slot) = self.spaces.for_output(&name).slots.get_mut(idx) {
             // left full screen while its Space is not shown: back into that Space

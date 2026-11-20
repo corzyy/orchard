@@ -74,9 +74,21 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
         if let Some(window) = window {
             self.animate_close(&window);
             self.space.unmap_elem(&window);
+            self.stage_on_window_removed(&window);
             if self.is_tiling_mode() {
                 self.dwindle.remove_everywhere(window.ipc_id().0);
                 self.retile_all();
+            }
+        } else {
+            // May have been parked in a Stage Manager strip
+            let staged = self
+                .stage
+                .all_staged_windows()
+                .into_iter()
+                .find(|(_, _, sw)| sw.window.wl_surface().as_deref() == Some(surface.wl_surface()))
+                .map(|(_, _, sw)| sw.window.clone());
+            if let Some(w) = staged {
+                self.stage_on_window_removed(&w);
             }
         }
         self.minimized

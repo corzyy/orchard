@@ -359,20 +359,33 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     /// Windows Mission Control shows on a display: its current Space (only
     /// one app's windows for App Exposé), bottom to top, with their rects.
     fn mc_windows(&self, output: &Output, app: Option<&str>) -> Vec<(WindowElement, Rectangle<f64, Logical>)> {
-        self.space
-            .elements()
-            .filter(|w| w.alive())
-            .filter(|w| app.map(|a| w.app_id() == a).unwrap_or(true))
-            .filter(|w| {
-                self.window_output(w).as_ref()
-                    .map(|o| o == output)
-                    .unwrap_or_else(|| self.space.outputs().next() == Some(output))
+        let (active, _) = self.spaces.info(&output.name());
+        let mut out: Vec<(WindowElement, Rectangle<f64, Logical>)> = self
+            .stage
+            .strip_windows_for(&output.name(), active)
+            .into_iter()
+            .filter(|(w, _)| w.alive() && app.map(|a| w.app_id() == a).unwrap_or(true))
+            .map(|(w, loc)| {
+                let r = Rectangle::new(loc, w.geometry().size).to_f64();
+                (w, r)
             })
-            .filter_map(|w| {
-                let loc = self.space.element_location(w)?;
-                Some((w.clone(), Rectangle::new(loc, w.geometry().size).to_f64()))
-            })
-            .collect()
+            .collect();
+        out.extend(
+            self.space
+                .elements()
+                .filter(|w| w.alive())
+                .filter(|w| app.map(|a| w.app_id() == a).unwrap_or(true))
+                .filter(|w| {
+                    self.window_output(w).as_ref()
+                        .map(|o| o == output)
+                        .unwrap_or_else(|| self.space.outputs().next() == Some(output))
+                })
+                .filter_map(|w| {
+                    let loc = self.space.element_location(w)?;
+                    Some((w.clone(), Rectangle::new(loc, w.geometry().size).to_f64()))
+                }),
+        );
+        out
     }
 
     pub fn toggle_mission_control(&mut self, app_only: bool) {
@@ -453,8 +466,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if let Some(mc) = self.mc.as_mut() {
             mc.drag = None;
             if let Some(w) = &pick {
-                // the picked window ends up on top
-                self.space.raise_element(w, true);
+                // the picked window ends up on top (if currently mapped in space)
+                if self.space.element_location(w).is_some() {
+                    self.space.raise_element(w, true);
+                }
                 // and is drawn last (on top) during the animation
                 if let Some((si, i)) = mc.find(w) {
                     let item = mc.screens[si].wins.remove(i);
@@ -866,16 +881,19 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         // windows of each Space, bottom to top, with their locations
         let mut per_space: Vec<Vec<(WindowElement, Point<i32, Logical>)>> = Vec::new();
         for i in 0..count {
+            let mut v = self.stage.strip_windows_for(&name, i);
             if i == active {
-                per_space.push(self.windows_on_output(output));
+                v.extend(self.windows_on_output(output));
             } else {
                 let slot = self.spaces.outputs.get(&name).and_then(|o| o.slots.get(i));
-                let mut v: Vec<_> = slot.map(|s| s.windows.clone()).unwrap_or_default();
-                if let Some(fs) = slot.and_then(|s| s.fullscreen.clone()) {
-                    v.push((fs, geo.loc));
+                if let Some(slot) = slot {
+                    v.extend(slot.windows.clone());
+                    if let Some(fs) = slot.fullscreen.clone() {
+                        v.push((fs, geo.loc));
+                    }
                 }
-                per_space.push(v);
             }
+            per_space.push(v);
         }
 
         let full = output.current_transform().transform_size(mode.size);

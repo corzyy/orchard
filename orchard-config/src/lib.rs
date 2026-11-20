@@ -1287,6 +1287,24 @@ mod tests {
     }
 
     #[test]
+    fn stage_manager_settings_round_trip() {
+        let mut s = Settings::default();
+        assert!(!s.stage_manager.enabled);
+        assert!(s.stage_manager.show_recent_apps);
+        assert!(s.stage_manager.click_wallpaper_to_reveal);
+        assert_eq!(s.stage_manager.app_windows, StageAppWindows::AllAtOnce);
+
+        s.stage_manager.enabled = true;
+        s.stage_manager.show_recent_apps = false;
+        s.stage_manager.click_wallpaper_to_reveal = false;
+        s.stage_manager.app_windows = StageAppWindows::OneAtATime;
+        let json = serde_json::to_string(&s).unwrap();
+        let (loaded, problems) = Settings::from_json_lenient(&json);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(loaded.stage_manager, s.stage_manager);
+    }
+
+    #[test]
     fn merge_keeps_changes_made_elsewhere() {
         let base = Settings::default();
         let mut mine = base.clone();
