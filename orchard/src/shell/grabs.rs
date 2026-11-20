@@ -30,8 +30,9 @@ pub struct PointerMoveSurfaceGrab<BackendData: Backend + 'static> {
     pub initial_window_location: Point<i32, Logical>,
     /// moved past the drag threshold (a click alone must not un-tile / un-zoom)
     pub dragged: bool,
-    /// screen-edge tile under the pointer, applied on release
-    pub tile: Option<crate::tiling::Tile>,
+    /// screen-edge tile under the pointer and the usable area of its
+    /// display, applied on release
+    pub tile: Option<(crate::tiling::Tile, smithay::utils::Rectangle<i32, Logical>)>,
 }
 
 impl<BackendData: Backend + 'static> PointerMoveSurfaceGrab<BackendData> {
@@ -101,9 +102,9 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             data.clear_tile_preview();
-            if let Some(tile) = self.tile.take() {
+            if let Some((tile, area)) = self.tile.take() {
                 let window = self.window.clone();
-                data.tile_window(&window, tile);
+                data.tile_window_in(&window, tile, area);
             }
             // No more buttons are pressed, release the grab.
             handle.unset_grab(self, data, event.serial, event.time, true);

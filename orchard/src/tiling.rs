@@ -39,6 +39,11 @@ const EDGE_ZONE: f64 = 32.0;
 /// Once a target shows, it stays until the pointer is this much further out
 /// (no flicker while the hand wobbles at the boundary).
 const STICKY: f64 = 48.0;
+/// The pointer zone at the seam between two displays: thin, since the pointer
+/// cannot be pushed against it, it just crosses over.
+const SEAM_ZONE: f64 = 14.0;
+/// A window may stick this far over a seam and still tile on its own display.
+const SEAM_OVERHANG: f64 = 64.0;
 
 /// The dragged window counts as "at the edge" once its side is this close to
 /// (or past) the screen edge, wherever the pointer is in its title bar.
@@ -103,46 +108,66 @@ fn tiled_states(tile: Tile) -> [bool; 4] {
     }
 }
 
-/// Which tile the pointer at `pos` asks for while dragging, if any. Only outer
-/// screen edges count (not the seam between two displays). `current` is the
-/// target shown right now; it gets a wider zone so it does not flicker.
+/// Which tile the pointer at `pos` asks for while dragging, if any, and the
+/// usable area of the display it belongs to. Every display has its own two
+/// halves: outer screen edges get a generous zone, the seam between two
+/// displays a thin strip on each side (so moving a window across stays easy).
+/// `current` is the target shown right now; it gets a wider zone so it does
+/// not flicker.
 pub fn edge_tile(
     outputs: &[(Rectangle<i32, Logical>, Rectangle<i32, Logical>)],
     pos: Point<f64, Logical>,
     window: Option<DragWindow>,
-    current: Option<Tile>,
+    current: Option<(Tile, Rectangle<i32, Logical>)>,
 ) -> Option<(Tile, Rectangle<i32, Logical>)> {
     let contains = |p: Point<f64, Logical>| outputs.iter().any(|(g, _)| g.to_f64().contains(p));
     let (geo, area) = outputs.iter().find(|(g, _)| g.to_f64().contains(pos))?;
     let g = geo.to_f64();
     let a = area.to_f64();
+    // hysteresis only for the target on this display
+    let current = current.filter(|(_, r)| r == area).map(|(t, _)| t);
     let extra = |t: &[Tile]| if current.map(|c| t.contains(&c)).unwrap_or(false) { STICKY } else { 0.0 };
     use Tile::*;
 
     let (gl, gr) = (g.loc.x, g.loc.x + g.size.w);
+    // another display on that side: a seam, not an outer edge
+    let seam_l = contains((gl - 1.0, pos.y).into());
+    let seam_r = contains((gr + 1.0, pos.y).into());
+    let seam_t = contains((pos.x, g.loc.y - 1.0).into());
+    let zone = |seam: bool| if seam { SEAM_ZONE } else { EDGE_ZONE };
     let sticky_l = extra(&[Left, TopLeft, BottomLeft]);
     let sticky_r = extra(&[Right, TopRight, BottomRight]);
     // the window pushed against the side (pointer anywhere in its title bar);
-    // not for windows nearly as wide as the screen, they touch both sides
+    // not for windows nearly as wide as the screen, they touch both sides. At
+    // a seam it must not stick out far: then it is on its way to the next display.
     let win = window.filter(|w| w.rect.size.w < g.size.w * 0.9);
     let win_left = win
-        .map(|w| w.rect.loc.x <= gl + WINDOW_TOUCH + sticky_l && w.start_x > gl + WINDOW_TOUCH)
+        .map(|w| {
+            w.rect.loc.x <= gl + WINDOW_TOUCH + sticky_l
+                && w.start_x > gl + WINDOW_TOUCH
+                && (!seam_l || w.rect.loc.x >= gl - SEAM_OVERHANG)
+        })
         .unwrap_or(false);
     let win_right = win
         .map(|w| {
             let w_right = w.rect.loc.x + w.rect.size.w;
             let start_right = w.start_x + w.rect.size.w;
-            w_right >= gr - WINDOW_TOUCH - sticky_r && start_right < gr - WINDOW_TOUCH
+            w_right >= gr - WINDOW_TOUCH - sticky_r
+                && start_right < gr - WINDOW_TOUCH
+                && (!seam_r || w_right <= gr + SEAM_OVERHANG)
         })
         .unwrap_or(false);
-    // a neighbouring display on that side makes it a seam, not an edge
-    let left = (pos.x - gl <= EDGE_ZONE + sticky_l || win_left) && !contains((gl - 1.0, pos.y).into());
-    let right = (gr - pos.x <= EDGE_ZONE + sticky_r || win_right) && !contains((gr + 1.0, pos.y).into());
+    let left = pos.x - gl <= zone(seam_l) + sticky_l || win_left;
+    let right = gr - pos.x <= zone(seam_r) + sticky_r || win_right;
     let (left, right) = if left && right { (pos.x - gl <= gr - pos.x, pos.x - gl > gr - pos.x) } else { (left, right) };
     // the top edge: the whole menu bar strip, plus a little below it
+    let sticky_t = extra(&[Fill, TopLeft, TopRight]);
     let menu_bar = (a.loc.y - g.loc.y).max(0.0);
-    let top = pos.y - g.loc.y <= menu_bar.max(12.0) + 6.0 + extra(&[Fill, TopLeft, TopRight])
-        && !contains((pos.x, g.loc.y - 1.0).into());
+    let top = if seam_t {
+        pos.y - g.loc.y <= menu_bar + SEAM_ZONE + sticky_t
+    } else {
+        pos.y - g.loc.y <= menu_bar.max(12.0) + 6.0 + sticky_t
+    };
 
     let cy = corner_zone(a.size.h);
     let cx = corner_zone(g.size.w);
@@ -177,7 +202,30 @@ pub fn edge_tile(
     } else {
         return None;
     };
-    Some((tile, tile_rect(*area, tile)))
+    Some((tile, *area))
+}
+
+/// The display next to `from` on the left (`dir < 0`) or right (`dir > 0`)
+/// that shares some height with it, nearest first.
+fn neighbour(
+    outputs: &[(Rectangle<i32, Logical>, Rectangle<i32, Logical>)],
+    from: Rectangle<i32, Logical>,
+    dir: i32,
+) -> Option<Rectangle<i32, Logical>> {
+    let overlaps = |g: &Rectangle<i32, Logical>| g.loc.y < from.loc.y + from.size.h && from.loc.y < g.loc.y + g.size.h;
+    outputs
+        .iter()
+        .filter(|(g, _)| *g != from && overlaps(g))
+        .filter_map(|(g, a)| {
+            let dist = if dir < 0 {
+                from.loc.x - (g.loc.x + g.size.w)
+            } else {
+                g.loc.x - (from.loc.x + from.size.w)
+            };
+            (dist >= 0).then_some((dist, *a))
+        })
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, a)| a)
 }
 
 impl<BackendData: Backend> OrchardState<BackendData> {
@@ -243,11 +291,48 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         window.decoration_state().restore_geometry = Some(Rectangle::new(loc, client));
     }
 
+    /// Keyboard tiling on the window's display. Asking for the half it is
+    /// already in moves it on to the facing half of the next display that
+    /// way (⌥⌘← from the left half lands in the right half of the display to
+    /// the left), so every display's two halves are reachable.
     pub fn tile_window(&mut self, window: &WindowElement, tile: Tile) {
+        let Some(area) = self.usable_area_for(window) else { return };
+        let (tile, area) = match (tile, window.decoration_state().tile) {
+            (Tile::Left, Some(Tile::Left)) | (Tile::Right, Some(Tile::Right)) => {
+                let outputs = self.output_areas();
+                let next = outputs
+                    .iter()
+                    .find(|(_, a)| *a == area)
+                    .and_then(|(g, _)| neighbour(&outputs, *g, if tile == Tile::Left { -1 } else { 1 }));
+                match next {
+                    Some(a) => (if tile == Tile::Left { Tile::Right } else { Tile::Left }, a),
+                    None => (tile, area),
+                }
+            }
+            _ => (tile, area),
+        };
+        self.tile_window_in(window, tile, area);
+    }
+
+    /// Tile `window` into `tile` of the usable area `area` (one display's).
+    pub fn tile_window_in(&mut self, window: &WindowElement, tile: Tile, area: Rectangle<i32, Logical>) {
         if !window.alive() || window.decoration_state().fullscreen {
             return;
         }
         if tile == Tile::Fill {
+            // zoom fills the display the window is on: bring it over first
+            if self.usable_area_for(window) != Some(area) {
+                if self.is_zoomed(window) {
+                    self.toggle_zoom(window);
+                }
+                let size = window.geometry().size;
+                let loc: Point<i32, Logical> = (
+                    area.loc.x + (area.size.w - size.w).max(0) / 2,
+                    area.loc.y + (area.size.h - size.h).max(0) / 2,
+                )
+                    .into();
+                self.space.map_element(window.clone(), loc, true);
+            }
             if !self.is_zoomed(window) {
                 if window.decoration_state().tile.is_some() {
                     // zoom restores to the pre-tile size later
@@ -261,7 +346,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             }
             return;
         }
-        let Some(area) = self.usable_area_for(window) else { return };
         self.save_restore_geometry(window);
         self.apply_frame(window, tile_rect(area, tile), Some(tile));
     }
@@ -335,14 +419,14 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         window: &WindowElement,
         pos: Point<f64, Logical>,
         start: Point<i32, Logical>,
-        current: Option<Tile>,
-    ) -> Option<Tile> {
+        current: Option<(Tile, Rectangle<i32, Logical>)>,
+    ) -> Option<(Tile, Rectangle<i32, Logical>)> {
         let drag = self.space.element_location(window).map(|loc| DragWindow {
             rect: Rectangle::new(loc, window.geometry().size).to_f64(),
             start_x: start.x as f64,
         });
         let hit = edge_tile(&self.output_areas(), pos, drag, current);
-        let target = hit.map(|(_, r)| r);
+        let target = hit.map(|(t, a)| tile_rect(a, t));
         if target != self.fx.tile_preview {
             let now: std::time::Duration = self.clock.now().into();
             if let Some(to) = target {
@@ -368,7 +452,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             }
             self.fx.tile_preview = target;
         }
-        hit.map(|(t, _)| t)
+        hit
     }
 
     pub fn clear_tile_preview(&mut self) {
@@ -418,8 +502,8 @@ mod tests {
         assert_eq!(edge_tile(&outs, (20.0, 150.0).into(), None, None).unwrap().0, Tile::TopLeft);
         // hysteresis: a shown target survives a small wobble outwards
         assert!(edge_tile(&outs, (60.0, 500.0).into(), None, None).is_none());
-        assert_eq!(edge_tile(&outs, (60.0, 500.0).into(), None, Some(Tile::Left)).unwrap().0, Tile::Left);
-        assert!(edge_tile(&outs, (120.0, 500.0).into(), None, Some(Tile::Left)).is_none());
+        assert_eq!(edge_tile(&outs, (60.0, 500.0).into(), None, Some((Tile::Left, outs[0].1))).unwrap().0, Tile::Left);
+        assert!(edge_tile(&outs, (120.0, 500.0).into(), None, Some((Tile::Left, outs[0].1))).is_none());
     }
 
     #[test]
@@ -444,24 +528,70 @@ mod tests {
         assert_eq!(edge_tile(&outs, (300.0, 60.0).into(), drag(0.0, 600.0), None).unwrap().0, Tile::TopLeft);
     }
 
-    #[test]
-    fn window_at_a_seam_does_not_tile() {
-        let outs = vec![
+    fn two_side_by_side() -> Vec<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)> {
+        vec![
             (rect(0, 0, 1920, 1080), rect(0, 24, 1920, 980)),
-            (rect(1920, 0, 1920, 1080), rect(1920, 0, 1920, 1080)),
-        ];
-        let d = Some(DragWindow { rect: Rectangle::new((1120.0, 200.0).into(), (800.0, 600.0).into()), start_x: 600.0 });
-        assert!(edge_tile(&outs, (1500.0, 500.0).into(), d, None).is_none());
+            (rect(1920, 0, 2560, 1440), rect(1920, 0, 2560, 1440)),
+        ]
     }
 
     #[test]
-    fn seam_between_outputs_is_not_an_edge() {
+    fn every_display_has_two_halves() {
+        let outs = two_side_by_side();
+        let hit = |x: f64| edge_tile(&outs, (x, 500.0).into(), None, None);
+        // outer edges
+        assert_eq!(hit(0.0), Some((Tile::Left, outs[0].1)));
+        assert_eq!(hit(4479.0), Some((Tile::Right, outs[1].1)));
+        // the seam: each side tiles on its own display
+        assert_eq!(hit(1919.0), Some((Tile::Right, outs[0].1)));
+        assert_eq!(hit(1920.0), Some((Tile::Left, outs[1].1)));
+        assert_eq!(hit(1910.0), Some((Tile::Right, outs[0].1)));
+        // but only a thin strip, so crossing over stays easy
+        assert!(hit(1890.0).is_none());
+        assert!(hit(1950.0).is_none());
+        // the tile lands in that display's half
+        let r = tile_rect(outs[1].1, Tile::Left);
+        assert_eq!(r.loc.x, 1920 + GAP);
+        assert_eq!(r.size.w, (2560 - 3 * GAP) / 2);
+    }
+
+    #[test]
+    fn hysteresis_is_per_display() {
+        let outs = two_side_by_side();
+        // shown on the left display: a wobble keeps it
+        let cur = Some((Tile::Right, outs[0].1));
+        assert_eq!(edge_tile(&outs, (1880.0, 500.0).into(), None, cur).unwrap(), (Tile::Right, outs[0].1));
+        // over on the next display the old target gives no extra room
+        assert!(edge_tile(&outs, (1960.0, 500.0).into(), None, cur).is_none());
+    }
+
+    #[test]
+    fn window_against_a_seam() {
+        let outs = two_side_by_side();
+        let d = |x: f64| Some(DragWindow { rect: Rectangle::new((x, 200.0).into(), (800.0, 600.0).into()), start_x: 600.0 });
+        // flush against the seam, pointer in the middle of the title bar: right half
+        assert_eq!(edge_tile(&outs, (1500.0, 500.0).into(), d(1120.0), None).unwrap(), (Tile::Right, outs[0].1));
+        // sticking out a little still counts
+        assert_eq!(edge_tile(&outs, (1540.0, 500.0).into(), d(1160.0), None).unwrap(), (Tile::Right, outs[0].1));
+        // well over: on its way to the next display
+        assert!(edge_tile(&outs, (1700.0, 500.0).into(), d(1320.0), None).is_none());
+    }
+
+    #[test]
+    fn stacked_displays_get_top_at_the_seam() {
         let outs = vec![
-            (rect(0, 0, 1920, 1080), rect(0, 24, 1920, 980)),
-            (rect(1920, 0, 1920, 1080), rect(1920, 0, 1920, 1080)),
+            (rect(0, 0, 1920, 1080), rect(0, 0, 1920, 1080)),
+            (rect(0, 1080, 1920, 1080), rect(0, 1104, 1920, 956)),
         ];
-        assert!(edge_tile(&outs, (1920.0, 500.0).into(), None, None).is_none());
-        assert!(edge_tile(&outs, (1919.0, 500.0).into(), None, None).is_none());
-        assert_eq!(edge_tile(&outs, (3839.0, 500.0).into(), None, None).unwrap().0, Tile::Right);
+        assert_eq!(edge_tile(&outs, (900.0, 1090.0).into(), None, None).unwrap(), (Tile::Fill, outs[1].1));
+        assert!(edge_tile(&outs, (900.0, 1200.0).into(), None, None).is_none());
+    }
+
+    #[test]
+    fn neighbours() {
+        let outs = two_side_by_side();
+        assert_eq!(neighbour(&outs, outs[0].0, 1), Some(outs[1].1));
+        assert_eq!(neighbour(&outs, outs[1].0, -1), Some(outs[0].1));
+        assert_eq!(neighbour(&outs, outs[0].0, -1), None);
     }
 }
