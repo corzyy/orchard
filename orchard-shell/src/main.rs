@@ -954,15 +954,17 @@ impl App {
                     self.drop_launchpad();
                     return;
                 }
-                lp.paint(&mut pm, fscale, &self.apps, &self.fonts, self.german);
+                lp.paint(&mut pm, fscale, &self.apps, &self.fonts, &self.theme, self.german);
                 animating = lp.is_animating();
                 let a = lp.open;
                 if (a - self.launchpad_backdrop).abs() > 0.01 || (a >= 1.0 && self.launchpad_backdrop < 1.0) {
                     self.launchpad_backdrop = a;
+                    // blur only behind the centered panel
+                    let (x, y, bw, bh, r) = lp.backdrop(w as f32, h as f32);
                     if let Some(ipc) = self.ipc.as_mut() {
                         ipc.request(
                             "set_backdrop",
-                            json!({"namespace": "orchard-launchpad", "rects": [{"x": 0, "y": 0, "w": w, "h": h, "radius": 0, "alpha": a}]}),
+                            json!({"namespace": "orchard-launchpad", "rects": [{"x": x, "y": y, "w": bw, "h": bh, "radius": r, "alpha": a}]}),
                         );
                     }
                 }
@@ -1238,19 +1240,26 @@ impl App {
         let hit = lp.hit(w, h, x, y);
         match kind {
             PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. } => {
-                lp.drag_to(x, w);
                 let hov = match hit {
                     launchpad::Hit::App(i) => Some(i),
                     _ => None,
                 };
-                if hov.is_some() && hov != lp.hovered {
-                    lp.selected = None;
+                if hov != lp.hovered {
+                    if hov.is_some() {
+                        // the mouse takes over from the keyboard selection
+                        lp.selected = None;
+                    }
+                    lp.hovered = hov;
+                    self.redraw(Which::Launchpad);
                 }
-                lp.hovered = hov;
-                self.redraw(Which::Launchpad);
+            }
+            PointerEventKind::Leave { .. } => {
+                if lp.hovered.take().is_some() {
+                    self.redraw(Which::Launchpad);
+                }
             }
             PointerEventKind::Press { button: BTN_LEFT, .. } => {
-                lp.press(hit, x);
+                lp.press(hit);
                 self.redraw(Which::Launchpad);
             }
             PointerEventKind::Release { button: BTN_LEFT, .. } => {
@@ -1258,27 +1267,23 @@ impl App {
                 self.redraw(Which::Launchpad);
                 match clicked {
                     Some(launchpad::Hit::App(i)) => self.launchpad_launch(i),
-                    Some(launchpad::Hit::Dot(p)) => lp_go(self, p),
-                    Some(launchpad::Hit::Empty) => self.close_launchpad(),
+                    Some(launchpad::Hit::Outside) => self.close_launchpad(),
                     _ => {}
                 }
             }
-            PointerEventKind::Axis { horizontal, vertical, .. } => {
-                let d = if horizontal.absolute.abs() > vertical.absolute.abs() {
-                    horizontal.absolute + horizontal.discrete as f64 * 10.0
+            PointerEventKind::Axis { vertical, .. } => {
+                let d = if vertical.absolute != 0.0 {
+                    vertical.absolute as f32
                 } else {
-                    vertical.absolute + vertical.discrete as f64 * 10.0
+                    vertical.discrete as f32 * 48.0
                 };
-                lp.scroll(d as f32);
-                self.redraw(Which::Launchpad);
+                if d != 0.0 {
+                    lp.scroll_by(d);
+                    lp.hovered = None;
+                    self.redraw(Which::Launchpad);
+                }
             }
             _ => {}
-        }
-        fn lp_go(app: &mut App, p: usize) {
-            if let Some(l) = app.launchpad.as_mut() {
-                l.go_to_page(p);
-            }
-            app.redraw(Which::Launchpad);
         }
     }
 
@@ -1302,8 +1307,11 @@ impl App {
             Keysym::Right => lp.move_selection(1, 0),
             Keysym::Up => lp.move_selection(0, -1),
             Keysym::Down => lp.move_selection(0, 1),
-            Keysym::Page_Down => lp.go_to_page(lp.page_target + 1),
-            Keysym::Page_Up => lp.go_to_page(lp.page_target.saturating_sub(1)),
+            Keysym::Tab => lp.move_selection(1, 0),
+            Keysym::Page_Down => lp.page(1),
+            Keysym::Page_Up => lp.page(-1),
+            Keysym::Home => lp.select_edge(false),
+            Keysym::End => lp.select_edge(true),
             Keysym::BackSpace => {
                 let mut q = lp.query.clone();
                 q.pop();
