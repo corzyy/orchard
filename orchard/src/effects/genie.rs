@@ -210,8 +210,9 @@ impl MeshElement {
     }
 
     fn vertices(&self) -> Vec<f32> {
+        let rows = if self.genie { ROWS } else { 1 };
         // triangle strip pairs per row: (left, right) for each row boundary
-        let mut out = Vec::with_capacity((ROWS + 1) * 2 * 4);
+        let mut out = Vec::with_capacity((rows + 1) * 2 * 4);
         let t = self.progress.clamp(0.0, 1.0);
         let point = |u: f32, v: f32| -> (f32, f32) {
             if !self.genie {
@@ -223,8 +224,8 @@ impl MeshElement {
                 genie_point(u, v, t, self.src, self.dst)
             }
         };
-        for i in 0..=ROWS {
-            let k = i as f32 / ROWS as f32;
+        for i in 0..=rows {
+            let k = i as f32 / rows as f32;
             // a strip of rows (vertical funnel) or of columns (sideways)
             let pair = if self.horizontal { [(k, 0.0f32), (k, 1.0)] } else { [(0.0f32, k), (1.0, k)] };
             for (u, v) in pair {

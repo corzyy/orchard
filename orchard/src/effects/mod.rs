@@ -308,18 +308,56 @@ impl FrameAnim {
     }
 }
 
+/// A window appearing on screen: drawn from a cached offscreen snapshot on a
+/// floating-point mesh quad so scaling has sub-pixel precision and chrome,
+/// shadow, and client move as one piece. Re-snapshots only if the window
+/// commits a new buffer or changes size mid-animation.
+#[derive(Debug)]
+pub struct OpenAnim {
+    pub spring: Spring,
+    pub snapshot: Option<Snapshot>,
+    pub snapshot_key: Vec<(Id, CommitCounter)>,
+    pub id: Id,
+    pub commit: Cell<CommitCounter>,
+}
+
+impl OpenAnim {
+    pub fn transform(&self, now: Duration) -> (f64, f32) {
+        if self.spring.is_done_at(now) {
+            return (1.0, 1.0);
+        }
+        let p = self.spring.value_at(now).clamp(0.0, 1.2);
+        (0.94 + 0.06 * p, p.clamp(0.0, 1.0) as f32)
+    }
+
+    pub fn next_commit(&self) -> CommitCounter {
+        let mut c = self.commit.get();
+        c.increment();
+        self.commit.set(c);
+        c
+    }
+}
+
 /// Per-window animation state, stored in the window's user data.
 #[derive(Debug, Default)]
 pub struct WindowAnim {
     /// 0 → 1 when the window appears
-    pub open: Option<Spring>,
+    pub open: Option<OpenAnim>,
     pub frame: Option<FrameAnim>,
 }
 
 impl WindowAnim {
     pub fn is_animating(&self, now: Duration) -> bool {
-        self.open.map(|s| !s.is_done_at(now)).unwrap_or(false)
+        self.open.as_ref().map(|o| !o.spring.is_done_at(now)).unwrap_or(false)
             || self.frame.as_ref().map(|f| !f.spring.is_done_at(now)).unwrap_or(false)
+    }
+
+    /// The running open animation, dropping a finished one (and its snapshot).
+    pub fn open_at_mut(&mut self, now: Duration) -> Option<&mut OpenAnim> {
+        if self.open.as_ref().map(|o| o.spring.is_done_at(now)).unwrap_or(false) {
+            self.open = None;
+        }
+        self.open.as_mut()
     }
 
     /// The running frame animation, dropping a finished one.
@@ -332,12 +370,9 @@ impl WindowAnim {
 
     /// (scale, alpha) of the window at `now`.
     pub fn transform(&self, now: Duration) -> (f64, f32) {
-        match self.open {
-            Some(s) if !s.is_done_at(now) => {
-                let p = s.value_at(now).clamp(0.0, 1.2);
-                (0.94 + 0.06 * p, p.clamp(0.0, 1.0) as f32)
-            }
-            _ => (1.0, 1.0),
+        match &self.open {
+            Some(o) => o.transform(now),
+            None => (1.0, 1.0),
         }
     }
 }
@@ -353,7 +388,17 @@ impl WindowElement {
     }
 
     pub fn start_open_animation(&self, now: Duration) {
-        self.anim().open = Some(Spring::new(0.0, 1.0, SpringParams::SMOOTH, now));
+        if crate::settings::get().appearance.reduce_motion {
+            self.anim().open = None;
+            return;
+        }
+        self.anim().open = Some(OpenAnim {
+            spring: Spring::new(0.0, 1.0, SpringParams::SMOOTH, now),
+            snapshot: None,
+            snapshot_key: Vec::new(),
+            id: Id::new(),
+            commit: Default::default(),
+        });
     }
 }
 

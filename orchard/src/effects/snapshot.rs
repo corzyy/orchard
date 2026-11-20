@@ -9,7 +9,7 @@ use smithay::{
             damage::OutputDamageTracker,
             element::AsRenderElements,
             gles::{GlesRenderer, GlesTexture},
-            Bind, Color32F, Frame, Offscreen, Renderer,
+            Bind, Color32F, Frame, Offscreen, Renderer, Texture,
         },
     },
     desktop::space::SpaceElement,
@@ -34,29 +34,47 @@ pub fn snapshot_window(renderer: &mut GlesRenderer, window: &WindowElement, scal
     if bbox.is_empty() {
         return None;
     }
+    // render origin is the surface origin; bbox is relative to it
+    let origin: Point<i32, Physical> =
+        (Point::<i32, Logical>::from((0, 0)) - bbox.loc).to_physical_precise_round(scale);
+    let elements: Vec<WindowRenderElement> =
+        AsRenderElements::<GlesRenderer>::render_elements(window, renderer, origin, Scale::from(scale), 1.0);
+    snapshot_elements_into(renderer, &elements, bbox, scale, None)
+}
+
+/// Render pre-built window elements (anchored at `-bbox.loc`) into an offscreen
+/// texture, reusing `reuse` when its size matches.
+pub fn snapshot_elements_into(
+    renderer: &mut GlesRenderer,
+    elements: &[WindowRenderElement],
+    bbox: Rectangle<i32, Logical>,
+    scale: f64,
+    reuse: Option<GlesTexture>,
+) -> Option<Snapshot> {
+    if bbox.is_empty() {
+        return None;
+    }
     let size: Size<i32, Physical> = bbox.size.to_physical_precise_ceil(scale);
     let buf_size = (size.w, size.h).into();
-    let mut texture: GlesTexture = renderer
-        .create_buffer(Fourcc::Abgr8888, buf_size)
-        .map_err(|e| tracing::warn!("snapshot buffer: {e:?}"))
-        .ok()?;
+    let mut texture: GlesTexture = match reuse {
+        Some(tex) if tex.size() == buf_size => tex,
+        _ => renderer
+            .create_buffer(Fourcc::Abgr8888, buf_size)
+            .map_err(|e| tracing::warn!("snapshot buffer: {e:?}"))
+            .ok()?,
+    };
     {
         let mut target = renderer
             .bind(&mut texture)
             .map_err(|e| tracing::warn!("snapshot bind: {e:?}"))
             .ok()?;
-        // Clear freshly allocated VRAM (prevents NVIDIA white-dot speckles).
+        // Clear freshly allocated or reused VRAM (prevents stale pixels / NVIDIA speckles).
         if let Ok(mut frame) = renderer.render(&mut target, size, Transform::Normal) {
             let _ = frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)]);
             let _ = frame.finish();
         }
-        // render origin is the surface origin; bbox is relative to it
-        let origin: Point<i32, Physical> =
-            (Point::<i32, Logical>::from((0, 0)) - bbox.loc).to_physical_precise_round(scale);
-        let elements: Vec<WindowRenderElement> =
-            AsRenderElements::<GlesRenderer>::render_elements(window, renderer, origin, Scale::from(scale), 1.0);
         let mut tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
-        let res = tracker.render_output(renderer, &mut target, 0, &elements, Color32F::TRANSPARENT);
+        let res = tracker.render_output(renderer, &mut target, 0, elements, Color32F::TRANSPARENT);
         if let Err(e) = res {
             tracing::warn!("snapshot render failed: {e:?}");
             return None;

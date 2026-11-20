@@ -9,7 +9,7 @@ use smithay::{
             surface::WaylandSurfaceRenderElement,
             texture::TextureRenderElement,
             utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
-            AsRenderElements, Id, Kind,
+            AsRenderElements, Element, Id, Kind,
         },
         gles::{GlesError, GlesRenderer, GlesTarget, GlesTexture},
         Color32F, ImportAll, ImportMem, Renderer,
@@ -259,6 +259,9 @@ fn window_elements(
     if frame_anim_elements(renderer, output_geo, window, location, scale, now, out) {
         return;
     }
+    if open_anim_elements(renderer, output_geo, window, location, scale, now, out) {
+        return;
+    }
     let (anim_scale, alpha) = window.anim().transform(now);
     let render_loc = (location - window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
     let geo = window.geometry();
@@ -269,6 +272,82 @@ fn window_elements(
     out.extend(elems.into_iter().map(|e| {
         OutputRenderElements::Window(RescaleRenderElement::from_element(e, center, anim_scale))
     }));
+}
+
+/// A window mid open-animation: render from a cached offscreen snapshot on a
+/// floating-point mesh quad so scaling is sub-pixel smooth and titlebar,
+/// client, and shadow never jitter relative to each other.
+fn open_anim_elements(
+    renderer: &mut GlesRenderer,
+    output_geo: Rectangle<i32, Logical>,
+    window: &WindowElement,
+    location: Point<i32, Logical>,
+    scale: f64,
+    now: Duration,
+    out: &mut Vec<OutputRenderElements>,
+) -> bool {
+    let (anim_scale, alpha) = {
+        let mut anim = window.anim();
+        let Some(oa) = anim.open_at_mut(now) else {
+            return false;
+        };
+        oa.transform(now)
+    };
+    let bbox = SpaceElement::bbox(window);
+    let geo = window.geometry();
+    if bbox.is_empty() || geo.size.w <= 0 || geo.size.h <= 0 {
+        return false;
+    }
+    let origin: Point<i32, Physical> =
+        (Point::<i32, Logical>::from((0, 0)) - bbox.loc).to_physical_precise_round(scale);
+    let elems: Vec<WindowRenderElement> =
+        AsRenderElements::<GlesRenderer>::render_elements(window, renderer, origin, Scale::from(scale), 1.0);
+    let key: Vec<(Id, smithay::backend::renderer::utils::CommitCounter)> =
+        elems.iter().map(|e| (e.id().clone(), e.current_commit())).collect();
+
+    let mut anim = window.anim();
+    let Some(oa) = anim.open.as_mut() else {
+        return false;
+    };
+    let cache_hit = oa
+        .snapshot
+        .as_ref()
+        .is_some_and(|s| s.bbox == bbox && (s.scale - scale).abs() < 1e-6)
+        && oa.snapshot_key == key;
+    if !cache_hit {
+        let reuse = oa.snapshot.take().map(|s| s.texture);
+        oa.snapshot = crate::effects::snapshot::snapshot_elements_into(renderer, &elems, bbox, scale, reuse);
+        oa.snapshot_key = key;
+    }
+    let Some(snap) = oa.snapshot.as_ref() else {
+        return false;
+    };
+    let cx = ((location.x - output_geo.loc.x) as f64 + geo.size.w as f64 * 0.5) * scale;
+    let cy = ((location.y - output_geo.loc.y) as f64 + geo.size.h as f64 * 0.5) * scale;
+    let base: Point<i32, Physical> =
+        (location - geo.loc - output_geo.loc + snap.bbox.loc).to_physical_precise_round(scale);
+    let x0 = base.x as f64;
+    let y0 = base.y as f64;
+    let w0 = snap.size.w as f64;
+    let h0 = snap.size.h as f64;
+    let r = RectF {
+        x: (cx + (x0 - cx) * anim_scale) as f32,
+        y: (cy + (y0 - cy) * anim_scale) as f32,
+        w: (w0 * anim_scale) as f32,
+        h: (h0 * anim_scale) as f32,
+    };
+    out.push(OutputRenderElements::Mesh(MeshElement::new(
+        oa.id.clone(),
+        oa.next_commit(),
+        snap.texture.clone(),
+        (snap.size.w, snap.size.h),
+        r,
+        r,
+        0.0,
+        alpha,
+        false,
+    )));
+    true
 }
 
 /// Full-screen reveal (fs_reveal.rs): the menu bar and a title bar with
@@ -1083,17 +1162,18 @@ fn output_elements_inner(
                     let is_ssd = window.is_ssd();
                     let client_geo = window.client_geometry();
                     let top_off = if is_ssd { crate::shell::ssd::HEADER_BAR_HEIGHT } else { 0 };
+                    let (anim_scale, alpha) = window.anim().transform(now);
+                    let win_geo = window.geometry();
+                    let cx = (loc.x - output_geo.loc.x) as f64 + win_geo.size.w as f64 * 0.5;
+                    let cy = (loc.y - output_geo.loc.y) as f64 + win_geo.size.h as f64 * 0.5;
+                    let x0 = (loc.x - output_geo.loc.x) as f64;
+                    let y0 = (loc.y - output_geo.loc.y + top_off) as f64;
                     let rect = Rectangle::<f64, Logical>::new(
-                        (
-                            (loc.x - output_geo.loc.x) as f64,
-                            (loc.y - output_geo.loc.y + top_off) as f64,
-                        )
-                            .into(),
-                        (client_geo.size.w as f64, client_geo.size.h as f64).into(),
+                        (cx + (x0 - cx) * anim_scale, cy + (y0 - cy) * anim_scale).into(),
+                        (client_geo.size.w as f64 * anim_scale, client_geo.size.h as f64 * anim_scale).into(),
                     )
                     .to_physical_precise_round(scale);
-                    let (_, alpha) = window.anim().transform(now);
-                    let radius = (crate::chrome::theme::corner_radius() as f64 * scale) as f32;
+                    let radius = (crate::chrome::theme::corner_radius() as f64 * anim_scale * scale) as f32;
                     pending.push(PendingBackdrop {
                         index: out.len(),
                         id: blur_id,

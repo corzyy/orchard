@@ -1690,7 +1690,9 @@ impl OrchardState<UdevData> {
             locked: self.protocols.locked,
             lock_surface: crate::protocols::lock_surface_of(&output),
         };
-        let now: Duration = self.clock.now().into();
+        // Sample animations at the predicted presentation time (vblank-locked)
+        // rather than timer-wakeup time, eliminating frame-pacing jitter.
+        let now: Duration = frame_target.max(self.clock.now()).into();
         // single-GPU path: render with the GLES renderer of the render node
         let result = render_surface(
             surface,
