@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Orchard (locked)
+Comment=Orchard, starting at its lock screen (used for automatic login)
+Exec=/usr/local/bin/orchard-session --locked
+Type=Application
+DesktopNames=Orchard
+NoDisplay=true

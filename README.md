@@ -7,6 +7,7 @@ Orchard uses no Apple assets. Fonts, icons and the wallpaper come from your own 
 ```
 orchard/        compositor   (window chrome, animations, Spaces, Mission Control, IPC)
 orchard-shell/  menu bar, Dock, Cmd+Tab switcher, Spotlight-like launcher
+orchard-lock/   lock screen (ext-session-lock + PAM)
 dist/           login session files + installer
 ```
 
@@ -58,6 +59,12 @@ dist/           login session files + installer
   - Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`) and Do Not Disturb toggles.
   - Display brightness (laptops) and volume sliders, and Now Playing with previous / play-pause / next (`playerctl`).
   - Click outside or press Esc to close.
+- **Lock screen** (`orchard-lock`; ⌃⌘Q, Apple menu → Lock Screen, hot corners, idle lock):
+  - macOS style: date and a large clock at the top, your account picture (`~/.face`, else a silhouette), name and the password field at the bottom, over the blurred wallpaper. Sleep, Restart and Shut Down buttons sit below.
+  - A wrong password shakes the field. A caps-lock badge shows in the field. Return or the arrow button checks the password through PAM (`/etc/pam.d/orchard-lock`, else swaylock's PAM file).
+  - On success the lock fades out and the blurred wallpaper dissolves into the desktop.
+  - The compositor never draws windows while locked, and only the lock screen gets keys, even from windows that open behind it. If the locker crashes, the session stays locked and Orchard starts a new one. A second locker is refused.
+  - **Instead of a login greeter** (`dist/autologin.sh enable`): the PC boots straight into Orchard, which starts at the lock screen (`orchard-session --locked`). The desktop, the menu bar, the Dock and your autostart apps load behind it while you type, so one password brings up a ready desktop. Logging out shows the greeter again; `dist/autologin.sh disable` turns this off. With automatic login, a keyring that PAM would unlock at login (KWallet, GNOME Keyring) is not unlocked.
 - **Volume / brightness HUD**: media keys change the volume (`wpctl`), brightness (`brightnessctl`, or DDC/CI via `ddcutil` for external monitors) and playback (`playerctl`).
   - The macOS-style bezel shows the new level in 16 steps.
   - ⇧⌥ + volume/brightness changes in quarter steps.
@@ -92,7 +99,7 @@ dist/           login session files + installer
 | ⌥⇧⌘⎋ / ⌥⌘⎋ | force quit the frontmost app / open the system monitor |
 | ⌥⇧⌘Q | log out |
 | volume, brightness, play/pause keys | with an on-screen HUD |
-| ⌃⌘Q | lock (needs `swaylock`, or set `ORCHARD_LOCKER`) |
+| ⌃⌘Q | lock screen (`orchard-lock`; another locker via Settings → Lock Screen or `ORCHARD_LOCKER`) |
 | ⌘Return | terminal (`ORCHARD_TERMINAL`, default konsole) |
 | Ctrl+Alt+Backspace | quit Orchard |
 
@@ -104,6 +111,7 @@ cargo run -- --nested     # in a window inside your current session
 cargo run -- --headless   # offscreen, no window (automated tests, see below)
 cargo run -- --tty        # real session from a text console (Ctrl+Alt+F3)
 dist/install.sh           # release build + "Orchard" entry in the SDDM session menu
+dist/autologin.sh enable  # optional: boot straight into Orchard's lock screen, no greeter
 ```
 Plasma stays installed and selectable at login.
 
@@ -132,13 +140,15 @@ dist/dev.sh manual           # back to the default: Rust is only built when you 
 The real-hardware backend links against `libinput` and `libseat`. Without their `-devel` packages it builds through a shim in `.devshim/` (see `.cargo/config.toml`). The proper fix is:
 `sudo dnf install libinput-devel libseat-devel`
 
-Recommended extra packages: `swaylock` (lock screen). Screen sharing uses `xdg-desktop-portal-hyprland` (already installed with Hyprland's portal package) through wlr-screencopy.
+Screen sharing uses `xdg-desktop-portal-hyprland` (already installed with Hyprland's portal package) through wlr-screencopy.
 
 ## Headless testing
 `dist/test-pointer-constraints.sh` checks that pointer locks and confinement (games) never let the cursor leave the window.
 
 `orchard --headless` renders on the GPU without a window. To control it, append lines to `$XDG_RUNTIME_DIR/orchard-ctl`:
-`motion X Y`, `rel DX DY` (relative mouse motion, honours pointer locks), `down`, `up`, `action <name>`, `shot <file.png>`, `spawn <cmd>`.
+`motion X Y`, `rel DX DY` (relative mouse motion, honours pointer locks), `down`, `up`, `key <evdev code> [down|up]`, `action <name>`, `shot <file.png>`, `spawn <cmd>`.
+
+`ORCHARD_START_LOCKED=1` starts the compositor locked (with `orchard-lock` as the first client), as `orchard-session --locked` does. `ORCHARD_LOCK_TRACE=1` makes `orchard-lock` print its startup timings.
 
 `ORCHARD_HEADLESS_OUTPUTS=2` adds a second, never-rendered output to test multi-display behaviour (main display). Headless outputs offer fake 60/120 Hz modes.
 

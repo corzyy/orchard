@@ -1,0 +1,3 @@
+#%PAM-1.0
+# Orchard's lock screen (orchard-lock) only checks the password.
+auth       include      login

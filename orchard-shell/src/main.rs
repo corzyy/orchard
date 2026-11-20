@@ -1431,7 +1431,7 @@ impl App {
                 MenuItem::new(t("Restart…", "Neustart …"), Action::System("systemctl reboot".into())),
                 MenuItem::new(t("Shut Down…", "Ausschalten …"), Action::System("systemctl poweroff".into())),
                 MenuItem::separator(),
-                MenuItem::new(t("Lock Screen", "Bildschirm sperren"), Action::System("${ORCHARD_LOCKER:-swaylock -f -c 1e1e1e}".into()))
+                MenuItem::new(t("Lock Screen", "Bildschirm sperren"), Action::Wm("lock"))
                     .with_shortcut("⌃⌘Q"),
                 MenuItem::new(t("Log Out", "Abmelden"), Action::LogOut).with_shortcut("⌥⇧⌘Q"),
             ],

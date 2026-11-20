@@ -1283,7 +1283,10 @@ pub fn lock_screen(ui: &mut Ui, cx: &mut Cx) {
             }
         });
         g.row_sub("Lock command", "Runs on ⌃⌘Q, hot corners and after inactivity", |ui| {
-            text_field(ui, &mut cx.s.lock.locker, 220.0, "swaylock -f");
+            if cx.s.lock.locker.trim() == orchard_config::LEGACY_LOCKER {
+                cx.s.lock.locker.clear();
+            }
+            text_field(ui, &mut cx.s.lock.locker, 220.0, "Orchard lock screen");
         });
     });
     let bin = cx.s.lock.locker.split_whitespace().next().unwrap_or_default().to_string();

@@ -401,15 +401,20 @@ impl Default for DesktopSettings {
 pub struct LockSettings {
     /// Lock after this many minutes without input; 0 = never.
     pub lock_after_minutes: u32,
-    /// Command used for locking (⌃⌘Q, hot corner, idle).
+    /// Command used for locking (⌃⌘Q, hot corner, idle). Empty: Orchard's own
+    /// lock screen (`orchard-lock`).
     pub locker: String,
 }
+
+/// The locker settings files written before `orchard-lock` existed; treated
+/// like an empty `locker`.
+pub const LEGACY_LOCKER: &str = "swaylock -f -c 1e1e1e";
 
 impl Default for LockSettings {
     fn default() -> Self {
         Self {
             lock_after_minutes: 0,
-            locker: "swaylock -f -c 1e1e1e".into(),
+            locker: String::new(),
         }
     }
 }

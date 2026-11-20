@@ -819,6 +819,17 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         if let Some(name) = state.socket_name.clone() {
             let handle = state.handle.clone();
             state.init_ipc(&handle, &name);
+            // `orchard-session --locked` (autologin): the lock screen is the first
+            // client, the shell and autostart load behind it
+            if std::env::var_os("ORCHARD_START_LOCKED").is_some_and(|v| v != "0") {
+                state.lock_at_startup();
+            }
+            // Parse the title-bar font now, off the main thread: it is otherwise
+            // loaded by the first window frame, which (when the session starts
+            // locked) is the moment of unlocking, and would stall it.
+            let _ = std::thread::Builder::new().name("font-warmup".into()).spawn(|| {
+                crate::chrome::font::title_font();
+            });
             state.start_shell();
             // autostart waits for Xwayland (X11 apps need DISPLAY); this timer is
             // the fallback if it never becomes ready
@@ -1091,6 +1102,16 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         // Drop the lock to the layer map before calling blocker_cleared, which might end up
         // calling the commit handler which in turn again could access the layer map.
         std::mem::drop(map);
+
+        // the lock screen animates (fade, shake, spinner): it needs frame callbacks too
+        if self.protocols.locked {
+            if let Some(lock) = crate::protocols::lock_surface_of(output) {
+                let o = output.clone();
+                smithay::desktop::utils::send_frames_surface_tree(&lock, output, time, throttle, move |_, _| {
+                    Some(o.clone())
+                });
+            }
+        }
 
         if let CursorImageStatus::Surface(ref surface) = self.cursor_status {
             with_surfaces_surface_tree(surface, |surface, states| {

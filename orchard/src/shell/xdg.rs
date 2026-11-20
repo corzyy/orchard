@@ -425,6 +425,10 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
                         .map(KeyboardFocusTarget::LayerSurface)
                 })
         }) {
+            if self.is_locked() {
+                // no popup grabs (and their keyboard focus) behind the lock
+                return;
+            }
             let ret = self.popups.grab_popup(root, kind, &seat, serial);
 
             if let Ok(mut grab) = ret {

@@ -276,6 +276,20 @@ pub fn run_headless() {
                 "rup" => state.inject_pointer_button(0x111, false, now_ms),
                 "mdown" => state.inject_pointer_button(0x112, true, now_ms),
                 "mup" => state.inject_pointer_button(0x112, false, now_ms),
+                // `key <evdev code> [down|up]` (press + release without a state)
+                "key" => {
+                    let mut it = rest.split_whitespace();
+                    if let Some(code) = it.next().and_then(|c| c.parse::<u32>().ok()) {
+                        match it.next() {
+                            Some("down") => state.inject_key(code, true, now_ms),
+                            Some("up") => state.inject_key(code, false, now_ms),
+                            _ => {
+                                state.inject_key(code, true, now_ms);
+                                state.inject_key(code, false, now_ms);
+                            }
+                        }
+                    }
+                }
                 "super" => state.fake_logo = rest == "down",
                 "action" => state.run_named_action(rest),
                 "shot" => pending_shot = Some(PathBuf::from(rest)),

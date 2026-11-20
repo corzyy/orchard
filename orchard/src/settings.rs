@@ -49,15 +49,32 @@ pub fn terminal() -> String {
         })
 }
 
-/// Command used to lock the screen.
+/// Command used to lock the screen: env var, then settings, then Orchard's own
+/// lock screen (`orchard-lock`, next to the compositor binary or on PATH).
 pub fn locker() -> String {
     std::env::var("ORCHARD_LOCKER")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
-            let l = get().lock.locker.clone();
-            if l.trim().is_empty() { "swaylock -f -c 1e1e1e".into() } else { l }
+            let l = get().lock.locker.trim().to_string();
+            // empty, or the old swaylock default: use Orchard's lock screen
+            if l.is_empty() || l == orchard_config::LEGACY_LOCKER || l == "orchard-lock" {
+                default_locker()
+            } else {
+                l
+            }
         })
+}
+
+fn default_locker() -> String {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.join("orchard-lock")))
+        .filter(|p| p.is_file());
+    match sibling {
+        Some(p) => format!("'{}'", p.display().to_string().replace('\'', "'\\''")),
+        None => "orchard-lock".into(),
+    }
 }
 
 use orchard_config::CornerAction;
@@ -284,6 +301,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
         let res = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(1)), |_, _, state| {
             state.supervise_shell();
+            state.supervise_locker();
             state.check_settings_file();
             TimeoutAction::ToDuration(std::time::Duration::from_secs(1))
         });

@@ -221,7 +221,13 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         let mut suppressed_keys = self.suppressed_keys.clone();
         let keyboard = self.seat.get_keyboard().unwrap();
 
-        for layer in self.layer_shell_state.layer_surfaces().rev() {
+        // while locked, keys only ever reach the lock screen: windows or layers
+        // that mapped behind the lock must not catch a typed password
+        if self.protocols.locked {
+            self.enforce_lock_focus();
+        }
+
+        for layer in self.layer_shell_state.layer_surfaces().rev().filter(|_| !self.protocols.locked) {
             let data = with_states(layer.wl_surface(), |states| {
                 *states.cached_state.get::<LayerSurfaceCachedState>().current()
             });
@@ -735,6 +741,22 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         );
         pointer.frame(self);
         self.after_pointer_motion(pos);
+    }
+
+    /// Synthetic key (headless testing): an evdev code delivered to the focused
+    /// client, with the same lock-screen focus rule as real keys.
+    pub fn inject_key(&mut self, evdev_code: u32, pressed: bool, time: u32) {
+        if self.protocols.locked {
+            self.enforce_lock_focus();
+        }
+        let Some(keyboard) = self.seat.get_keyboard() else { return };
+        let state = if pressed {
+            smithay::backend::input::KeyState::Pressed
+        } else {
+            smithay::backend::input::KeyState::Released
+        };
+        let serial = SCOUNTER.next_serial();
+        keyboard.input::<(), _>(self, (evdev_code + 8).into(), state, serial, time, |_, _, _| FilterResult::Forward);
     }
 
     /// Synthetic pointer button (headless testing / automation).

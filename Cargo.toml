@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["orchard", "orchard-shell", "orchard-config", "orchard-settings"]
+members = ["orchard", "orchard-shell", "orchard-config", "orchard-settings", "orchard-lock"]
 
 [workspace.package]
 edition = "2021"

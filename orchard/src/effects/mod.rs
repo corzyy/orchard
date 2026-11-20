@@ -182,11 +182,45 @@ pub struct Effects {
     pub shot_bufs: [smithay::backend::renderer::element::solid::SolidColorBuffer; 5],
     /// live-blur textures of the frosted-glass backdrops
     pub blur: blur::LiveBlur,
+    /// lock screen backdrop: blurred wallpaper + a light dim (stable ids)
+    pub lock_bg_id: StableId,
+    pub lock_dim: smithay::backend::renderer::element::solid::SolidColorBuffer,
+    pub lock_fallback: smithay::backend::renderer::element::solid::SolidColorBuffer,
+    /// when the session was unlocked: the lock backdrop fades out over the desktop
+    pub unlock_fade: Option<Duration>,
+}
+
+/// An element id created on first use (`Id` has no `Default`).
+pub struct StableId(pub Id);
+
+impl Default for StableId {
+    fn default() -> Self {
+        StableId(Id::new())
+    }
+}
+
+/// Length of the unlock cross-fade.
+pub const UNLOCK_FADE: Duration = Duration::from_millis(320);
+
+impl Effects {
+    /// Opacity of the lock backdrop drawn over the desktop right after unlocking
+    /// (1 → 0, ease-out), or None once the fade is over.
+    pub fn unlock_fade_alpha(&mut self, now: Duration) -> Option<f32> {
+        let start = self.unlock_fade?;
+        let t = now.saturating_sub(start).as_secs_f32() / UNLOCK_FADE.as_secs_f32();
+        if t >= 1.0 {
+            self.unlock_fade = None;
+            return None;
+        }
+        let e = 1.0 - (1.0 - t).powi(3);
+        Some(1.0 - e)
+    }
 }
 
 impl Effects {
     pub fn is_animating(&self, now: Duration) -> bool {
         self.transients.iter().any(|t| !t.is_done(now))
+            || self.unlock_fade.map(|s| now.saturating_sub(s) < UNLOCK_FADE).unwrap_or(false)
             || self.tile_preview_anim.as_ref().map(|(_, s, _)| !s.is_done_at(now)).unwrap_or(false)
             || self
                 .space_transition

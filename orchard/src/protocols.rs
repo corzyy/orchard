@@ -29,6 +29,11 @@ pub struct ProtocolState {
     /// ext-foreign-toplevel handles: window, handle, last title, last app_id
     pub toplevels: Vec<(crate::shell::WindowElement, ForeignToplevelHandle, String, String)>,
     pub locked: bool,
+    /// the ext-session-lock object holding the lock (one at a time)
+    pub active_lock: Option<smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1>,
+    /// the locker Orchard started itself, and when (see `supervise_locker`)
+    pub locker_child: Option<std::process::Child>,
+    pub locker_started: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for ProtocolState {
@@ -80,29 +85,51 @@ impl<BackendData: Backend> SessionLockHandler for OrchardState<BackendData> {
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {
+        use smithay::reexports::wayland_server::Resource;
+        let lock = confirmation.ext_session_lock().clone();
+        if self.protocols.active_lock.as_ref().is_some_and(|l| l.is_alive()) {
+            // Only one lock at a time. Smithay runs `unlock` for *any* lock
+            // object's unlock_and_destroy (even one that was refused), so the
+            // second locker gets a protocol error: libwayland then stops
+            // reading its requests and disconnects it. (Disconnecting it
+            // directly here, inside its own dispatch, crashes libwayland.)
+            tracing::warn!("rejecting a second session lock");
+            drop(confirmation); // sends `finished`
+            lock.post_error(
+                smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::Error::InvalidUnlock,
+                "the session is already locked",
+            );
+            return;
+        }
         tracing::info!("session locked");
+        self.protocols.active_lock = Some(lock);
         self.protocols.locked = true;
+        self.fx.unlock_fade = None;
         // close transient UI
         self.mc = None;
         self.switcher_cancel();
-        // the next repaint shows only lock surfaces / black; confirm right away
+        // the next repaint shows only lock surfaces over the wallpaper; confirm right away
         confirmation.lock();
         for output in self.space.outputs().cloned().collect::<Vec<_>>() {
             self.backend_data.reset_buffers(&output);
         }
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        if let Some(k) = self.seat.get_keyboard() {
-            k.set_focus(self, None, serial);
-        }
+        self.enforce_lock_focus();
     }
 
     fn unlock(&mut self) {
         tracing::info!("session unlocked");
         self.protocols.locked = false;
+        self.protocols.active_lock = None;
+        self.prefs_rt.idle_locked = false;
         for output in self.space.outputs() {
             if let Some(slot) = output.user_data().get::<OutputLockSurface>() {
                 slot.0.borrow_mut().take();
             }
+        }
+        // the lock backdrop dissolves into the desktop (render.rs)
+        self.fx.unlock_fade = Some(self.clock.now().into());
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            self.backend_data.reset_buffers(&output);
         }
         self.focus_topmost();
     }
@@ -115,16 +142,9 @@ impl<BackendData: Backend> SessionLockHandler for OrchardState<BackendData> {
         });
         surface.send_configure();
         output.user_data().insert_if_missing(OutputLockSurface::default);
-        // keyboard focus goes to the lock surface
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        if let Some(k) = self.seat.get_keyboard() {
-            k.set_focus(
-                self,
-                Some(crate::focus::KeyboardFocusTarget::Surface(surface.wl_surface().clone())),
-                serial,
-            );
-        }
         *output.user_data().get::<OutputLockSurface>().unwrap().0.borrow_mut() = Some(surface);
+        // keyboard focus goes to the lock surface
+        self.enforce_lock_focus();
     }
 }
 delegate_session_lock!(@<BackendData: Backend + 'static> OrchardState<BackendData>);
@@ -140,6 +160,102 @@ pub fn lock_surface_of(output: &Output) -> Option<WlSurface> {
 impl<BackendData: Backend> OrchardState<BackendData> {
     pub fn is_locked(&self) -> bool {
         self.protocols.locked
+    }
+
+    /// While locked, keyboard focus is a live lock surface (the one under the
+    /// pointer, else the first), or nothing until the locker has one.
+    pub fn enforce_lock_focus(&mut self) {
+        use smithay::wayland::seat::WaylandFocus;
+        if !self.protocols.locked {
+            return;
+        }
+        let Some(keyboard) = self.seat.get_keyboard() else { return };
+        let surfaces: Vec<WlSurface> = self
+            .space
+            .outputs()
+            .filter_map(lock_surface_of)
+            .filter(|s| s.alive())
+            .collect();
+        let current = keyboard.current_focus().and_then(|f| f.wl_surface().map(|s| s.into_owned()));
+        if current.as_ref().is_some_and(|c| surfaces.contains(c)) {
+            return;
+        }
+        let pointer = self.pointer.current_location();
+        let preferred = self
+            .space
+            .output_under(pointer)
+            .next()
+            .and_then(lock_surface_of)
+            .filter(|s| s.alive())
+            .or_else(|| surfaces.first().cloned());
+        if current.is_none() && preferred.is_none() {
+            return;
+        }
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, preferred.map(crate::focus::KeyboardFocusTarget::Surface), serial);
+    }
+
+    /// Start the configured locker (see `settings::locker`), tracked so the
+    /// watchdog can tell whether it is still coming up.
+    pub fn spawn_locker(&mut self) {
+        let command = crate::settings::locker();
+        tracing::info!(command, "starting locker");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(&command);
+        self.child_env(&mut cmd);
+        match cmd.spawn() {
+            Ok(child) => {
+                if let Some(mut old) = self.protocols.locker_child.replace(child) {
+                    let _ = old.try_wait();
+                }
+            }
+            Err(e) => tracing::warn!("starting locker {command:?} failed: {e}"),
+        }
+        self.protocols.locker_started = Some(std::time::Instant::now());
+    }
+
+    /// Lock the session from the very first frame (login without a greeter:
+    /// `orchard-session --locked`). The desktop keeps loading behind the lock.
+    pub fn lock_at_startup(&mut self) {
+        tracing::info!("starting locked");
+        self.protocols.locked = true;
+        self.spawn_locker();
+    }
+
+    /// Called every second. A locked session must never be left without a
+    /// locker: if the lock client died (crash, OOM, killed) the session stays
+    /// locked, and a new locker is started.
+    pub fn supervise_locker(&mut self) {
+        // reap our locker when it exits
+        let running = match self.protocols.locker_child.as_mut().map(|c| c.try_wait()) {
+            Some(Ok(None)) => true,
+            Some(_) => {
+                self.protocols.locker_child = None;
+                false
+            }
+            None => false,
+        };
+        use smithay::reexports::wayland_server::Resource;
+        if !self.protocols.locked || self.protocols.active_lock.as_ref().is_some_and(|l| l.is_alive()) {
+            return;
+        }
+        let since = self.protocols.locker_started.map(|t| t.elapsed()).unwrap_or(std::time::Duration::MAX);
+        if running && since < std::time::Duration::from_secs(5) {
+            return; // still starting up
+        }
+        if since < std::time::Duration::from_secs(2) {
+            return; // don't spin on a locker that exits right away
+        }
+        if running {
+            if let Some(mut c) = self.protocols.locker_child.take() {
+                tracing::warn!("locker did not lock within 5 s; restarting it");
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        } else {
+            tracing::warn!("session is locked but no locker is running; restarting it");
+        }
+        self.spawn_locker();
     }
 
     pub fn lock_surface_for(&self, output: &Output) -> Option<LockSurface> {

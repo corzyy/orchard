@@ -783,6 +783,8 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
 
     /// Session environment for processes started by the compositor.
     pub fn child_env(&self, cmd: &mut std::process::Command) {
+        // only meant for this compositor (a nested Orchard must not start locked)
+        cmd.env_remove("ORCHARD_START_LOCKED");
         if let Some(s) = &self.socket_name {
             cmd.env("WAYLAND_DISPLAY", s);
         }

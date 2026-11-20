@@ -585,6 +585,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     pub fn focus_window(&mut self, window: &WindowElement) {
         self.space.raise_element(window, true);
+        if self.is_locked() {
+            // raised for later, but the keyboard stays with the lock screen
+            return;
+        }
         let serial = SERIAL_COUNTER.next_serial();
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, Some(window.clone().into()), serial);
@@ -620,6 +624,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// Give focus to the topmost remaining window (after close/minimize).
     pub fn focus_topmost(&mut self) {
+        if self.is_locked() {
+            return;
+        }
         let top = self.space.elements().next_back().cloned();
         match top {
             Some(w) => self.focus_window(&w),

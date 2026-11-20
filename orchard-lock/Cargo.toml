@@ -1,0 +1,15 @@
+[package]
+name = "orchard-lock"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "macOS-style lock screen for the Orchard compositor (ext-session-lock + PAM)"
+
+[dependencies]
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop", "xkbcommon"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ttf-parser = "0.25"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libc = "0.2"
+orchard-config = { path = "../orchard-config" }

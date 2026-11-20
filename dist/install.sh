@@ -25,7 +25,7 @@ fi
 
 cargo build --release
 
-for b in orchard orchard-shell orchard-settings; do
+for b in orchard orchard-shell orchard-settings orchard-lock; do
     sudo rm -f "/usr/local/bin/$b"
     if [ "${1:-}" = "--dev" ]; then
         sudo ln -s "$PWD/target/release/$b" "/usr/local/bin/$b"
@@ -36,6 +36,8 @@ done
 sudo install -Dm644 dist/org.orchard.settings.desktop /usr/share/applications/org.orchard.settings.desktop
 sudo install -Dm755 dist/orchard-session          /usr/local/bin/orchard-session
 sudo install -Dm644 dist/orchard.desktop          /usr/share/wayland-sessions/orchard.desktop
+sudo install -Dm644 dist/orchard-locked.desktop   /usr/share/wayland-sessions/orchard-locked.desktop
+sudo install -Dm644 dist/orchard-lock.pam         /etc/pam.d/orchard-lock
 
 if [ "${1:-}" = "--dev" ]; then
     echo "Installed in dev mode (symlinks into $PWD/target/release)."

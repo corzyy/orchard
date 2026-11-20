@@ -17,4 +17,10 @@ LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/orchard"
 mkdir -p "$LOG_DIR"
 [ -f "$LOG_DIR/orchard.log" ] && mv -f "$LOG_DIR/orchard.log" "$LOG_DIR/orchard.log.old"
 
+# --locked (automatic login, see dist/autologin.sh): the lock screen is the
+# first thing shown; the desktop loads behind it and appears on unlock
+if [ "${1:-}" = "--locked" ]; then
+    export ORCHARD_START_LOCKED=1
+fi
+
 exec /usr/local/bin/orchard --tty >"$LOG_DIR/orchard.log" 2>&1

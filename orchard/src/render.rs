@@ -842,12 +842,79 @@ fn soft_shadow(
     }
 }
 
+/// Lock screen backdrop: the blurred wallpaper under a light dim, at `alpha`.
+/// Shown while locked (under the locker's translucent surface, and before the
+/// locker has drawn anything) and faded out over the desktop after unlocking.
+fn lock_backdrop_elements(
+    renderer: &mut GlesRenderer,
+    fx: &mut Effects,
+    mode_size: smithay::utils::Size<i32, Physical>,
+    scale: f64,
+    alpha: f32,
+    out: &mut Vec<OutputRenderElements>,
+) {
+    let full = Rectangle::<i32, Physical>::from_size(mode_size);
+    let logical = mode_size.to_f64().to_logical(scale).to_i32_round();
+    fx.lock_dim.update(logical, [0.0, 0.0, 0.0, 0.16 * alpha]);
+    out.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
+        &fx.lock_dim,
+        (0, 0),
+        scale,
+        1.0,
+        Kind::Unspecified,
+    )));
+    let id = fx.lock_bg_id.0.clone();
+    let wp = fx.wallpaper.textures(renderer, mode_size).map(|wp| wp.blurred_region(renderer, &id, full, scale, alpha));
+    match wp {
+        Some(el) => out.push(OutputRenderElements::Texture(el)),
+        // no wallpaper (yet): a dark slate, like the default gradient's darkest tone
+        None => {
+            fx.lock_fallback.update(logical, [0.09, 0.10, 0.13, alpha]);
+            out.push(OutputRenderElements::Solid(SolidColorRenderElement::from_buffer(
+                &fx.lock_fallback,
+                (0, 0),
+                scale,
+                1.0,
+                Kind::Unspecified,
+            )));
+        }
+    }
+}
+
 #[profiling::function]
 pub fn output_elements(
     output: &Output,
     space: &Space<WindowElement>,
     ctx: &mut RenderCtx<'_>,
     custom_elements: impl IntoIterator<Item = CustomRenderElements<GlesRenderer>>,
+    renderer: &mut GlesRenderer,
+    now: Duration,
+) -> (Vec<OutputRenderElements>, Color32F) {
+    let custom: Vec<_> = custom_elements.into_iter().collect();
+    let n_custom = custom.len();
+    let (mut out, clear) = output_elements_inner(output, space, ctx, custom, renderer, now);
+    // just unlocked: the lock backdrop dissolves over the (already running) desktop
+    if !ctx.locked {
+        if let Some(alpha) = ctx.fx.unlock_fade_alpha(now) {
+            let scale = output.current_scale().fractional_scale();
+            let mode_size = output
+                .current_mode()
+                .map(|m| output.current_transform().transform_size(m.size))
+                .unwrap_or_default();
+            let mut overlay = Vec::new();
+            lock_backdrop_elements(renderer, ctx.fx, mode_size, scale, alpha, &mut overlay);
+            let at = n_custom.min(out.len());
+            out.splice(at..at, overlay);
+        }
+    }
+    (out, clear)
+}
+
+fn output_elements_inner(
+    output: &Output,
+    space: &Space<WindowElement>,
+    ctx: &mut RenderCtx<'_>,
+    custom_elements: Vec<CustomRenderElements<GlesRenderer>>,
     renderer: &mut GlesRenderer,
     now: Duration,
 ) -> (Vec<OutputRenderElements>, Color32F) {
@@ -874,6 +941,12 @@ pub fn output_elements(
                 .map(OutputRenderElements::Layer),
             );
         }
+        // windows are never drawn while locked; the backdrop is wallpaper only
+        let mode_size = output
+            .current_mode()
+            .map(|m| output.current_transform().transform_size(m.size))
+            .unwrap_or_default();
+        lock_backdrop_elements(renderer, ctx.fx, mode_size, scale, 1.0, &mut out);
         return (out, Color32F::new(0.0, 0.0, 0.0, 1.0));
     }
 
