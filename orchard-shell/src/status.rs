@@ -151,7 +151,7 @@ pub enum Network {
     Offline,
 }
 
-fn is_virtual_iface(name: &str) -> bool {
+pub(crate) fn is_virtual_iface(name: &str) -> bool {
     name == "lo"
         || name.starts_with("virbr")
         || name.starts_with("docker")

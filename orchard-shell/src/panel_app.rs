@@ -48,6 +48,7 @@ impl App {
         let mut p = Panel::new(kind, anchor);
         if kind == Kind::Control {
             p.control = self.control_cache.clone();
+            p.network_hint = self.menubar.network;
             let settings = orchard_config::Settings::load();
             p.night_shift = settings.night_shift.active_now();
             p.stage_manager = settings.stage_manager.enabled;
@@ -55,6 +56,7 @@ impl App {
             p.game_active = self.game.clone();
             if let Some(sub) = submenu {
                 p.standalone = true;
+                p.auto_network_submenu = item == BarItem::Network;
                 p.open_submenu(sub);
             }
             self.refresh_control(None, None);
@@ -131,8 +133,19 @@ impl App {
     pub(crate) fn on_control_state(&mut self, st: ControlState) {
         tracing::debug!(?st, "control center state");
         self.control_cache = st.clone();
+        let mut bar_dirty = false;
         if st.volume.is_some() && self.menubar.volume != st.volume {
             self.menubar.volume = st.volume;
+            bar_dirty = true;
+        }
+        if self.menubar.cfg.show_network {
+            let net = crate::status::network();
+            if self.menubar.network != net {
+                self.menubar.network = net;
+                bar_dirty = true;
+            }
+        }
+        if bar_dirty {
             self.redraw(Which::Bar);
         }
         if let Some(p) = self.panel.as_mut() {
@@ -141,7 +154,19 @@ impl App {
             let displays = p.control.displays.clone();
             let streams = p.control.streams.clone();
             p.control = st;
+            p.network_hint = self.menubar.network;
             p.busy_item = None;
+            if p.auto_network_submenu {
+                p.auto_network_submenu = false;
+                let desired = if p.control.show_ethernet() {
+                    Submenu::Ethernet
+                } else {
+                    Submenu::Wifi
+                };
+                if p.submenu != Some(desired) {
+                    p.open_submenu(desired);
+                }
+            }
             match p.dragging {
                 Some(Target::Volume(..)) => p.control.volume = volume,
                 Some(Target::AppVolume(idx, ..)) => {
@@ -359,6 +384,7 @@ impl App {
                     Target::Card(hit) => self.click_notification(hit),
                     Target::OpenSubmenu(sub) => {
                         if let Some(p) = self.panel.as_mut() {
+                            p.auto_network_submenu = false;
                             p.open_submenu(sub);
                         }
                         self.redraw(Which::Panel);
@@ -392,6 +418,13 @@ impl App {
                             self.redraw(Which::Panel);
                             self.refresh_control(Some(Target::WifiConnect { ssid, known, secure }), None);
                         }
+                    }
+                    Target::EthToggleDevice { device, connected } => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.busy_item = Some(device.clone());
+                        }
+                        self.redraw(Which::Panel);
+                        self.refresh_control(Some(Target::EthToggleDevice { device, connected }), None);
                     }
                     Target::BtToggleDevice { mac, connected } => {
                         if let Some(p) = self.panel.as_mut() {
@@ -441,6 +474,18 @@ impl App {
                                 Target::WifiToggle => {
                                     if let Some(w) = p.control.wifi.as_mut() {
                                         w.0 = !w.0;
+                                    }
+                                }
+                                Target::EthernetToggle => {
+                                    let any_connected = p.control.ethernet.iter().any(|e| e.managed && e.connected);
+                                    if any_connected {
+                                        for e in &mut p.control.ethernet {
+                                            if e.managed && e.connected {
+                                                e.connected = false;
+                                            }
+                                        }
+                                    } else if let Some(e) = p.control.ethernet.iter_mut().find(|e| e.managed && e.plugged) {
+                                        e.connected = true;
                                     }
                                 }
                                 Target::BluetoothToggle => p.control.bluetooth = p.control.bluetooth.map(|b| !b),

@@ -2702,7 +2702,24 @@ impl App {
                     return self.toggle_panel(BarItem::Volume, panel::Kind::Control, Some(panel::Submenu::Sound))
                 }
                 Some(BarItem::Network) => {
-                    return self.toggle_panel(BarItem::Network, panel::Kind::Control, Some(panel::Submenu::Wifi))
+                    let sub = match self.menubar.network {
+                        status::Network::Wired => {
+                            if self.control_cache.wifi_connected() {
+                                panel::Submenu::Wifi
+                            } else {
+                                panel::Submenu::Ethernet
+                            }
+                        }
+                        status::Network::Wifi(_) => panel::Submenu::Wifi,
+                        status::Network::Offline => {
+                            if self.control_cache.show_ethernet() {
+                                panel::Submenu::Ethernet
+                            } else {
+                                panel::Submenu::Wifi
+                            }
+                        }
+                    };
+                    return self.toggle_panel(BarItem::Network, panel::Kind::Control, Some(sub));
                 }
                 Some(BarItem::Tray(idx)) => {
                     self.close_panel();

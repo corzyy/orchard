@@ -30,8 +30,24 @@ pub enum Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submenu {
     Wifi,
+    Ethernet,
     Bluetooth,
     Sound,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EthernetDevice {
+    /// Kernel interface name (e.g. "enp5s0")
+    pub device: String,
+    /// Active NetworkManager connection profile name, if connected
+    pub connection: Option<String>,
+    /// IPv4 address without CIDR prefix, if connected
+    pub ip: Option<String>,
+    pub connected: bool,
+    /// False when cable is unplugged (`unavailable`)
+    pub plugged: bool,
+    /// True when NetworkManager can connect/disconnect this interface
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -76,6 +92,7 @@ pub struct ControlState {
     /// Wi-Fi radio on, connected network
     pub wifi: Option<(bool, Option<String>)>,
     pub wifi_networks: Vec<WifiNetwork>,
+    pub ethernet: Vec<EthernetDevice>,
     pub bluetooth: Option<bool>,
     pub bt_devices: Vec<BtDevice>,
     /// 0..1, muted
@@ -86,6 +103,29 @@ pub struct ControlState {
     /// Controllable displays (built-in backlight + DDC/CI external monitors)
     pub displays: Vec<crate::ddc::DisplayBrightness>,
     pub media: Option<Media>,
+}
+
+impl ControlState {
+    pub fn wifi_connected(&self) -> bool {
+        self.wifi
+            .as_ref()
+            .and_then(|(on, ssid)| on.then_some(ssid.as_ref()).flatten())
+            .is_some()
+    }
+
+    pub fn ethernet_connected(&self) -> bool {
+        self.ethernet.iter().any(|e| e.connected)
+    }
+
+    /// True when Quick Settings should display Ethernet instead of Wi-Fi:
+    /// connected only via Ethernet, or Ethernet hardware is present without Wi-Fi.
+    pub fn show_ethernet(&self) -> bool {
+        if self.ethernet_connected() && !self.wifi_connected() {
+            true
+        } else {
+            self.wifi.is_none() && !self.ethernet.is_empty()
+        }
+    }
 }
 
 /// One app's playback streams (a browser's tabs share one row).
@@ -119,6 +159,7 @@ pub enum Target {
     StageManager,
     GameMode,
     WifiToggle,
+    EthernetToggle,
     BluetoothToggle,
     OpenSubmenu(Submenu),
     SubmenuBack,
@@ -128,6 +169,10 @@ pub enum Target {
         secure: bool,
     },
     WifiToggleOthers,
+    EthToggleDevice {
+        device: String,
+        connected: bool,
+    },
     BtToggleDevice {
         mac: String,
         connected: bool,
@@ -155,15 +200,19 @@ pub struct Panel {
     pub submenu: Option<Submenu>,
     /// True when opened directly from a menu bar icon (Sound / Network) rather than via Control Center.
     pub standalone: bool,
+    /// True while a standalone Network submenu should align itself to the first fresh `ControlState`.
+    pub auto_network_submenu: bool,
     pub submenu_since: Instant,
     pub wifi_others_open: bool,
-    /// SSID or MAC currently connecting / toggling
+    /// SSID, MAC, or Ethernet interface currently connecting / toggling
     pub busy_item: Option<String>,
     pub scroll: f32,
     pub hover: Option<(f32, f32)>,
     /// x of the right edge of the Control Center icon (Control Center anchors there)
     pub anchor_right: f32,
     pub control: ControlState,
+    /// Live menu-bar network state, used before the first async `query_control()` completes.
+    pub network_hint: Network,
     /// slider being dragged
     pub dragging: Option<Target>,
     /// Night Shift on right now (schedule or manual switch)
@@ -188,6 +237,7 @@ impl Panel {
             opened: now,
             submenu: None,
             standalone: false,
+            auto_network_submenu: false,
             submenu_since: now - SUBMENU_ANIM,
             wifi_others_open: true,
             busy_item: None,
@@ -195,6 +245,7 @@ impl Panel {
             hover: None,
             anchor_right,
             control: ControlState::default(),
+            network_hint: Network::Offline,
             dragging: None,
             night_shift: false,
             stage_manager: false,
@@ -485,7 +536,7 @@ impl Panel {
         fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, tint);
         stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, 1.0 * s, border);
 
-        // connectivity card: Wi-Fi + Bluetooth
+        // connectivity card: Wi-Fi / Ethernet (dynamic by active connection) + Bluetooth
         let y = y0 + pad;
         fill_rounded(pm, inner_x * s, y * s, half * s, 110.0 * s, 14.0 * s, card);
         stroke_rounded(pm, inner_x * s, y * s, half * s, 110.0 * s, 14.0 * s, 0.75 * s, card_border);
@@ -514,9 +565,33 @@ impl Panel {
             None => t("Unavailable", "Nicht verfügbar").to_string(),
         };
 
-        let rows = [
+        let show_eth = self.control.show_ethernet()
+            || (self.control.wifi.is_none()
+                && self.control.ethernet.is_empty()
+                && self.network_hint == Network::Wired);
+        let net_row = if show_eth {
+            let eth_connected = self.control.ethernet_connected()
+                || (self.control.ethernet.is_empty() && self.network_hint == Network::Wired);
+            let primary = self.control.ethernet.first();
+            let can_toggle = primary.is_some_and(|e| e.managed && e.plugged);
+            let status = if eth_connected {
+                t("Connected", "Verbunden").to_string()
+            } else if primary.is_some_and(|e| e.plugged) {
+                t("Disconnected", "Getrennt").to_string()
+            } else {
+                t("Unplugged", "Kein Kabel").to_string()
+            };
             (
-                Target::WifiToggle,
+                can_toggle.then_some(Target::EthernetToggle),
+                Submenu::Ethernet,
+                "Ethernet".to_string(),
+                status,
+                eth_connected,
+                true,
+            )
+        } else {
+            (
+                self.control.wifi.is_some().then_some(Target::WifiToggle),
                 Submenu::Wifi,
                 "Wi-Fi".to_string(),
                 if self.control.wifi.is_none() {
@@ -528,9 +603,13 @@ impl Panel {
                 },
                 wifi_on,
                 self.control.wifi.is_some(),
-            ),
+            )
+        };
+
+        let rows = [
+            net_row,
             (
-                Target::BluetoothToggle,
+                self.control.bluetooth.is_some().then_some(Target::BluetoothToggle),
                 Submenu::Bluetooth,
                 "Bluetooth".to_string(),
                 bt_status,
@@ -544,7 +623,8 @@ impl Panel {
             let row_rect = (inner_x + 4.0, ry, half - 8.0, 44.0);
             let circle_rect = (inner_x + 8.0, ry + 5.0, 32.0, 32.0);
             let open_rect = (inner_x + 40.0, ry, half - 42.0, 44.0);
-            let row_hovered = available && self.hovered(open_rect.0, open_rect.1, open_rect.2, open_rect.3);
+            let hover_rect = if toggle_target.is_some() { open_rect } else { row_rect };
+            let row_hovered = available && self.hovered(hover_rect.0, hover_rect.1, hover_rect.2, hover_rect.3);
             if row_hovered {
                 fill_rounded(pm, row_rect.0 * s, row_rect.1 * s, row_rect.2 * s, row_rect.3 * s, 10.0 * s, hover_bg);
             }
@@ -553,6 +633,7 @@ impl Panel {
             let glyph = if on { [255, 255, 255, 255] } else { text };
             match submenu {
                 Submenu::Wifi => crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.8, Network::Wifi(3), glyph),
+                Submenu::Ethernet => crate::menubar::draw_network(pm, cx * s, cy * s, s * 1.0, Network::Wired, glyph),
                 _ => bluetooth(pm, cx * s, cy * s, 7.0 * s, glyph),
             }
             let tx = inner_x + 46.0;
@@ -564,9 +645,13 @@ impl Panel {
             if available {
                 let chev_col = if row_hovered { text } else { sub };
                 chevron_right(pm, (inner_x + half - 11.0) * s, (ry + 22.0) * s, 4.0 * s, chev_col);
-                // Circle toggles directly; rest of row opens submenu (1:1 macOS)
-                self.targets.push((circle_rect, toggle_target));
-                self.targets.push((open_rect, Target::OpenSubmenu(submenu)));
+                // Circle toggles directly when toggleable; rest of row opens submenu (1:1 macOS)
+                if let Some(toggle) = toggle_target {
+                    self.targets.push((circle_rect, toggle));
+                    self.targets.push((open_rect, Target::OpenSubmenu(submenu)));
+                } else {
+                    self.targets.push((row_rect, Target::OpenSubmenu(submenu)));
+                }
             }
         }
 
@@ -785,6 +870,16 @@ impl Panel {
                     )
                 }
             }
+            Submenu::Ethernet => {
+                let eth_toggleable = self.control.ethernet.iter().any(|e| e.managed && e.plugged);
+                (
+                    "Ethernet",
+                    eth_toggleable.then(|| self.control.ethernet_connected()),
+                    eth_toggleable.then_some(Target::EthernetToggle),
+                    t("Network Settings…", "Netzwerkeinstellungen …"),
+                    "network",
+                )
+            }
             Submenu::Bluetooth => (
                 "Bluetooth",
                 Some(self.control.bluetooth == Some(true)),
@@ -811,30 +906,47 @@ impl Panel {
         let content_h = match submenu {
             Submenu::Wifi => {
                 let wifi_on = self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false);
-                if !wifi_on {
+                let show_eth_link = self.control.ethernet.iter().any(|e| e.connected || e.plugged);
+                if !wifi_on && !show_eth_link {
                     0.0
                 } else {
-                    let known_count = self.control.wifi_networks.iter().filter(|n| n.active || n.known).count();
-                    let other_count = self.control.wifi_networks.iter().filter(|n| !n.active && !n.known).count();
                     let mut ch = 4.0;
-                    if known_count > 0 {
-                        ch += 24.0 + known_count as f32 * 38.0 + 4.0;
-                        if other_count > 0 {
-                            ch += 9.0; // divider
+                    if wifi_on {
+                        let known_count = self.control.wifi_networks.iter().filter(|n| n.active || n.known).count();
+                        let other_count = self.control.wifi_networks.iter().filter(|n| !n.active && !n.known).count();
+                        if known_count > 0 {
+                            ch += 24.0 + known_count as f32 * 38.0 + 4.0;
+                            if other_count > 0 {
+                                ch += 9.0; // divider
+                            }
                         }
-                    }
-                    if other_count > 0 || known_count == 0 {
-                        ch += 26.0; // "Other Networks" header row
-                        if self.wifi_others_open {
-                            if other_count == 0 {
-                                ch += 34.0;
-                            } else {
-                                ch += other_count as f32 * 38.0;
+                        if other_count > 0 || known_count == 0 {
+                            ch += 26.0; // "Other Networks" header row
+                            if self.wifi_others_open {
+                                if other_count == 0 {
+                                    ch += 34.0;
+                                } else {
+                                    ch += other_count as f32 * 38.0;
+                                }
                             }
                         }
                     }
+                    if show_eth_link {
+                        if wifi_on {
+                            ch += 4.0 + 9.0; // padding + divider
+                        }
+                        ch += 24.0 + 38.0; // "Ethernet" header + summary row
+                    }
                     ch + 4.0
                 }
+            }
+            Submenu::Ethernet => {
+                let count = self.control.ethernet.len();
+                let mut ch = 4.0 + 24.0 + if count == 0 { 34.0 } else { count as f32 * 38.0 };
+                if self.control.wifi.is_some() {
+                    ch += 4.0 + 9.0 + 24.0 + 38.0; // pad + divider + "Wi-Fi" header + row
+                }
+                ch + 4.0
             }
             Submenu::Bluetooth => {
                 let bt_on = self.control.bluetooth == Some(true);
@@ -929,115 +1041,229 @@ impl Panel {
 
                 match submenu {
                     Submenu::Wifi => {
-                        let known: Vec<WifiNetwork> = self
-                            .control
-                            .wifi_networks
-                            .iter()
-                            .filter(|n| n.active || n.known)
-                            .cloned()
-                            .collect();
-                        let others: Vec<WifiNetwork> = self
-                            .control
-                            .wifi_networks
-                            .iter()
-                            .filter(|n| !n.active && !n.known)
-                            .cloned()
-                            .collect();
+                        let wifi_on = self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false);
+                        let show_eth_link = self.control.ethernet.iter().any(|e| e.connected || e.plugged);
+                        if wifi_on {
+                            let known: Vec<WifiNetwork> = self
+                                .control
+                                .wifi_networks
+                                .iter()
+                                .filter(|n| n.active || n.known)
+                                .cloned()
+                                .collect();
+                            let others: Vec<WifiNetwork> = self
+                                .control
+                                .wifi_networks
+                                .iter()
+                                .filter(|n| !n.active && !n.known)
+                                .cloned()
+                                .collect();
 
-                        if !known.is_empty() {
-                            let lbl = if known.len() == 1 {
-                                t("Known Network", "Bekanntes Netzwerk")
-                            } else {
-                                t("Known Networks", "Bekannte Netzwerke")
-                            };
-                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, lbl, fonts, sub_text);
+                            if !known.is_empty() {
+                                let lbl = if known.len() == 1 {
+                                    t("Known Network", "Bekanntes Netzwerk")
+                                } else {
+                                    t("Known Networks", "Bekannte Netzwerke")
+                                };
+                                draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, lbl, fonts, sub_text);
+                                ly += 24.0;
+                                for net in &known {
+                                    let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                    if is_hov(row.0, row.1, row.2, row.3) {
+                                        fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
+                                    }
+                                    draw_wifi_row(
+                                        &mut sub_pm,
+                                        s,
+                                        slide_x,
+                                        ly,
+                                        net,
+                                        self.busy_item.as_deref() == Some(net.ssid.as_str()),
+                                        fonts,
+                                        accent,
+                                        off,
+                                        text,
+                                        sub_text,
+                                        german,
+                                    );
+                                    local_targets.push((
+                                        row,
+                                        Target::WifiConnect {
+                                            ssid: net.ssid.clone(),
+                                            known: true,
+                                            secure: net.secure,
+                                        },
+                                    ));
+                                    ly += 38.0;
+                                }
+                                ly += 4.0;
+                                if !others.is_empty() {
+                                    draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                                    ly += 9.0;
+                                }
+                            }
+
+                            if !others.is_empty() || known.is_empty() {
+                                let hdr_rect = (6.0, ly, CC_WIDTH - 12.0, 26.0);
+                                if is_hov(hdr_rect.0, hdr_rect.1, hdr_rect.2, hdr_rect.3) {
+                                    fill_rounded(&mut sub_pm, hdr_rect.0 * s, hdr_rect.1 * s, hdr_rect.2 * s, hdr_rect.3 * s, 6.0 * s, hover_bg);
+                                }
+                                draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly + 1.0, t("Other Networks", "Andere Netzwerke"), fonts, sub_text);
+                                if self.wifi_others_open {
+                                    chevron_down(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
+                                } else {
+                                    chevron_right(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
+                                }
+                                local_targets.push((hdr_rect, Target::WifiToggleOthers));
+                                ly += 26.0;
+
+                                if self.wifi_others_open {
+                                    if others.is_empty() {
+                                        let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
+                                        fonts.draw(&mut sub_pm, t("No Networks Found", "Keine Netzwerke gefunden"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
+                                        ly += 34.0;
+                                    } else {
+                                        for net in &others {
+                                            let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                            if is_hov(row.0, row.1, row.2, row.3) {
+                                                fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
+                                            }
+                                            draw_wifi_row(
+                                                &mut sub_pm,
+                                                s,
+                                                slide_x,
+                                                ly,
+                                                net,
+                                                self.busy_item.as_deref() == Some(net.ssid.as_str()),
+                                                fonts,
+                                                accent,
+                                                off,
+                                                text,
+                                                sub_text,
+                                                german,
+                                            );
+                                            local_targets.push((
+                                                row,
+                                                Target::WifiConnect {
+                                                    ssid: net.ssid.clone(),
+                                                    known: false,
+                                                    secure: net.secure,
+                                                },
+                                            ));
+                                            ly += 38.0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if show_eth_link {
+                            if wifi_on {
+                                ly += 4.0;
+                                draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                                ly += 9.0;
+                            }
+                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, "Ethernet", fonts, sub_text);
                             ly += 24.0;
-                            for net in &known {
+                            if let Some(dev) = self.control.ethernet.first() {
                                 let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
                                 if is_hov(row.0, row.1, row.2, row.3) {
                                     fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                                 }
-                                draw_wifi_row(
+                                let status = if dev.connected {
+                                    dev.ip.as_deref().unwrap_or_else(|| t("Connected", "Verbunden"))
+                                } else {
+                                    t("Disconnected", "Getrennt")
+                                };
+                                let name = dev.connection.as_deref().unwrap_or(dev.device.as_str());
+                                draw_network_link_row(
                                     &mut sub_pm,
                                     s,
                                     slide_x,
                                     ly,
-                                    net,
-                                    self.busy_item.as_deref() == Some(net.ssid.as_str()),
+                                    Network::Wired,
+                                    dev.connected,
+                                    name,
+                                    status,
                                     fonts,
                                     accent,
                                     off,
                                     text,
                                     sub_text,
-                                    german,
                                 );
-                                local_targets.push((
-                                    row,
-                                    Target::WifiConnect {
-                                        ssid: net.ssid.clone(),
-                                        known: true,
-                                        secure: net.secure,
-                                    },
-                                ));
-                                ly += 38.0;
+                                local_targets.push((row, Target::OpenSubmenu(Submenu::Ethernet)));
                             }
-                            ly += 4.0;
-                            if !others.is_empty() {
-                                draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
-                                ly += 9.0;
+                        }
+                    }
+
+                    Submenu::Ethernet => {
+                        draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Connections", "Verbindungen"), fonts, sub_text);
+                        ly += 24.0;
+                        if self.control.ethernet.is_empty() {
+                            let msg = if self.network_hint == Network::Wired {
+                                t("Connected", "Verbunden")
+                            } else {
+                                t("No Ethernet Interfaces", "Keine Ethernet-Schnittstellen")
+                            };
+                            let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
+                            fonts.draw(&mut sub_pm, msg, (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
+                            ly += 34.0;
+                        } else {
+                            for dev in &self.control.ethernet {
+                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                let clickable = dev.managed && dev.plugged;
+                                if clickable && is_hov(row.0, row.1, row.2, row.3) {
+                                    fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
+                                }
+                                let busy = self.busy_item.as_deref() == Some(dev.device.as_str());
+                                draw_eth_row(&mut sub_pm, s, slide_x, ly, dev, busy, fonts, accent, off, text, sub_text, german);
+                                if clickable {
+                                    local_targets.push((
+                                        row,
+                                        Target::EthToggleDevice {
+                                            device: dev.device.clone(),
+                                            connected: dev.connected,
+                                        },
+                                    ));
+                                }
+                                ly += 38.0;
                             }
                         }
 
-                        if !others.is_empty() || known.is_empty() {
-                            let hdr_rect = (6.0, ly, CC_WIDTH - 12.0, 26.0);
-                            if is_hov(hdr_rect.0, hdr_rect.1, hdr_rect.2, hdr_rect.3) {
-                                fill_rounded(&mut sub_pm, hdr_rect.0 * s, hdr_rect.1 * s, hdr_rect.2 * s, hdr_rect.3 * s, 6.0 * s, hover_bg);
+                        if let Some((wifi_on, ref ssid)) = self.control.wifi {
+                            ly += 4.0;
+                            draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                            ly += 9.0;
+                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, "Wi-Fi", fonts, sub_text);
+                            ly += 24.0;
+                            let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                            let circle_rect = (12.0, ly + 5.0, 28.0, 28.0);
+                            let open_rect = (42.0, ly, CC_WIDTH - 48.0, 38.0);
+                            if is_hov(open_rect.0, open_rect.1, open_rect.2, open_rect.3) {
+                                fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                             }
-                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly + 1.0, t("Other Networks", "Andere Netzwerke"), fonts, sub_text);
-                            if self.wifi_others_open {
-                                chevron_down(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
+                            let status = if !wifi_on {
+                                t("Off", "Aus")
                             } else {
-                                chevron_right(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
-                            }
-                            local_targets.push((hdr_rect, Target::WifiToggleOthers));
-                            ly += 26.0;
-
-                            if self.wifi_others_open {
-                                if others.is_empty() {
-                                    let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
-                                    fonts.draw(&mut sub_pm, t("No Networks Found", "Keine Netzwerke gefunden"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
-                                } else {
-                                    for net in &others {
-                                        let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
-                                        if is_hov(row.0, row.1, row.2, row.3) {
-                                            fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
-                                        }
-                                        draw_wifi_row(
-                                            &mut sub_pm,
-                                            s,
-                                            slide_x,
-                                            ly,
-                                            net,
-                                            self.busy_item.as_deref() == Some(net.ssid.as_str()),
-                                            fonts,
-                                            accent,
-                                            off,
-                                            text,
-                                            sub_text,
-                                            german,
-                                        );
-                                        local_targets.push((
-                                            row,
-                                            Target::WifiConnect {
-                                                ssid: net.ssid.clone(),
-                                                known: false,
-                                                secure: net.secure,
-                                            },
-                                        ));
-                                        ly += 38.0;
-                                    }
-                                }
-                            }
+                                ssid.as_deref().unwrap_or_else(|| t("Not Connected", "Nicht verbunden"))
+                            };
+                            draw_network_link_row(
+                                &mut sub_pm,
+                                s,
+                                slide_x,
+                                ly,
+                                Network::Wifi(3),
+                                wifi_on,
+                                "Wi-Fi",
+                                status,
+                                fonts,
+                                accent,
+                                off,
+                                text,
+                                sub_text,
+                            );
+                            local_targets.push((circle_rect, Target::WifiToggle));
+                            local_targets.push((open_rect, Target::OpenSubmenu(Submenu::Wifi)));
                         }
                     }
 
@@ -1247,6 +1473,95 @@ fn draw_wifi_row(
     } else if net.secure {
         lock_glyph(pm, (CC_WIDTH - 22.0) * s, cy * s, 5.5 * s, sub_text);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_eth_row(
+    pm: &mut Pixmap,
+    s: f32,
+    slide_x: f32,
+    ly: f32,
+    dev: &EthernetDevice,
+    busy: bool,
+    fonts: &Fonts,
+    accent: Rgba,
+    off: Rgba,
+    text: Rgba,
+    sub_text: Rgba,
+    german: bool,
+) {
+    let (cx, cy) = (27.0 + slide_x, ly + 19.0);
+    fill_circle(pm, cx * s, cy * s, 13.0 * s, if dev.connected { accent } else { off });
+    let glyph_col = if dev.connected { [255, 255, 255, 255] } else { text };
+    crate::menubar::draw_network(pm, cx * s, cy * s, s * 0.9, Network::Wired, glyph_col);
+
+    let status: String = if busy {
+        if dev.connected {
+            if german { "Trennen…" } else { "Disconnecting…" }
+        } else if german {
+            "Verbinden…"
+        } else {
+            "Connecting…"
+        }
+        .into()
+    } else if dev.connected {
+        dev.ip
+            .clone()
+            .unwrap_or_else(|| if german { "Verbunden" } else { "Connected" }.into())
+    } else if dev.plugged {
+        if german { "Getrennt" } else { "Disconnected" }.into()
+    } else if german {
+        "Kein Kabel".into()
+    } else {
+        "Cable unplugged".into()
+    };
+
+    let sw = fonts.measure(&status, 11.0 * s, Weight::Regular) / s;
+    let right_reserve = sw + 22.0;
+    let maxw = (CC_WIDTH - 48.0 - right_reserve).max(40.0);
+    let name = dev.connection.as_deref().unwrap_or(dev.device.as_str());
+    let b = fonts.baseline_centered(ly * s, 38.0 * s, 13.0 * s, Weight::Regular);
+    let label = fonts.elide(name, 13.0 * s, Weight::Regular, maxw * s);
+    fonts.draw(pm, &label, (48.0 + slide_x) * s, b, 13.0 * s, Weight::Regular, text);
+
+    let sb = fonts.baseline_centered(ly * s, 38.0 * s, 11.0 * s, Weight::Regular);
+    fonts.draw(pm, &status, (CC_WIDTH - 14.0 - sw) * s, sb, 11.0 * s, Weight::Regular, sub_text);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_network_link_row(
+    pm: &mut Pixmap,
+    s: f32,
+    slide_x: f32,
+    ly: f32,
+    icon: Network,
+    active: bool,
+    title: &str,
+    status: &str,
+    fonts: &Fonts,
+    accent: Rgba,
+    off: Rgba,
+    text: Rgba,
+    sub_text: Rgba,
+) {
+    let (cx, cy) = (27.0 + slide_x, ly + 19.0);
+    fill_circle(pm, cx * s, cy * s, 13.0 * s, if active { accent } else { off });
+    let glyph_col = if active { [255, 255, 255, 255] } else { text };
+    match icon {
+        Network::Wired => crate::menubar::draw_network(pm, cx * s, cy * s, s * 0.9, Network::Wired, glyph_col),
+        _ => crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.72, Network::Wifi(3), glyph_col),
+    }
+
+    let sw = fonts.measure(status, 11.0 * s, Weight::Regular) / s;
+    let right_reserve = sw + 34.0;
+    let maxw = (CC_WIDTH - 48.0 - right_reserve).max(40.0);
+    let b = fonts.baseline_centered(ly * s, 38.0 * s, 13.0 * s, Weight::Regular);
+    let label = fonts.elide(title, 13.0 * s, Weight::Regular, maxw * s);
+    fonts.draw(pm, &label, (48.0 + slide_x) * s, b, 13.0 * s, Weight::Regular, text);
+
+    let sb = fonts.baseline_centered(ly * s, 38.0 * s, 11.0 * s, Weight::Regular);
+    fonts.draw(pm, status, (CC_WIDTH - 28.0 - sw) * s, sb, 11.0 * s, Weight::Regular, sub_text);
+    chevron_right(pm, (CC_WIDTH - 16.0) * s, cy * s, 4.0 * s, sub_text);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1905,10 +2220,126 @@ fn query_audio_sinks() -> Vec<AudioSink> {
     parse_audio_sinks(&json, &default_sink)
 }
 
+fn parse_nm_devices(out: &str) -> (bool, Option<String>, Vec<EthernetDevice>) {
+    let mut has_wifi = false;
+    let mut active_wifi_con = None;
+    let mut eths = Vec::new();
+    for f in out.lines().map(nm_fields) {
+        if f.len() < 3 {
+            continue;
+        }
+        let dev = &f[0];
+        let kind = f[1].as_str();
+        let state = f[2].as_str();
+        let con = f
+            .get(3)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && *s != "--");
+        let connected = state == "connected" || state.starts_with("connected ");
+        match kind {
+            "wifi" => {
+                has_wifi = true;
+                if connected && active_wifi_con.is_none() {
+                    active_wifi_con = con.map(str::to_string);
+                }
+            }
+            "ethernet" => {
+                if crate::status::is_virtual_iface(dev) {
+                    continue;
+                }
+                let external = state.contains("externally");
+                let unmanaged = state == "unmanaged";
+                let plugged = state != "unavailable";
+                let managed = !external && !unmanaged;
+                eths.push(EthernetDevice {
+                    device: dev.clone(),
+                    connection: if connected { con.map(str::to_string) } else { None },
+                    ip: None,
+                    connected,
+                    plugged,
+                    managed,
+                });
+            }
+            _ => {}
+        }
+    }
+    eths.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then(b.plugged.cmp(&a.plugged))
+            .then(a.device.cmp(&b.device))
+    });
+    (has_wifi, active_wifi_con, eths)
+}
+
+fn query_ethernet_sysfs() -> Vec<EthernetDevice> {
+    let Ok(rd) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut eths = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if crate::status::is_virtual_iface(&name) || e.path().join("wireless").exists() {
+            continue;
+        }
+        let state = std::fs::read_to_string(e.path().join("operstate")).unwrap_or_default();
+        let carrier = std::fs::read_to_string(e.path().join("carrier")).unwrap_or_default();
+        let connected = state.trim() == "up";
+        let plugged = connected || carrier.trim() == "1";
+        eths.push(EthernetDevice {
+            device: name,
+            connection: None,
+            ip: None,
+            connected,
+            plugged,
+            managed: false,
+        });
+    }
+    eths.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then(b.plugged.cmp(&a.plugged))
+            .then(a.device.cmp(&b.device))
+    });
+    eths
+}
+
 pub fn query_control() -> ControlState {
-    let has_wifi = cmd("nmcli", &["-t", "-f", "type", "dev"])
-        .map(|o| o.lines().any(|l| l == "wifi"))
-        .unwrap_or(false);
+    let (has_wifi, active_wifi_con, ethernet) =
+        if let Some(devs) = cmd("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev"]) {
+            let (hw, aw, mut eths) = parse_nm_devices(&devs);
+            for dev in &mut eths {
+                if !dev.managed && !dev.connected {
+                    let up = std::fs::read_to_string(format!("/sys/class/net/{}/operstate", dev.device))
+                        .map(|s| s.trim() == "up")
+                        .unwrap_or(false);
+                    if up {
+                        dev.connected = true;
+                        dev.plugged = true;
+                    }
+                }
+                if dev.connected {
+                    dev.ip = cmd("nmcli", &["-g", "IP4.ADDRESS", "dev", "show", &dev.device]).and_then(|s| {
+                        s.lines()
+                            .next()
+                            .and_then(|l| l.split('|').next())
+                            .and_then(|a| a.trim().split('/').next())
+                            .map(str::trim)
+                            .filter(|a| !a.is_empty())
+                            .map(str::to_string)
+                    });
+                }
+            }
+            eths.sort_by(|a, b| {
+                b.connected
+                    .cmp(&a.connected)
+                    .then(b.plugged.cmp(&a.plugged))
+                    .then(a.device.cmp(&b.device))
+            });
+            (hw, aw, eths)
+        } else {
+            (false, None, query_ethernet_sysfs())
+        };
     let wifi_on = if has_wifi {
         cmd("nmcli", &["-t", "radio", "wifi"]).map(|r| r.trim() == "enabled")
     } else {
@@ -1921,7 +2352,11 @@ pub fn query_control() -> ControlState {
     };
     let wifi = wifi_on.map(|on| {
         let ssid = if on {
-            wifi_networks.iter().find(|n| n.active).map(|n| n.ssid.clone())
+            wifi_networks
+                .iter()
+                .find(|n| n.active)
+                .map(|n| n.ssid.clone())
+                .or(active_wifi_con)
         } else {
             None
         };
@@ -1962,6 +2397,7 @@ pub fn query_control() -> ControlState {
     ControlState {
         wifi,
         wifi_networks,
+        ethernet,
         bluetooth,
         bt_devices,
         volume,
@@ -2024,6 +2460,25 @@ pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) 
         Target::WifiToggle => {
             let on = current.wifi.as_ref().map(|w| w.0).unwrap_or(false);
             cmd("nmcli", &["radio", "wifi", if on { "off" } else { "on" }]);
+        }
+        Target::EthernetToggle => {
+            let connected: Vec<&str> = current
+                .ethernet
+                .iter()
+                .filter(|e| e.managed && e.connected)
+                .map(|e| e.device.as_str())
+                .collect();
+            if !connected.is_empty() {
+                for dev in connected {
+                    cmd("nmcli", &["dev", "disconnect", dev]);
+                }
+            } else if let Some(dev) = current.ethernet.iter().find(|e| e.managed && e.plugged) {
+                cmd("nmcli", &["dev", "connect", &dev.device]);
+            }
+        }
+        Target::EthToggleDevice { device, connected } => {
+            let verb = if *connected { "disconnect" } else { "connect" };
+            cmd("nmcli", &["dev", verb, device]);
         }
         Target::WifiConnect { ssid, known, .. } => {
             if *known {
@@ -2190,4 +2645,155 @@ mod tests {
         assert!(!sinks[2].active);
         assert_eq!(sinks[2].icon, AudioIcon::Display);
     }
+
+    #[test]
+    fn parses_nm_devices_and_filters_virtual() {
+        let out = "\
+lo:loopback:connected (externally):lo
+veth1234:ethernet:unmanaged:
+docker0:bridge:connected (externally):docker0
+enp5s0:ethernet:unavailable:
+enp6s0:ethernet:disconnected:
+enp4s0:ethernet:connected:Wired\\:1
+enp7s0:ethernet:connected (externally):enp7s0
+wlan0:wifi:connected:OfficeWiFi
+";
+        let (has_wifi, active_wifi, eths) = parse_nm_devices(out);
+        assert!(has_wifi);
+        assert_eq!(active_wifi.as_deref(), Some("OfficeWiFi"));
+        assert_eq!(eths.len(), 4);
+        // Connected interfaces come first, then plugged disconnected, then unplugged
+        assert_eq!(eths[0].device, "enp4s0");
+        assert!(eths[0].connected);
+        assert!(eths[0].managed);
+        assert_eq!(eths[0].connection.as_deref(), Some("Wired:1"));
+        assert_eq!(eths[1].device, "enp7s0");
+        assert!(eths[1].connected);
+        assert!(!eths[1].managed);
+        assert_eq!(eths[2].device, "enp6s0");
+        assert!(!eths[2].connected);
+        assert!(eths[2].plugged);
+        assert!(eths[2].managed);
+        assert_eq!(eths[3].device, "enp5s0");
+        assert!(!eths[3].connected);
+        assert!(!eths[3].plugged);
+    }
+
+    #[test]
+    fn show_ethernet_picks_active_connection() {
+        let eth = |connected: bool, plugged: bool| EthernetDevice {
+            device: "enp5s0".into(),
+            connection: connected.then(|| "Wired connection 1".into()),
+            ip: connected.then(|| "192.168.1.10".into()),
+            connected,
+            plugged,
+            managed: true,
+        };
+
+        // Only Ethernet connected (Wi-Fi off) -> Ethernet
+        let st = ControlState {
+            wifi: Some((false, None)),
+            ethernet: vec![eth(true, true)],
+            ..Default::default()
+        };
+        assert!(st.show_ethernet());
+
+        // Only Ethernet connected (Wi-Fi on, not connected) -> Ethernet
+        let st = ControlState {
+            wifi: Some((true, None)),
+            ethernet: vec![eth(true, true)],
+            ..Default::default()
+        };
+        assert!(st.show_ethernet());
+
+        // Only Ethernet connected (no Wi-Fi hardware) -> Ethernet
+        let st = ControlState {
+            wifi: None,
+            ethernet: vec![eth(true, true)],
+            ..Default::default()
+        };
+        assert!(st.show_ethernet());
+
+        // Only Wi-Fi connected -> Wi-Fi
+        let st = ControlState {
+            wifi: Some((true, Some("HomeNet".into()))),
+            ethernet: vec![eth(false, false)],
+            ..Default::default()
+        };
+        assert!(!st.show_ethernet());
+
+        // Both Wi-Fi and Ethernet connected -> Wi-Fi (not exclusively Ethernet)
+        let st = ControlState {
+            wifi: Some((true, Some("HomeNet".into()))),
+            ethernet: vec![eth(true, true)],
+            ..Default::default()
+        };
+        assert!(!st.show_ethernet());
+
+        // Neither connected, Wi-Fi hardware present -> Wi-Fi
+        let st = ControlState {
+            wifi: Some((true, None)),
+            ethernet: vec![eth(false, true)],
+            ..Default::default()
+        };
+        assert!(!st.show_ethernet());
+
+        // Neither connected, no Wi-Fi hardware, Ethernet present -> Ethernet
+        let st = ControlState {
+            wifi: None,
+            ethernet: vec![eth(false, false)],
+            ..Default::default()
+        };
+        assert!(st.show_ethernet());
+
+        // Neither present -> fallback (false)
+        assert!(!ControlState::default().show_ethernet());
+    }
+
+    #[test]
+    fn quicksettings_switches_targets_between_wifi_and_ethernet() {
+        let fonts = Fonts::load();
+        let theme = Theme::new(crate::theme::Appearance::Dark);
+        let center = Center::default();
+        let apps = Apps::load(None);
+        let mut pm = Pixmap::new(640, 800).unwrap();
+
+        let mut panel = Panel::new(Kind::Control, 620.0);
+        panel.opened = Instant::now() - Duration::from_secs(1);
+        // Connected only via Ethernet -> main view exposes Ethernet toggle & submenu
+        panel.control = ControlState {
+            wifi: Some((false, None)),
+            ethernet: vec![EthernetDevice {
+                device: "enp5s0".into(),
+                connection: Some("Wired connection 1".into()),
+                ip: Some("10.0.0.5".into()),
+                connected: true,
+                plugged: true,
+                managed: true,
+            }],
+            ..Default::default()
+        };
+        panel.paint(&mut pm, 1.0, 640.0, 800.0, &center, &apps, &fonts, &theme, false);
+        assert!(panel.targets.iter().any(|(_, t)| *t == Target::EthernetToggle));
+        assert!(panel.targets.iter().any(|(_, t)| *t == Target::OpenSubmenu(Submenu::Ethernet)));
+        assert!(!panel.targets.iter().any(|(_, t)| *t == Target::WifiToggle));
+
+        // Open Ethernet submenu -> exposes EthToggleDevice + quick-access Wi-Fi link
+        panel.open_submenu(Submenu::Ethernet);
+        panel.paint(&mut pm, 1.0, 640.0, 800.0, &center, &apps, &fonts, &theme, false);
+        assert!(panel.targets.iter().any(|(_, t)| {
+            matches!(t, Target::EthToggleDevice { device, connected: true } if device == "enp5s0")
+        }));
+        assert!(panel.targets.iter().any(|(_, t)| *t == Target::OpenSubmenu(Submenu::Wifi)));
+
+        // Switch to Wi-Fi connected -> main view switches back to Wi-Fi
+        panel.close_submenu();
+        panel.control.wifi = Some((true, Some("HomeNet".into())));
+        panel.control.ethernet[0].connected = false;
+        panel.paint(&mut pm, 1.0, 640.0, 800.0, &center, &apps, &fonts, &theme, false);
+        assert!(panel.targets.iter().any(|(_, t)| *t == Target::WifiToggle));
+        assert!(panel.targets.iter().any(|(_, t)| *t == Target::OpenSubmenu(Submenu::Wifi)));
+        assert!(!panel.targets.iter().any(|(_, t)| *t == Target::EthernetToggle));
+    }
 }
+
