@@ -95,15 +95,20 @@ impl App {
         // Fast path for volume/brightness sliders & mute: apply without spawning the
         // full 15-subprocess `query_control()` on every drag tick.
         if let Some(ref t) = target {
-            if matches!(t, Target::Volume(..) | Target::Brightness(..) | Target::VolumeMute) {
+            if matches!(
+                t,
+                Target::Volume(..) | Target::Brightness(..) | Target::VolumeMute | Target::AppVolume(..) | Target::AppMute(_)
+            ) {
                 let t = t.clone();
                 if let Some(p) = self.panel.as_ref() {
                     self.control_cache.volume = p.control.volume;
                     self.control_cache.displays = p.control.displays.clone();
+                    self.control_cache.streams = p.control.streams.clone();
                 }
                 let displays = self.control_cache.displays.clone();
+                let streams = self.control_cache.streams.clone();
                 let _ = std::thread::Builder::new().name("control-slider".into()).spawn(move || {
-                    panel::run_control_slider(&t, value, &displays);
+                    panel::run_control_slider(&t, value, &displays, &streams);
                 });
                 return;
             }
@@ -130,10 +135,19 @@ impl App {
             // keep the slider where the user holds it
             let volume = p.control.volume;
             let displays = p.control.displays.clone();
+            let streams = p.control.streams.clone();
             p.control = st;
             p.busy_item = None;
             match p.dragging {
                 Some(Target::Volume(..)) => p.control.volume = volume,
+                Some(Target::AppVolume(idx, ..)) => {
+                    if let (Some(old), Some(cur)) = (streams.get(idx), p.control.streams.get_mut(idx)) {
+                        if old.name == cur.name {
+                            cur.volume = old.volume;
+                            cur.muted = old.muted;
+                        }
+                    }
+                }
                 Some(Target::Brightness(idx, ..)) => {
                     if let (Some(old), Some(cur)) = (displays.get(idx), p.control.displays.get_mut(idx)) {
                         cur.value = old.value;
@@ -191,6 +205,12 @@ impl App {
                 Target::Brightness(idx, ..) => {
                     if let Some(d) = p.control.displays.get_mut(*idx) {
                         d.value = v;
+                    }
+                }
+                Target::AppVolume(idx, ..) => {
+                    if let Some(a) = p.control.streams.get_mut(*idx) {
+                        a.volume = v;
+                        a.muted = false;
                     }
                 }
                 _ => {}
@@ -333,7 +353,14 @@ impl App {
                         self.redraw(Which::Panel);
                         self.refresh_control(Some(Target::VolumeMute), None);
                     }
-                    Target::Volume(..) | Target::Brightness(..) => {
+                    Target::AppMute(idx) => {
+                        if let Some(a) = self.panel.as_mut().and_then(|p| p.control.streams.get_mut(idx)) {
+                            a.muted = !a.muted;
+                        }
+                        self.redraw(Which::Panel);
+                        self.refresh_control(Some(Target::AppMute(idx)), None);
+                    }
+                    Target::Volume(..) | Target::Brightness(..) | Target::AppVolume(..) => {
                         if let Some(p) = self.panel.as_mut() {
                             p.dragging = Some(target.clone());
                         }

@@ -81,9 +81,25 @@ pub struct ControlState {
     /// 0..1, muted
     pub volume: Option<(f32, bool)>,
     pub audio_sinks: Vec<AudioSink>,
+    /// apps playing sound (per-app volume)
+    pub streams: Vec<AppStream>,
     /// Controllable displays (built-in backlight + DDC/CI external monitors)
     pub displays: Vec<crate::ddc::DisplayBrightness>,
     pub media: Option<Media>,
+}
+
+/// One app's playback streams (a browser's tabs share one row).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AppStream {
+    pub name: String,
+    /// icon name or binary, for the app's icon
+    pub icon: String,
+    /// pactl sink-input indices
+    pub indices: Vec<u32>,
+    /// 0..1+ (loudest stream)
+    pub volume: f32,
+    /// every stream muted
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -121,6 +137,9 @@ pub enum Target {
     VolumeMute,
     /// `(display_index, min_x, max_x)`
     Brightness(usize, f32, f32),
+    /// per-app volume: `(stream_index, min_x, max_x)`
+    AppVolume(usize, f32, f32),
+    AppMute(usize),
     MediaPrev,
     MediaPlay,
     MediaNext,
@@ -239,7 +258,9 @@ impl Panel {
     /// Slider value for pointer x.
     pub fn slider_value(target: &Target, x: f32) -> Option<f32> {
         match target {
-            Target::Volume(a, b) | Target::Brightness(_, a, b) => Some(((x - a) / (b - a)).clamp(0.0, 1.0)),
+            Target::Volume(a, b) | Target::Brightness(_, a, b) | Target::AppVolume(_, a, b) => {
+                Some(((x - a) / (b - a)).clamp(0.0, 1.0))
+            }
             _ => None,
         }
     }
@@ -267,7 +288,7 @@ impl Panel {
             Kind::Notifications => self.paint_nc(pm, s, w, h, center, apps, fonts, theme, german),
             Kind::Control => match self.submenu {
                 None => self.paint_cc(pm, s, w, center, fonts, theme, german),
-                Some(sub) => self.paint_cc_submenu(pm, s, w, h, sub, fonts, theme, german),
+                Some(sub) => self.paint_cc_submenu(pm, s, w, h, sub, apps, fonts, theme, german),
             },
         }
     }
@@ -663,6 +684,7 @@ impl Panel {
         w: f32,
         h: f32,
         submenu: Submenu,
+        apps: &Apps,
         fonts: &Fonts,
         theme: &Theme,
         german: bool,
@@ -765,7 +787,12 @@ impl Panel {
             }
             Submenu::Sound => {
                 let count = self.control.audio_sinks.len();
-                4.0 + 24.0 + if count == 0 { 34.0 } else { count as f32 * 38.0 } + 4.0
+                let apps_h = if self.control.streams.is_empty() {
+                    0.0
+                } else {
+                    9.0 + 24.0 + self.control.streams.len() as f32 * APP_ROW_H
+                };
+                4.0 + 24.0 + if count == 0 { 34.0 } else { count as f32 * 38.0 } + apps_h + 4.0
             }
         };
 
@@ -997,6 +1024,36 @@ impl Panel {
                                 ly += 38.0;
                             }
                         }
+                        // per-app volume
+                        if !self.control.streams.is_empty() {
+                            draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                            ly += 9.0;
+                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Apps", "Apps"), fonts, sub_text);
+                            ly += 24.0;
+                            for (i, st) in self.control.streams.iter().enumerate() {
+                                let icon_px = (16.0 * s).round().max(1.0) as u32;
+                                let name_x = if let Some(icon) = apps.icon(&st.icon, icon_px) {
+                                    pm_draw_icon(&mut sub_pm, &icon, (14.0 + slide_x) * s, (ly + 3.0) * s, 16.0 * s);
+                                    36.0
+                                } else {
+                                    14.0
+                                };
+                                let b = fonts.baseline_centered((ly + 2.0) * s, 18.0 * s, 12.0 * s, Weight::Regular);
+                                let label = fonts.elide(&st.name, 12.0 * s, Weight::Regular, (CC_WIDTH - name_x - 18.0) * s);
+                                fonts.draw(&mut sub_pm, &label, (name_x + slide_x) * s, b, 12.0 * s, Weight::Regular, text);
+                                let (tx, ty, tw, th) = (14.0 + slide_x, ly + 22.0, CC_WIDTH - 28.0, 20.0);
+                                let shown = if st.muted { 0.0 } else { st.volume.min(1.0) };
+                                draw_pill_slider(&mut sub_pm, s, tx, ty, tw, th, shown, 1, st.muted, off);
+                                // the speaker mutes; the rest of the track sets the level.
+                                // local targets get x0 added, slider ranges are absolute.
+                                local_targets.push(((tx - 2.0, ty - 3.0, 24.0, th + 6.0), Target::AppMute(i)));
+                                local_targets.push((
+                                    (tx + 22.0, ty - 3.0, tw - 18.0, th + 6.0),
+                                    Target::AppVolume(i, x0 + tx + th / 2.0, x0 + tx + tw - th / 2.0),
+                                ));
+                                ly += APP_ROW_H;
+                            }
+                        }
                     }
                 }
 
@@ -1032,6 +1089,22 @@ impl Panel {
         fonts.draw(pm, settings_label, (x0 + 16.0) * s, fb, 12.5 * s, Weight::Regular, text);
         self.targets.push((foot_rect, Target::OpenSettings(settings_page)));
     }
+}
+
+/// Height of one per-app volume row (name + slider).
+const APP_ROW_H: f32 = 48.0;
+
+/// Draw an icon pixmap scaled into a `size` square at (x, y) (device px).
+fn pm_draw_icon(pm: &mut Pixmap, icon: &Pixmap, x: f32, y: f32, size: f32) {
+    let k = size / icon.width().max(1) as f32;
+    pm.draw_pixmap(
+        0,
+        0,
+        icon.as_ref(),
+        &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() },
+        Transform::from_row(k, 0.0, 0.0, k, x, y),
+        None,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1673,6 +1746,59 @@ fn query_bt_devices() -> Vec<BtDevice> {
     devices
 }
 
+/// `pactl -f json list sink-inputs` → one entry per app (sorted by name, so
+/// rows keep their place while the list refreshes). System sounds are left out.
+fn parse_sink_inputs(json: &str) -> Vec<AppStream> {
+    let Ok(serde_json::Value::Array(list)) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let mut apps: Vec<AppStream> = Vec::new();
+    for si in &list {
+        let Some(index) = si["index"].as_u64() else { continue };
+        let props = &si["properties"];
+        let prop = |k: &str| props[k].as_str().filter(|v| !v.is_empty());
+        // event sounds and level meters (pavucontrol peak detection)
+        if prop("media.role") == Some("event") || props["stream.monitor"].as_str() == Some("true") {
+            continue;
+        }
+        let name = prop("application.name")
+            .or(prop("application.process.binary"))
+            .or(prop("node.name"))
+            .unwrap_or("Unknown")
+            .to_string();
+        let icon = prop("application.icon_name")
+            .or(prop("application.id"))
+            .or(prop("application.process.binary"))
+            .unwrap_or_default()
+            .to_lowercase();
+        let volume = si["volume"]
+            .as_object()
+            .map(|chans| {
+                chans
+                    .values()
+                    .filter_map(|c| c["value"].as_f64())
+                    .fold(0.0f64, f64::max)
+                    / 65536.0
+            })
+            .unwrap_or(0.0) as f32;
+        let muted = si["mute"].as_bool().unwrap_or(false);
+        match apps.iter_mut().find(|a| a.name == name) {
+            Some(a) => {
+                a.indices.push(index as u32);
+                a.volume = a.volume.max(volume);
+                a.muted &= muted;
+            }
+            None => apps.push(AppStream { name, icon, indices: vec![index as u32], volume, muted }),
+        }
+    }
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps
+}
+
+pub fn query_streams() -> Vec<AppStream> {
+    parse_sink_inputs(&cmd_localized("pactl", &["-f", "json", "list", "sink-inputs"]).unwrap_or_default())
+}
+
 fn query_audio_sinks() -> Vec<AudioSink> {
     let json = cmd_localized("pactl", &["-f", "json", "list", "sinks"]).unwrap_or_default();
     let default_sink = cmd("pactl", &["get-default-sink"]).unwrap_or_default().trim().to_string();
@@ -1719,6 +1845,7 @@ pub fn query_control() -> ControlState {
 
     let volume = cmd("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).and_then(|o| crate::osd::parse_wpctl(&o));
     let audio_sinks = query_audio_sinks();
+    let streams = query_streams();
 
     let displays = crate::ddc::query_displays();
 
@@ -1739,6 +1866,7 @@ pub fn query_control() -> ControlState {
         bt_devices,
         volume,
         audio_sinks,
+        streams,
         displays,
         media,
     }
@@ -1746,8 +1874,32 @@ pub fn query_control() -> ControlState {
 
 /// Fast path for sliders & mute: only applies the system change without running
 /// the 15-subprocess full `query_control()`.
-pub fn run_control_slider(target: &Target, value: Option<f32>, displays: &[crate::ddc::DisplayBrightness]) {
+pub fn run_control_slider(
+    target: &Target,
+    value: Option<f32>,
+    displays: &[crate::ddc::DisplayBrightness],
+    streams: &[AppStream],
+) {
     match target {
+        Target::AppVolume(idx, ..) => {
+            if let (Some(v), Some(app)) = (value, streams.get(*idx)) {
+                let pct = format!("{}%", (v * 100.0).round() as u32);
+                for i in &app.indices {
+                    let i = i.to_string();
+                    let _ = cmd("pactl", &["set-sink-input-mute", &i, "0"]);
+                    let _ = cmd("pactl", &["set-sink-input-volume", &i, &pct]);
+                }
+            }
+        }
+        Target::AppMute(idx) => {
+            if let Some(app) = streams.get(*idx) {
+                // all streams of the app follow the row's new state
+                let mute = if app.muted { "1" } else { "0" };
+                for i in &app.indices {
+                    let _ = cmd("pactl", &["set-sink-input-mute", &i.to_string(), mute]);
+                }
+            }
+        }
         Target::Volume(..) => {
             if let Some(v) = value {
                 let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
@@ -1865,6 +2017,59 @@ mod tests {
         assert_eq!(devs.len(), 2);
         assert_eq!(devs[0], ("AA:BB:CC:DD:EE:FF".into(), "AirPods Pro".into()));
         assert_eq!(devs[1], ("11:22:33:44:55:66".into(), "Magic Mouse".into()));
+    }
+
+    /// Real PipeWire round trip with a silent stream (zeros):
+    /// `cargo test -p orchard-shell app_volume_round_trip -- --ignored`
+    #[test]
+    #[ignore]
+    fn app_volume_round_trip() {
+        let mut child = std::process::Command::new("paplay")
+            .args(["--raw", "--volume=0", "--client-name=Orchard Volume Test", "/dev/zero"])
+            .spawn()
+            .expect("paplay");
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let find = || query_streams().into_iter().position(|a| a.name == "Orchard Volume Test");
+        let streams = query_streams();
+        let idx = find().expect("test stream listed");
+        run_control_slider(&Target::AppVolume(idx, 0.0, 1.0), Some(0.37), &[], &streams);
+        let now = query_streams();
+        let app = &now[find().unwrap()];
+        assert!((app.volume - 0.37).abs() < 0.01, "{}", app.volume);
+        assert!(!app.muted);
+        // the row's new state is what gets applied
+        let mut muted = now.clone();
+        muted[idx].muted = true;
+        run_control_slider(&Target::AppMute(idx), None, &[], &muted);
+        assert!(query_streams()[find().unwrap()].muted);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn parses_sink_inputs_per_app() {
+        // shape of real `pactl -f json list sink-inputs` output
+        let json = r#"[
+          {"index":170,"mute":false,"volume":{"front-left":{"value":32768,"value_percent":"50%"},"front-right":{"value":39321,"value_percent":"60%"}},
+           "properties":{"application.name":"Firefox","application.icon_name":"firefox","media.name":"Tab 1"}},
+          {"index":171,"mute":true,"volume":{"mono":{"value":65536,"value_percent":"100%"}},
+           "properties":{"application.name":"Firefox","media.name":"Tab 2"}},
+          {"index":172,"mute":true,"volume":{"mono":{"value":65536}},
+           "properties":{"application.process.binary":"mpv"}},
+          {"index":173,"mute":false,"volume":{"mono":{"value":65536}},
+           "properties":{"application.name":"Bell","media.role":"event"}}
+        ]"#;
+        let apps = parse_sink_inputs(json);
+        assert_eq!(apps.len(), 2, "event sounds are left out");
+        assert_eq!(apps[0].name, "Firefox");
+        assert_eq!(apps[0].indices, [170, 171]);
+        assert!((apps[0].volume - 1.0).abs() < 1e-3, "loudest stream wins");
+        assert!(!apps[0].muted, "one stream still audible");
+        assert_eq!(apps[0].icon, "firefox");
+        assert_eq!(apps[1].name, "mpv");
+        assert!(apps[1].muted);
+        assert!(parse_sink_inputs("[]").is_empty());
+        assert!(parse_sink_inputs("garbage").is_empty());
     }
 
     #[test]

@@ -34,6 +34,8 @@ dist/           login session files + installer
   - Arrow keys select a window, Return or Space opens it. ⌃⌘←/→ and ⌃⌘1…9 switch Spaces without leaving Mission Control.
 - **Global app menus**: KDE/Qt apps (KWrite, Kate, Dolphin, Konsole …) show their own menus in the menu bar after the app name, with shortcuts, checkmarks and submenus. Their in-window menu bar disappears.
   - Wayland apps announce their menu through `org_kde_kwin_appmenu`. X11 apps register with `com.canonical.AppMenu.Registrar`, which the shell provides.
+  - GTK 3/4 apps with a GtkApplication menu bar announce it through `gtk_shell1`; Orchard reads it with `org.gtk.Menus` and runs items with `org.gtk.Actions`. Their in-window menu bar disappears.
+  - Electron apps (VS Code/VSCodium, …) running natively on Wayland register their menu with the Registrar for their process; Orchard matches it to the app's window, including Flatpak apps (whose D-Bus traffic comes through the sandbox's proxy). VS Code needs `"window.titleBarStyle": "native"` to use its native menu.
   - Menus are read with `com.canonical.dbusmenu`. Apps without an exported menu keep the Window and Help menus.
 - **Menu bar**:
   - Left: leaf menu (Sleep, Restart, Lock and so on), the bold name of the active app, and Window and Help menus.
@@ -58,6 +60,7 @@ dist/           login session files + installer
 - **Control Center** (the switches icon left of the clock):
   - Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`), Do Not Disturb and Night Shift toggles.
   - Display brightness (laptops) and volume sliders, and Now Playing with previous / play-pause / next (`playerctl`).
+  - Sound (click its header): output devices, and a volume slider per app that is playing sound. Several streams of one app (browser tabs) share a row; the speaker mutes the app.
   - Click outside or press Esc to close.
 - **Lock screen** (`orchard-lock`; ⌃⌘Q, Apple menu → Lock Screen, hot corners, idle lock):
   - macOS style: date and a large clock at the top, your account picture (`~/.face`, else a silhouette), name and the password field at the bottom, over the blurred wallpaper. Sleep, Restart and Shut Down buttons sit below.
@@ -178,8 +181,7 @@ Apps started from the Dock or the launcher are spawned by the compositor, so the
 
 ## Not done yet
 - Multi-GPU uses the primary GPU only.
-- Global menus cover Qt/KDE apps (and X11 apps using the registrar). GTK and Electron apps keep their in-window menus.
-- Blur works only behind Orchard's own panels; apps can't request it yet (KDE blur protocol).
+- GTK apps that build a plain GtkMenuBar widget (instead of a GtkApplication menu bar) keep their in-window menus, unless `appmenu-gtk-module` exports them.
 - Swipes switch once a threshold is reached; they don't follow your fingers (no trackpad in use, so not planned).
 - KDE apps that apply a colour scheme themselves still read it from kdeglobals.
 
