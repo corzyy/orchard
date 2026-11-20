@@ -12,7 +12,7 @@ mod ui;
 
 use std::time::{Duration, Instant};
 
-use orchard_config::Settings;
+use orchard_config::{Settings, ThemeMode};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
@@ -53,30 +53,36 @@ use crate::{
     icons::Icons,
     pages::{Page, PageState, ALL_PAGES, SIDEBAR},
     sys::Wake,
-    theme::{resolve_dark, skia_color, Fonts, Palette, Weight},
+    theme::{mix, resolve_dark, skia_color, with_alpha, Fonts, Palette, Weight},
     ui::{hash_id, Rect, TextEvent, Ui, UiState},
 };
 
-const INIT_W: u32 = 860;
-const INIT_H: u32 = 640;
-const MIN_W: u32 = 700;
-const MIN_H: u32 = 460;
-const SIDEBAR_W: f32 = 216.0;
-const TOOLBAR_H: f32 = 46.0;
+const INIT_W: u32 = 880;
+const INIT_H: u32 = 660;
+const MIN_W: u32 = 720;
+const MIN_H: u32 = 500;
+const SIDEBAR_W: f32 = 220.0;
+const TOOLBAR_H: f32 = 52.0;
+const ROW_H: f32 = 28.0;
+/// Upper bound between frames while waiting for a frame callback, so a
+/// compositor that withholds callbacks can't stall the UI.
+const FRAME_FALLBACK: Duration = Duration::from_millis(50);
 
 struct App {
     loop_handle: LoopHandle<'static, App>,
+    qh: QueueHandle<App>,
     registry: RegistryState,
     output: OutputState,
     shm: Shm,
     seat: SeatState,
     window: Window,
     pool: SlotPool,
+    pixmap: Option<Pixmap>,
 
     fonts: Fonts,
     icons: Icons,
     pal: Palette,
-    styled_key: (bool, [u8; 3]),
+    styled_key: (ThemeMode, [u8; 3]),
 
     settings: Settings,
     saved: Settings,
@@ -84,7 +90,10 @@ struct App {
     compositor_live: Option<bool>,
 
     page: Page,
+    back: Vec<Page>,
+    forward: Vec<Page>,
     search: String,
+    user: (String, String),
     page_state: PageState,
     ui_state: UiState,
     wake: Wake,
@@ -95,17 +104,58 @@ struct App {
     configured: bool,
     exit: bool,
     mods: Modifiers,
+
+    frame_pending: bool,
+    dirty: bool,
+    redraw_timer: Option<RegistrationToken>,
     last_frame: Instant,
+}
+
+/// Navigation requested while drawing a frame.
+#[derive(Clone, Copy)]
+enum Nav {
+    Go(Page),
+    Back,
+    Forward,
 }
 
 impl App {
     fn update_theme(&mut self) {
-        let dark = resolve_dark(self.settings.appearance.mode);
-        let accent = self.settings.appearance.accent.rgb();
-        if self.styled_key != (dark, accent) {
-            self.pal = Palette::new(dark, accent);
-            self.styled_key = (dark, accent);
+        // Keyed on the *mode*, not the resolved value: resolving `Auto` spawns
+        // gsettings, which must not happen on every frame.
+        let key = (self.settings.appearance.mode, self.settings.appearance.accent.rgb());
+        if self.styled_key != key {
+            self.pal = Palette::new(resolve_dark(key.0), key.1);
+            self.styled_key = key;
         }
+    }
+
+    fn navigate(&mut self, nav: Nav) {
+        let target = match nav {
+            Nav::Go(p) if p != self.page => {
+                self.back.push(self.page);
+                self.forward.clear();
+                p
+            }
+            Nav::Back => match self.back.pop() {
+                Some(p) => {
+                    self.forward.push(self.page);
+                    p
+                }
+                None => return,
+            },
+            Nav::Forward => match self.forward.pop() {
+                Some(p) => {
+                    self.back.push(self.page);
+                    p
+                }
+                None => return,
+            },
+            _ => return,
+        };
+        self.page = target;
+        self.ui_state.reset_page();
+        self.ui_state.group_heights.clear();
     }
 
     fn schedule_save(&mut self) {
@@ -138,27 +188,60 @@ impl App {
         self.compositor_live = Some(matches!(reply, Ok(ref v) if v["event"] == "ok"));
     }
 
+    /// Redraw at most once per compositor frame: pointer motion arrives far
+    /// faster than the display refreshes.
+    fn request_redraw(&mut self) {
+        if self.frame_pending && self.last_frame.elapsed() < FRAME_FALLBACK {
+            self.dirty = true;
+            if self.redraw_timer.is_none() {
+                let timer = Timer::from_duration(FRAME_FALLBACK);
+                self.redraw_timer = self
+                    .loop_handle
+                    .insert_source(timer, |_, _, app: &mut App| {
+                        app.redraw_timer = None;
+                        if app.dirty {
+                            app.render();
+                        }
+                        TimeoutAction::Drop
+                    })
+                    .ok();
+            }
+            return;
+        }
+        self.render();
+    }
+
     fn render(&mut self) {
         if !self.configured || self.width == 0 || self.height == 0 {
             return;
+        }
+        self.dirty = false;
+        if let Some(tok) = self.redraw_timer.take() {
+            self.loop_handle.remove(tok);
         }
         self.update_theme();
         let s = self.scale.max(1) as f32;
         let pw = (self.width as i32 * self.scale.max(1)) as u32;
         let ph = (self.height as i32 * self.scale.max(1)) as u32;
-        let Some(mut pm) = Pixmap::new(pw, ph) else {
-            return;
+        let mut pm = match self.pixmap.take() {
+            Some(pm) if pm.width() == pw && pm.height() == ph => pm,
+            _ => match Pixmap::new(pw, ph) {
+                Some(pm) => pm,
+                None => return,
+            },
         };
 
         let mut pass = 0;
         loop {
-            let dry_run = false;
             pm.fill(skia_color(self.pal.content));
             self.ui_state.hovered_pointer = false;
+            let before = self.settings.clone();
 
             let win_w = self.width as f32;
             let win_h = self.height as f32;
-            let prev_page = self.page;
+            let nav: Option<Nav>;
+            let can_back = !self.back.is_empty();
+            let can_fwd = !self.forward.is_empty();
 
             let needs_relayout = {
                 let mut ui = Ui::new(
@@ -170,153 +253,238 @@ impl App {
                     s,
                     win_w,
                     win_h,
-                    dry_run,
+                    false,
                 );
-
-                // 1. Main scrollable content area (drawn first so toolbar/sidebar cleanly mask edges)
-                let content_x = SIDEBAR_W;
-                let content_w = (win_w - SIDEBAR_W).max(200.0);
-                let inner_w = (content_w - 48.0).min(640.0);
-                let pad_x = content_x + ((content_w - inner_w) * 0.5).max(16.0);
-
-                ui.clip = Some(Rect::new(content_x, TOOLBAR_H, content_w, (win_h - TOOLBAR_H).max(0.0)));
-                ui.x = pad_x;
-                ui.w = inner_w;
-                let start_y = TOOLBAR_H + 12.0 - ui.st.scroll_y;
-                ui.y = start_y;
-
-                if self.compositor_live == Some(false) {
-                    ui.error_line(Some("Saved. Restart Orchard for changes to take effect."));
-                }
-
-                pages::show(&mut ui, self.page, &mut self.settings, &mut self.page_state, &self.wake);
-
-                let total_h = (ui.y - start_y) + 28.0;
-                let view_h = (win_h - TOOLBAR_H).max(1.0);
-                let max_scroll = (total_h - view_h).max(0.0);
-                ui.st.max_scroll = max_scroll;
-                if ui.st.scroll_y > max_scroll {
-                    ui.st.scroll_y = max_scroll;
-                }
-
-                // Subtle scrollbar
-                if max_scroll > 1.0 {
-                    let frac = (view_h / total_h).clamp(0.08, 1.0);
-                    let bar_h = (view_h * frac).max(28.0);
-                    let bar_y = TOOLBAR_H + (ui.st.scroll_y / max_scroll) * (view_h - bar_h);
-                    let bar_r = Rect::new(win_w - 8.0, bar_y + 2.0, 4.0, (bar_h - 4.0).max(12.0));
-                    ui.fill_rect(bar_r, 2.0, ui.pal.text3);
-                }
-
-                // 2. Top toolbar over content area
-                ui.clip = None;
-                let tb = Rect::new(SIDEBAR_W, 0.0, content_w, TOOLBAR_H);
-                ui.fill_rect(tb, 0.0, self.pal.content);
-                ui.line(SIDEBAR_W, TOOLBAR_H, win_w, TOOLBAR_H, 1.0, self.pal.group_border);
-                ui.text(self.page.title(), SIDEBAR_W + 20.0, TOOLBAR_H * 0.5, 15.0, Weight::Bold, self.pal.text);
-
-                // 3. Left sidebar
-                let sb = Rect::new(0.0, 0.0, SIDEBAR_W, win_h);
-                ui.fill_rect(sb, 0.0, self.pal.sidebar);
-                ui.line(SIDEBAR_W, 0.0, SIDEBAR_W, win_h, 1.0, self.pal.group_border);
-
-                // Search input
-                let search_r = Rect::new(12.0, 12.0, SIDEBAR_W - 24.0, 28.0);
-                let _ = ui.text_input_at(hash_id("sidebar-search"), search_r, &mut self.search, "Search", false);
-
-                // Sidebar items
-                let mut sy = 52.0;
-                let q = self.search.trim().to_lowercase();
-                if !q.is_empty() {
-                    let mut any = false;
-                    for &pg in ALL_PAGES {
-                        if pg.title().to_lowercase().contains(&q) || pg.keywords().contains(&q) {
-                            any = true;
-                            if draw_sidebar_item(&mut ui, pg, self.page == pg, sy) {
-                                self.page = pg;
-                            }
-                            sy += 30.0;
-                        }
-                    }
-                    if !any {
-                        ui.text_center("No Results", SIDEBAR_W * 0.5, sy + 24.0, 12.5, Weight::Regular, self.pal.text2);
-                    }
-                } else {
-                    for section in SIDEBAR {
-                        for &pg in *section {
-                            if draw_sidebar_item(&mut ui, pg, self.page == pg, sy) {
-                                self.page = pg;
-                            }
-                            sy += 30.0;
-                        }
-                        sy += 12.0;
-                    }
-                }
-
-                // 4. Open popup menu overlay (always on top!)
-                ui.render_popup_overlay();
-
+                let mut view = View {
+                    page: self.page,
+                    settings: &mut self.settings,
+                    page_state: &mut self.page_state,
+                    wake: &self.wake,
+                    search: &mut self.search,
+                    user: &self.user,
+                    can_back,
+                    can_fwd,
+                    compositor_live: self.compositor_live,
+                };
+                nav = draw_window(&mut ui, &mut view);
                 ui.needs_relayout
             };
 
-            // Clear one-shot click/press/text events after first real pass
             self.ui_state.clicked = false;
             self.ui_state.just_pressed = false;
             self.ui_state.text_events.clear();
 
-            if self.page != prev_page {
-                self.ui_state.reset_page();
-                self.ui_state.group_heights.clear();
-                pass += 1;
-                if pass < 3 {
-                    continue;
-                }
-            }
-            if self.ui_state.popup_result.is_some() && pass < 3 {
-                pass += 1;
-                continue;
-            }
-            if needs_relayout && pass < 2 {
-                pass += 1;
-                continue;
-            }
-            if self.settings != self.saved {
+            let settings_changed = self.settings != before;
+            if settings_changed {
                 self.update_theme();
                 self.schedule_save();
-                if pass < 2 {
-                    pass += 1;
-                    continue;
-                }
+            }
+
+            let prev = self.page;
+            if let Some(n) = nav {
+                self.navigate(n);
+            }
+            let again = self.page != prev
+                || self.ui_state.popup_result.is_some()
+                || needs_relayout
+                || settings_changed;
+            if again && pass < 3 {
+                pass += 1;
+                continue;
             }
             break;
         }
 
-        // Blit Pixmap (RGBA premultiplied) -> Wayland SHM (ARGB8888 / BGRA premultiplied)
+        // Pixmap (premultiplied RGBA) -> wl_shm ARGB8888 (BGRA bytes on little endian).
         let stride = pw as i32 * 4;
         let Ok((buf, canvas)) = self
             .pool
             .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Argb8888)
         else {
+            self.pixmap = Some(pm);
             return;
         };
-        let src = pm.data();
-        for (d, c) in canvas.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        for (d, c) in canvas.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
             d[0] = c[2];
             d[1] = c[1];
             d[2] = c[0];
             d[3] = c[3];
         }
-        let surf = self.window.wl_surface();
+        self.pixmap = Some(pm);
+        let surf = self.window.wl_surface().clone();
         surf.set_buffer_scale(self.scale.max(1));
-        let _ = buf.attach_to(surf);
+        let _ = buf.attach_to(&surf);
         surf.damage_buffer(0, 0, pw as i32, ph as i32);
+        surf.frame(&self.qh, surf.clone());
         surf.commit();
+        self.frame_pending = true;
         self.last_frame = Instant::now();
     }
 }
 
+/// Everything a frame needs besides the painter.
+struct View<'a> {
+    page: Page,
+    settings: &'a mut Settings,
+    page_state: &'a mut PageState,
+    wake: &'a Wake,
+    search: &'a mut String,
+    user: &'a (String, String),
+    can_back: bool,
+    can_fwd: bool,
+    compositor_live: Option<bool>,
+}
+
+/// Paint the whole window: content pane, toolbar, sidebar, pop-up overlay.
+fn draw_window(ui: &mut Ui, v: &mut View) -> Option<Nav> {
+    let mut nav = None;
+    let (win_w, win_h) = (ui.win_w, ui.win_h);
+    let (can_back, can_fwd) = (v.can_back, v.can_fwd);
+    // 1. Scrollable content (drawn first; toolbar and sidebar mask its edges).
+    let content_x = SIDEBAR_W;
+    let content_w = (win_w - SIDEBAR_W).max(200.0);
+    let inner_w = (content_w - 40.0).min(680.0);
+    let pad_x = content_x + ((content_w - inner_w) * 0.5).max(20.0);
+
+    ui.clip = Some(Rect::new(content_x, TOOLBAR_H, content_w, (win_h - TOOLBAR_H).max(0.0)));
+    ui.x = pad_x;
+    ui.w = inner_w;
+    let start_y = TOOLBAR_H + 4.0 - ui.st.scroll_y;
+    ui.y = start_y;
+
+    if v.compositor_live == Some(false) {
+        ui.error_line(Some("Saved. Restart Orchard for changes to take effect."));
+    }
+
+    pages::show(ui, v.page, v.settings, v.page_state, v.wake);
+
+    let total_h = (ui.y - start_y) + 20.0;
+    let view_h = (win_h - TOOLBAR_H).max(1.0);
+    let max_scroll = (total_h - view_h).max(0.0);
+    ui.st.max_scroll = max_scroll;
+    if ui.st.scroll_y > max_scroll {
+        ui.st.scroll_y = max_scroll;
+    }
+
+    if max_scroll > 1.0 {
+        let frac = (view_h / total_h).clamp(0.08, 1.0);
+        let bar_h = (view_h * frac).max(28.0);
+        let bar_y = TOOLBAR_H + (ui.st.scroll_y / max_scroll) * (view_h - bar_h);
+        let bar_r = Rect::new(win_w - 9.0, bar_y + 3.0, 5.0, (bar_h - 6.0).max(12.0));
+        ui.fill_rect(bar_r, 2.5, with_alpha(ui.pal.text, 70));
+    }
+
+    // 2. Toolbar: ‹ › and the pane title, hairline only once content scrolls under it.
+    ui.clip = None;
+    let tb = Rect::new(SIDEBAR_W, 0.0, content_w, TOOLBAR_H);
+    ui.fill_rect(tb, 0.0, ui.pal.content);
+    if ui.st.scroll_y > 0.5 {
+        ui.line(SIDEBAR_W, TOOLBAR_H - 0.5, win_w, TOOLBAR_H - 0.5, 1.0, ui.pal.separator);
+    }
+    let cy = TOOLBAR_H * 0.5;
+    let back_r = Rect::new(SIDEBAR_W + 12.0, cy - 13.0, 26.0, 26.0);
+    let fwd_r = Rect::new(back_r.right() + 2.0, cy - 13.0, 26.0, 26.0);
+    if toolbar_chevron(ui, back_r, true, can_back) {
+        nav = Some(Nav::Back);
+    }
+    if toolbar_chevron(ui, fwd_r, false, can_fwd) {
+        nav = Some(Nav::Forward);
+    }
+    ui.text_elided(
+        v.page.title(),
+        fwd_r.right() + 12.0,
+        cy,
+        content_w - 100.0,
+        15.0,
+        Weight::Bold,
+        ui.pal.text,
+    );
+
+    // 3. Sidebar.
+    let sb = Rect::new(0.0, 0.0, SIDEBAR_W, win_h);
+    ui.fill_rect(sb, 0.0, ui.pal.sidebar);
+    ui.line(SIDEBAR_W - 0.5, 0.0, SIDEBAR_W - 0.5, win_h, 1.0, ui.pal.group_border);
+
+    let search_r = Rect::new(10.0, 12.0, SIDEBAR_W - 20.0, 28.0);
+    let _ = ui.search_field(hash_id("sidebar-search"), search_r, v.search);
+
+    let q = v.search.trim().to_lowercase();
+    let mut sy = 52.0;
+    if !q.is_empty() {
+        let mut any = false;
+        for &pg in ALL_PAGES {
+            if pg.title().to_lowercase().contains(&q) || pg.keywords().contains(&q) {
+                any = true;
+                if draw_sidebar_item(ui, pg, v.page == pg, sy) {
+                    nav = Some(Nav::Go(pg));
+                }
+                sy += ROW_H;
+            }
+        }
+        if !any {
+            ui.text_center("No Results", SIDEBAR_W * 0.5, sy + 24.0, 13.0, Weight::Regular, ui.pal.text2);
+        }
+    } else {
+        if draw_account(ui, v.user, sy) {
+            nav = Some(Nav::Go(Page::System));
+        }
+        sy += 62.0;
+        for (i, section) in SIDEBAR.iter().enumerate() {
+            if i > 0 {
+                sy += 10.0;
+            }
+            for &pg in *section {
+                if draw_sidebar_item(ui, pg, v.page == pg, sy) {
+                    nav = Some(Nav::Go(pg));
+                }
+                sy += ROW_H;
+            }
+        }
+    }
+
+    // 4. Open pop-up menu on top of everything.
+    ui.render_popup_overlay();
+    nav
+}
+
+fn toolbar_chevron(ui: &mut Ui, r: Rect, left: bool, enabled: bool) -> bool {
+    if enabled && ui.hovered(r) {
+        ui.fill_rect(r, 6.0, ui.pal.hover);
+    }
+    let col = if enabled { ui.pal.text2 } else { with_alpha(ui.pal.text3, 120) };
+    let (cx, cy) = (r.cx(), r.cy());
+    let d = if left { 1.0 } else { -1.0 };
+    ui.line(cx + 2.5 * d, cy - 6.0, cx - 3.0 * d, cy, 2.0, col);
+    ui.line(cx - 3.0 * d, cy, cx + 2.5 * d, cy + 6.0, 2.0, col);
+    enabled && ui.clicked(r)
+}
+
+/// The account card at the top of the sidebar (like the Apple Account entry).
+fn draw_account(ui: &mut Ui, user: &(String, String), y: f32) -> bool {
+    let r = Rect::new(10.0, y, SIDEBAR_W - 20.0, 52.0);
+    if ui.hovered(r) {
+        ui.fill_rect(r, 8.0, ui.pal.hover);
+    }
+    let (cx, cy) = (r.x + 24.0, r.cy());
+    let top = [0xA8, 0xA8, 0xAE, 255];
+    ui.circle_filled(cx, cy, 17.0, mix(top, [0x6E, 0x6E, 0x74, 255], 0.35));
+    let initials: String = user
+        .0
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect();
+    ui.text_center(&initials, cx, cy, 13.5, Weight::Bold, [255, 255, 255, 255]);
+    let tx = r.x + 48.0;
+    let tw = r.w - 54.0;
+    ui.text_elided(&user.0, tx, cy - 8.0, tw, 13.0, Weight::Bold, ui.pal.text);
+    ui.text_elided(&user.1, tx, cy + 8.5, tw, 11.0, Weight::Regular, ui.pal.text2);
+    ui.clicked(r)
+}
+
 fn draw_sidebar_item(ui: &mut Ui, pg: Page, selected: bool, y: f32) -> bool {
-    let r = Rect::new(10.0, y, SIDEBAR_W - 20.0, 28.0);
+    let r = Rect::new(10.0, y, SIDEBAR_W - 20.0, ROW_H);
     if selected {
         ui.fill_rect(r, 6.0, ui.pal.accent);
     } else if ui.hovered(r) {
@@ -328,6 +496,19 @@ fn draw_sidebar_item(ui: &mut Ui, pg: Page, selected: bool, y: f32) -> bool {
     let fg = if selected { [255, 255, 255, 255] } else { ui.pal.text };
     ui.text_elided(pg.title(), r.x + 34.0, r.cy(), r.w - 40.0, 13.0, Weight::Regular, fg);
     ui.clicked(r)
+}
+
+/// Full name (GECOS) and login of the current user, read without subprocesses.
+fn current_user() -> (String, String) {
+    let login = std::env::var("USER").unwrap_or_default();
+    let gecos = std::fs::read_to_string("/etc/passwd").ok().and_then(|pw| {
+        pw.lines().find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() > 4 && f[0] == login).then(|| f[4].split(',').next().unwrap_or("").trim().to_string())
+        })
+    });
+    let name = gecos.filter(|g| !g.is_empty()).unwrap_or_else(|| login.clone());
+    (name, "Local Account".into())
 }
 
 fn main() {
@@ -360,9 +541,9 @@ fn main() {
     window.commit();
 
     let settings = Settings::load();
-    let dark = resolve_dark(settings.appearance.mode);
+    let mode = settings.appearance.mode;
     let accent = settings.appearance.accent.rgb();
-    let pal = Palette::new(dark, accent);
+    let pal = Palette::new(resolve_dark(mode), accent);
 
     let pool = SlotPool::new((INIT_W * INIT_H * 4 * 4) as usize, &shm).expect("shm pool");
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("event loop");
@@ -371,7 +552,7 @@ fn main() {
     let (wake_tx, wake_rx) = channel::channel::<()>();
     loop_handle
         .insert_source(wake_rx, |_, _, app: &mut App| {
-            app.render();
+            app.request_redraw();
         })
         .expect("wake channel");
 
@@ -381,22 +562,27 @@ fn main() {
 
     let mut app = App {
         loop_handle,
+        qh: qh.clone(),
         registry,
         output,
         shm,
         seat,
         window,
         pool,
+        pixmap: None,
         fonts: Fonts::load(),
         icons: Icons::default(),
         pal,
-        styled_key: (dark, accent),
+        styled_key: (mode, accent),
         saved: settings.clone(),
         settings,
         save_timer: None,
         compositor_live: None,
         page: start_page,
+        back: Vec::new(),
+        forward: Vec::new(),
         search: String::new(),
+        user: current_user(),
         page_state: PageState::default(),
         ui_state: UiState::default(),
         wake: Wake(wake_tx),
@@ -406,6 +592,9 @@ fn main() {
         configured: false,
         exit: false,
         mods: Modifiers::default(),
+        frame_pending: false,
+        dirty: false,
+        redraw_timer: None,
         last_frame: Instant::now(),
     };
 
@@ -426,7 +615,12 @@ impl CompositorHandler for App {
         }
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+        self.frame_pending = false;
+        if self.dirty {
+            self.render();
+        }
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
@@ -481,20 +675,25 @@ impl KeyboardHandler for App {
             self.exit = true;
             return;
         }
+        if cmd && matches!(ev.keysym, Keysym::bracketleft | Keysym::bracketright) && self.ui_state.focused_input.is_none() {
+            self.navigate(if ev.keysym == Keysym::bracketleft { Nav::Back } else { Nav::Forward });
+            self.request_redraw();
+            return;
+        }
         if cmd && (ev.keysym == Keysym::f || ev.keysym == Keysym::F) {
             self.ui_state.focused_input = Some(hash_id("sidebar-search"));
-            self.render();
+            self.request_redraw();
             return;
         }
         if ev.keysym == Keysym::Escape {
             if self.ui_state.open_popup.is_some() {
                 self.ui_state.open_popup = None;
-                self.render();
+                self.request_redraw();
                 return;
             }
             if self.ui_state.focused_input.is_some() {
                 self.ui_state.text_events.push(TextEvent::Escape);
-                self.render();
+                self.request_redraw();
                 return;
             }
         }
@@ -512,7 +711,7 @@ impl KeyboardHandler for App {
                     }
                 }
             }
-            self.render();
+            self.request_redraw();
         }
     }
 
@@ -559,6 +758,15 @@ impl PointerHandler for App {
                     self.ui_state.active_slider = None;
                     redraw = true;
                 }
+                // Mouse back/forward side buttons.
+                PointerEventKind::Press { button: 0x113 | 0x116, .. } => {
+                    self.navigate(Nav::Back);
+                    redraw = true;
+                }
+                PointerEventKind::Press { button: 0x114 | 0x115, .. } => {
+                    self.navigate(Nav::Forward);
+                    redraw = true;
+                }
                 PointerEventKind::Axis { vertical, .. } => {
                     let dy = scroll_delta(vertical);
                     if dy.abs() > 0.01 {
@@ -575,7 +783,7 @@ impl PointerHandler for App {
             }
         }
         if redraw {
-            self.render();
+            self.request_redraw();
         }
     }
 }
@@ -608,3 +816,4 @@ delegate_pointer!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 delegate_registry!(App);
+

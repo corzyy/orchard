@@ -10,7 +10,7 @@ use tiny_skia::Pixmap;
 use crate::{
     icons::Icons,
     theme::{
-        blit_rounded_rgba, fill_circle, fill_rrect, line, mix, stroke_circle, stroke_rrect,
+        blit_rounded_rgba, fill_circle, fill_rrect, fill_rrect_vgrad, line, mix, stroke_circle, stroke_rrect,
         with_alpha, Fonts, Palette, Rgba, Weight,
     },
 };
@@ -337,17 +337,50 @@ impl<'a> Ui<'a> {
         self.icons.draw(self.pm, name, dx, dy, px, tint, clip)
     }
 
+    /// macOS-style app icon tile: rounded square with a soft top-to-bottom
+    /// gradient and a white symbolic glyph.
     pub fn icon_tile(&mut self, r: Rect, bg: Rgba, icon: &str) {
         if !self.visible(r) {
             return;
         }
-        let radius = (r.w * 0.24).round();
-        self.fill_rect(r, radius, bg);
-        let inner = r.inset(r.w * 0.18);
+        let radius = (r.w * 0.225).round().max(4.0);
+        let s = self.scale;
+        let top = mix(bg, [255, 255, 255, 255], 0.16);
+        let bottom = mix(bg, [0, 0, 0, 255], 0.08);
+        fill_rrect_vgrad(self.pm, r.x * s, r.y * s, r.w * s, r.h * s, radius * s, top, bottom);
+        self.stroke_rect(r, radius, 0.5, [0, 0, 0, 30]);
+        let inner = r.inset(r.w * 0.2);
         if !self.icon(icon, inner, [255, 255, 255, 255]) {
             let ch = icon.chars().next().unwrap_or('?').to_ascii_uppercase().to_string();
             self.text_center(&ch, r.cx(), r.cy(), r.h * 0.52, Weight::Bold, [255, 255, 255, 255]);
         }
+    }
+
+    /// Wrapped paragraph centred on `cx`; returns the height used.
+    pub fn paragraph_center(&mut self, text: &str, cx: f32, y: f32, max_w: f32, size: f32, color: Rgba) -> f32 {
+        let line_h = (size * 1.36).round();
+        let lines = self.fonts.wrap(text, size, Weight::Regular, max_w);
+        for (i, l) in lines.iter().enumerate() {
+            self.text_center(l, cx, y + line_h * (i as f32 + 0.5), size, Weight::Regular, color);
+        }
+        line_h * lines.len() as f32
+    }
+
+    /// The header card at the top of each pane (big icon, title, blurb),
+    /// as in macOS System Settings.
+    pub fn hero(&mut self, id_key: &str, icon: &str, color: Rgba, title: &str, desc: &str) {
+        let key = format!("hero-{id_key}");
+        self.group(&key, |ui| {
+            let y0 = ui.y;
+            let cx = ui.x + ui.w * 0.5;
+            let tile = Rect::new(cx - 27.0, y0 + 18.0, 54.0, 54.0);
+            ui.icon_tile(tile, color, icon);
+            ui.text_center(title, cx, tile.bottom() + 18.0, 15.0, Weight::Bold, ui.pal.text);
+            let max_w = (ui.w - 64.0).min(420.0);
+            let h = ui.paragraph_center(desc, cx, tile.bottom() + 30.0, max_w, 11.5, ui.pal.text2);
+            ui.y = tile.bottom() + 30.0 + h + 16.0;
+        });
+        self.y += 6.0;
     }
 
     pub fn rounded_image(&mut self, r: Rect, rgba: &[u8], iw: u32, ih: u32, radius: f32) {
@@ -498,9 +531,9 @@ impl<'a> Ui<'a> {
             .find(|(k, _)| k == current)
             .map(|(_, l)| l.as_str())
             .unwrap_or("—");
-        let text_w = self.fonts.measure(display, 12.5, Weight::Regular).min(240.0);
-        let pw = (text_w + 30.0).max(76.0);
-        let pr = Rect::new(r.right() - 14.0 - pw, r.cy() - 12.0, pw, 24.0);
+        let text_w = self.fonts.measure(display, 13.0, Weight::Regular).min(260.0);
+        let pw = text_w + 30.0;
+        let pr = Rect::new(r.right() - 6.0 - pw, r.cy() - 12.0, pw, 24.0);
         self.popup_at(id, pr, current, display, options)
     }
 
@@ -637,11 +670,11 @@ impl<'a> Ui<'a> {
         display: &str,
         options: &[(String, String)],
     ) -> Option<String> {
-        let hov = self.hovered(r);
-        let bg = if hov { self.pal.hover } else { self.pal.control };
-        self.fill_rect(r, 6.0, bg);
-        self.stroke_rect(r, 6.0, 1.0, self.pal.control_border);
-        self.text_elided(display, r.x + 8.0, r.cy(), r.w - 26.0, 12.5, Weight::Regular, self.pal.text);
+        let hov = self.hovered(r) || self.st.open_popup.as_ref().map(|p| p.id) == Some(id);
+        if hov {
+            self.fill_rect(r, 5.0, self.pal.hover);
+        }
+        self.text_elided(display, r.x + 8.0, r.cy(), r.w - 26.0, 13.0, Weight::Regular, self.pal.text);
         self.updown_chevrons(r.right() - 10.0, r.cy(), self.pal.text2);
 
         if self.clicked(r) && !options.is_empty() {
@@ -656,15 +689,8 @@ impl<'a> Ui<'a> {
         self.st.take_popup_result(id)
     }
 
-    /// Single-line text input. Returns true when Enter was pressed.
-    pub fn text_input_at(
-        &mut self,
-        id: u64,
-        r: Rect,
-        value: &mut String,
-        hint: &str,
-        password: bool,
-    ) -> bool {
+    /// Focus + keyboard handling shared by text fields. Returns (focused, submitted).
+    fn edit_text(&mut self, id: u64, r: Rect, value: &mut String) -> (bool, bool) {
         if (self.st.just_pressed && self.hovered(r)) || self.clicked(r) {
             self.st.focused_input = Some(id);
         }
@@ -682,40 +708,67 @@ impl<'a> Ui<'a> {
                     TextEvent::Backspace => {
                         value.pop();
                     }
-                    TextEvent::Enter => {
-                        submitted = true;
-                    }
-                    TextEvent::Escape => {
-                        self.st.focused_input = None;
-                    }
+                    TextEvent::Enter => submitted = true,
+                    TextEvent::Escape => self.st.focused_input = None,
                 }
             }
         }
+        (self.st.focused_input == Some(id), submitted)
+    }
 
-        self.fill_rect(r, 6.0, self.pal.field);
-        let border = if focused { self.pal.accent } else { self.pal.control_border };
-        self.stroke_rect(r, 6.0, if focused { 1.5 } else { 1.0 }, border);
-
+    fn field_text(&mut self, r: Rect, x: f32, value: &str, hint: &str, password: bool, focused: bool) {
         let shown = if value.is_empty() {
             hint.to_string()
         } else if password {
             "•".repeat(value.chars().count())
         } else {
-            value.clone()
+            value.to_string()
         };
         let color = if value.is_empty() { self.pal.text3 } else { self.pal.text };
-        let max_w = (r.w - 16.0).max(10.0);
-        let disp = self.fonts.elide(&shown, 12.5, Weight::Regular, max_w);
-        self.text(&disp, r.x + 8.0, r.cy(), 12.5, Weight::Regular, color);
-
+        let max_w = (r.right() - x - 8.0).max(10.0);
+        let disp = self.fonts.elide(&shown, 13.0, Weight::Regular, max_w);
+        self.text(&disp, x, r.cy(), 13.0, Weight::Regular, color);
         if focused {
-            let tw = if value.is_empty() {
-                0.0
-            } else {
-                self.fonts.measure(&disp, 12.5, Weight::Regular)
-            };
-            let cx = (r.x + 8.0 + tw + 1.0).min(r.right() - 6.0);
-            self.line(cx, r.y + 5.0, cx, r.bottom() - 5.0, 1.5, self.pal.accent);
+            let tw = if value.is_empty() { 0.0 } else { self.fonts.measure(&disp, 13.0, Weight::Regular) };
+            let cx = (x + tw + 1.0).min(r.right() - 6.0);
+            self.line(cx, r.y + 5.0, cx, r.bottom() - 5.0, 1.2, self.pal.text);
+        }
+    }
+
+    /// Single-line text input. Returns true when Enter was pressed.
+    pub fn text_input_at(&mut self, id: u64, r: Rect, value: &mut String, hint: &str, password: bool) -> bool {
+        let (focused, submitted) = self.edit_text(id, r, value);
+        self.fill_rect(r, 6.0, self.pal.field);
+        if focused {
+            self.stroke_rect(r.inset(-2.5), 8.0, 3.0, with_alpha(self.pal.accent, 110));
+        }
+        self.stroke_rect(r, 6.0, 1.0, self.pal.control_border);
+        self.field_text(r, r.x + 8.0, value, hint, password, focused);
+        submitted
+    }
+
+    /// Sidebar search field with a magnifying glass, macOS style.
+    pub fn search_field(&mut self, id: u64, r: Rect, value: &mut String) -> bool {
+        let (focused, submitted) = self.edit_text(id, r, value);
+        self.fill_rect(r, 7.0, self.pal.field);
+        if focused {
+            self.stroke_rect(r.inset(-2.5), 9.0, 3.0, with_alpha(self.pal.accent, 110));
+        }
+        // magnifying glass
+        let (gx, gy) = (r.x + 13.0, r.cy() - 0.8);
+        self.circle_stroke(gx, gy, 4.2, 1.3, self.pal.text2);
+        self.line(gx + 3.0, gy + 3.0, gx + 6.0, gy + 6.0, 1.5, self.pal.text2);
+        self.field_text(r, r.x + 25.0, value, "Search", false, focused);
+        if !value.is_empty() {
+            let cr = Rect::new(r.right() - 22.0, r.cy() - 8.0, 16.0, 16.0);
+            self.circle_filled(cr.cx(), cr.cy(), 6.5, self.pal.text3);
+            let c = cr.cx();
+            let m = cr.cy();
+            self.line(c - 2.3, m - 2.3, c + 2.3, m + 2.3, 1.3, self.pal.sidebar);
+            self.line(c + 2.3, m - 2.3, c - 2.3, m + 2.3, 1.3, self.pal.sidebar);
+            if self.clicked(cr) {
+                value.clear();
+            }
         }
         submitted
     }

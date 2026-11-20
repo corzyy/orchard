@@ -30,48 +30,50 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// macOS System Settings–style colours: grouped forms are a faint tint over
+    /// the window background (darker in light mode, lighter in dark mode).
     pub fn new(dark: bool, accent_rgb: [u8; 3]) -> Self {
         let accent = [accent_rgb[0], accent_rgb[1], accent_rgb[2], 255];
         if dark {
             Self {
                 dark,
-                sidebar: [0x26, 0x25, 0x29, 255],
-                content: [0x1C, 0x1B, 0x1F, 255],
-                group: [0x27, 0x26, 0x2B, 255],
-                group_border: [255, 255, 255, 18],
+                sidebar: [0x2C, 0x2B, 0x2E, 255],
+                content: [0x1F, 0x1F, 0x21, 255],
+                group: [255, 255, 255, 12],
+                group_border: [255, 255, 255, 16],
                 separator: [255, 255, 255, 20],
-                text: [0xF2, 0xF2, 0xF5, 255],
-                text2: [0x9E, 0x9E, 0xA4, 255],
-                text3: [0x6A, 0x6A, 0x70, 255],
+                text: [0xEC, 0xEC, 0xEE, 255],
+                text2: [0x9C, 0x9C, 0xA2, 255],
+                text3: [0x68, 0x68, 0x6E, 255],
                 accent,
-                control: [0x3D, 0x3C, 0x42, 255],
-                control_border: [255, 255, 255, 24],
-                toggle_off: [255, 255, 255, 42],
-                knob: [0xF0, 0xF0, 0xF2, 255],
-                hover: [255, 255, 255, 16],
-                field: [0x30, 0x2F, 0x34, 255],
-                menu: [0x2D, 0x2C, 0x31, 255],
+                control: [0x5A, 0x5A, 0x5E, 255],
+                control_border: [255, 255, 255, 22],
+                toggle_off: [255, 255, 255, 40],
+                knob: [0xEE, 0xEE, 0xF0, 255],
+                hover: [255, 255, 255, 18],
+                field: [255, 255, 255, 14],
+                menu: [0x2E, 0x2D, 0x31, 255],
                 danger: [0xFF, 0x45, 0x3A, 255],
             }
         } else {
             Self {
                 dark,
-                sidebar: [0xEA, 0xE8, 0xEC, 255],
-                content: [0xF5, 0xF5, 0xF7, 255],
-                group: [0xFF, 0xFF, 0xFF, 255],
-                group_border: [0, 0, 0, 18],
-                separator: [0, 0, 0, 18],
+                sidebar: [0xE6, 0xE5, 0xE8, 255],
+                content: [0xF1, 0xF1, 0xF2, 255],
+                group: [0, 0, 0, 10],
+                group_border: [0, 0, 0, 14],
+                separator: [0, 0, 0, 20],
                 text: [0x1D, 0x1D, 0x1F, 255],
-                text2: [0x78, 0x78, 0x80, 255],
-                text3: [0xAE, 0xAE, 0xB4, 255],
+                text2: [0x7A, 0x7A, 0x80, 255],
+                text3: [0xAA, 0xAA, 0xB0, 255],
                 accent,
                 control: [0xFF, 0xFF, 0xFF, 255],
                 control_border: [0, 0, 0, 34],
-                toggle_off: [0, 0, 0, 28],
+                toggle_off: [0, 0, 0, 30],
                 knob: [0xFF, 0xFF, 0xFF, 255],
-                hover: [0, 0, 0, 12],
-                field: [0xFF, 0xFF, 0xFF, 255],
-                menu: [0xF8, 0xF7, 0xFA, 255],
+                hover: [0, 0, 0, 14],
+                field: [0, 0, 0, 12],
+                menu: [0xF6, 0xF6, 0xF7, 255],
                 danger: [0xE0, 0x38, 0x3E, 255],
             }
         }
@@ -148,61 +150,58 @@ fn fc_match(pattern: &str) -> Option<(String, u32)> {
     Some((file, idx))
 }
 
-fn first_existing(paths: &[&str]) -> Option<Font> {
-    for p in paths {
-        let path = Path::new(p);
-        if path.is_file() {
-            if let Some(f) = load_font_file(path, 0) {
-                return Some(f);
-            }
-        }
+/// First matching file among `paths` (no subprocess).
+fn first_existing(paths: &[String]) -> Option<Font> {
+    paths
+        .iter()
+        .map(Path::new)
+        .filter(|p| p.is_file())
+        .find_map(|p| load_font_file(p, 0))
+}
+
+/// `fc-match`, accepted only when the resolved file name contains `needle`
+/// (fontconfig always falls back to *something*, e.g. a variable Cantarell).
+fn fc_family(pattern: &str, needle: &str) -> Option<Font> {
+    let (f, i) = fc_match(pattern)?;
+    if !f.to_lowercase().contains(needle) {
+        return None;
     }
-    None
+    load_font_file(Path::new(&f), i)
 }
 
 impl Fonts {
-    /// Load UI fonts quickly: try common direct paths first (0 subprocesses),
-    /// then fall back to a single `fc-match` call if needed.
+    /// UI fonts like the rest of Orchard: SF Pro Text when installed, else
+    /// Inter, else the fontconfig sans-serif. Known paths are tried first so
+    /// startup normally spawns no `fc-match` at all.
     pub fn load() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
-        let sf_reg = format!("{home}/.local/share/fonts/SF-Pro-Text-Regular.otf");
-        let sf_bold = format!("{home}/.local/share/fonts/SF-Pro-Text-Semibold.otf");
+        let candidates = |sf: &str| -> Vec<String> {
+            vec![
+                format!("{home}/.local/share/fonts/SF-Pro/SF-Pro-Text-{sf}.otf"),
+                format!("{home}/.local/share/fonts/SF-Pro-Text-{sf}.otf"),
+                format!("{home}/.fonts/SF-Pro-Text-{sf}.otf"),
+                format!("/usr/share/fonts/SF-Pro/SF-Pro-Text-{sf}.otf"),
+                format!("/usr/local/share/fonts/SF-Pro-Text-{sf}.otf"),
+            ]
+        };
 
-        let regular = first_existing(&[
-            &sf_reg,
-            "/usr/share/fonts/inter/Inter-Regular.ttf",
-            "/usr/share/fonts/inter-fonts/Inter-Regular.otf",
-            "/usr/share/fonts/rsms-inter-fonts/Inter-Regular.otf",
-            "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
-            "/usr/share/fonts/abattis-cantarell-vf-fonts/Cantarell-VF.otf",
-            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        ])
-        .or_else(|| {
-            let (f, i) = fc_match("sans-serif:style=Regular")?;
-            load_font_file(Path::new(&f), i)
-        })
-        .expect("no usable UI font found");
+        let regular = first_existing(&candidates("Regular"))
+            .or_else(|| fc_family("SF Pro Text:style=Regular", "sf-pro"))
+            .or_else(|| fc_family("Inter:style=Regular", "inter"))
+            .or_else(|| {
+                let (f, i) = fc_match("sans-serif:style=Regular")?;
+                load_font_file(Path::new(&f), i)
+            })
+            .expect("no usable UI font found");
 
-        let bold = first_existing(&[
-            &sf_bold,
-            "/usr/share/fonts/inter/Inter-SemiBold.ttf",
-            "/usr/share/fonts/inter/Inter-Bold.ttf",
-            "/usr/share/fonts/inter-fonts/Inter-SemiBold.otf",
-            "/usr/share/fonts/rsms-inter-fonts/Inter-SemiBold.otf",
-            "/usr/share/fonts/cantarell/Cantarell-Bold.otf",
-            "/usr/share/fonts/google-noto/NotoSans-Bold.ttf",
-            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        ])
-        .or_else(|| {
-            let (f, i) = fc_match("sans-serif:style=Bold")?;
-            load_font_file(Path::new(&f), i)
-        })
-        .unwrap_or_else(|| regular.clone());
+        let bold = first_existing(&candidates("Semibold"))
+            .or_else(|| fc_family("SF Pro Text:style=Semibold", "sf-pro"))
+            .or_else(|| fc_family("Inter:style=SemiBold", "inter"))
+            .or_else(|| {
+                let (f, i) = fc_match("sans-serif:style=Bold")?;
+                load_font_file(Path::new(&f), i)
+            })
+            .unwrap_or_else(|| regular.clone());
 
         Self {
             regular,
@@ -229,7 +228,34 @@ impl Fonts {
 
     pub fn measure(&self, text: &str, px: f32, w: Weight) -> f32 {
         let f = self.font(w);
-        text.chars().map(|c| f.metrics(c, px).advance_width).sum()
+        let mut prev: Option<char> = None;
+        let mut width = 0.0;
+        for c in text.chars() {
+            if let Some(p) = prev {
+                width += f.horizontal_kern(p, c, px).unwrap_or(0.0);
+            }
+            width += f.metrics(c, px).advance_width;
+            prev = Some(c);
+        }
+        width
+    }
+
+    /// Greedy word wrap into lines no wider than `max_w`.
+    pub fn wrap(&self, text: &str, px: f32, w: Weight, max_w: f32) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut cur = String::new();
+        for word in text.split_whitespace() {
+            let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+            if !cur.is_empty() && self.measure(&cand, px, w) > max_w {
+                lines.push(std::mem::replace(&mut cur, word.to_string()));
+            } else {
+                cur = cand;
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
     }
 
     pub fn elide(&self, text: &str, px: f32, w: Weight, max_w: f32) -> String {
@@ -284,12 +310,18 @@ impl Fonts {
         }
         let data = pm.data_mut();
         let mut pen_x = x;
+        let mut prev: Option<char> = None;
+        let font = self.font(w);
         let sr = color[0] as u32;
         let sg = color[1] as u32;
         let sb = color[2] as u32;
         let sa = color[3] as u32;
 
         for c in text.chars() {
+            if let Some(p) = prev {
+                pen_x += font.horizontal_kern(p, c, px).unwrap_or(0.0);
+            }
+            prev = Some(c);
             let g = self.glyph(w, c, px);
             let (m, ref cov) = *g;
             if m.width > 0 && m.height > 0 {
@@ -366,6 +398,27 @@ pub fn fill_rrect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, color
     let Some(path) = rounded_rect_path(x, y, w, h, r) else { return };
     let mut paint = Paint::default();
     paint.set_color(skia_color(color));
+    paint.anti_alias = true;
+    pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+}
+
+/// Rounded rect with a vertical linear gradient from `top` to `bottom`.
+pub fn fill_rrect_vgrad(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, top: Rgba, bottom: Rgba) {
+    let Some(path) = rounded_rect_path(x, y, w, h, r) else { return };
+    let Some(shader) = tiny_skia::LinearGradient::new(
+        tiny_skia::Point::from_xy(x, y),
+        tiny_skia::Point::from_xy(x, y + h),
+        vec![
+            tiny_skia::GradientStop::new(0.0, skia_color(top)),
+            tiny_skia::GradientStop::new(1.0, skia_color(bottom)),
+        ],
+        tiny_skia::SpreadMode::Pad,
+        Transform::identity(),
+    ) else {
+        return fill_rrect(pm, x, y, w, h, r, top);
+    };
+    let mut paint = Paint::default();
+    paint.shader = shader;
     paint.anti_alias = true;
     pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 }

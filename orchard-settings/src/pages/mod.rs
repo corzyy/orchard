@@ -92,6 +92,24 @@ impl Page {
         }
     }
 
+    /// Blurb shown under the title in the pane's header card.
+    pub fn description(self) -> &'static str {
+        match self {
+            Wifi => "Set up Wi‑Fi to wirelessly connect your computer to the internet. Turn on Wi‑Fi, then choose a network to join.",
+            Bluetooth => "Connect headphones, keyboards, mice and other wireless accessories.",
+            Sound => "Choose where sound plays and which microphone is used, and adjust their volume.",
+            Appearance => "Choose light or dark mode, an accent colour, and how windows and icons look.",
+            Wallpaper => "Pick a picture for your desktop, or add your own.",
+            DesktopDock => "Adjust the Dock, how windows behave, and what happens in the corners of your screen.",
+            MenuBar => "Choose what appears in the menu bar and how the clock is shown.",
+            Displays => "Arrange your displays and set their resolution, scaling and refresh rate.",
+            Keyboard => "Adjust key repeat, keyboard layouts and modifier keys.",
+            Pointer => "Set tracking speed, scrolling direction and trackpad gestures.",
+            LockPower => "Control when your screen locks and how your computer uses energy.",
+            System => "Information about your computer, default apps, date and time, and login items.",
+        }
+    }
+
     pub fn keywords(self) -> &'static str {
         match self {
             Wifi => "wifi wireless wlan internet network ssid ethernet vpn",
@@ -146,6 +164,8 @@ pub struct PageState {
 }
 
 pub fn show(ui: &mut Ui, page: Page, s: &mut Settings, st: &mut PageState, wake: &Wake) {
+    let (icon, color) = page.icon();
+    ui.hero(page.title(), icon, color, page.title(), page.description());
     match page {
         Wifi => connectivity::wifi(ui, &mut st.conn, wake),
         Bluetooth => connectivity::bluetooth(ui, &mut st.conn, wake),
