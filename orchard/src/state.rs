@@ -161,7 +161,8 @@ pub struct OrchardState<BackendData: Backend + 'static> {
     pub dnd_icon: Option<DndIcon>,
 
     // input-related fields
-    pub suppressed_keys: Vec<Keysym>,
+    /// keycodes whose press triggered a compositor shortcut; their release is not forwarded
+    pub suppressed_keys: Vec<smithay::input::keyboard::Keycode>,
     pub cursor_status: CursorImageStatus,
     pub seat_name: String,
     pub seat: Seat<OrchardState<BackendData>>,

@@ -235,9 +235,22 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 });
                 if let Some(surface) = surface {
                     keyboard.set_focus(self, Some(surface.into()), serial);
-                    keyboard.input::<(), _>(self, keycode, state, serial, time, |_, _, _| {
-                        FilterResult::Forward
-                    });
+                    // a key whose press triggered a shortcut (e.g. the Space of
+                    // Super+Space that opened this layer) is released here: drop
+                    // it from the suppressed set, or its next ordinary release
+                    // would be swallowed and the client would see it stuck down
+                    let was_suppressed = suppressed_keys.contains(&keycode);
+                    suppressed_keys.retain(|k| *k != keycode);
+                    self.suppressed_keys = suppressed_keys;
+                    if state == KeyState::Released && was_suppressed {
+                        keyboard.input::<(), _>(self, keycode, state, serial, time, |_, _, _| {
+                            FilterResult::Intercept(())
+                        });
+                    } else {
+                        keyboard.input::<(), _>(self, keycode, state, serial, time, |_, _, _| {
+                            FilterResult::Forward
+                        });
+                    }
                     return KeyAction::None;
                 };
             }
@@ -270,6 +283,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 // so that we can decide on a release if the key
                 // should be forwarded to the client or not.
                 if let KeyState::Pressed = state {
+                    // a fresh press means any earlier suppressed press of this
+                    // key was released somewhere we did not see
+                    suppressed_keys.retain(|k| *k != keycode);
                     if !inhibited {
                         let action = if st.protocols.locked {
                             // while locked only VT switching works
@@ -305,7 +321,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                         };
 
                         if action.is_some() {
-                            suppressed_keys.push(keysym);
+                            suppressed_keys.push(keycode);
                         }
 
                         action
@@ -317,9 +333,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 } else if st.switcher.is_some() && (keysym == Keysym::Super_L || keysym == Keysym::Super_R) {
                     FilterResult::Intercept(KeyAction::SwitcherCommit)
                 } else {
-                    let suppressed = suppressed_keys.contains(&keysym);
+                    let suppressed = suppressed_keys.contains(&keycode);
                     if suppressed {
-                        suppressed_keys.retain(|k| *k != keysym);
+                        suppressed_keys.retain(|k| *k != keycode);
                         FilterResult::Intercept(KeyAction::None)
                     } else {
                         FilterResult::Forward
