@@ -19,7 +19,7 @@ use smithay::{
     delegate_output, delegate_pointer_constraints, delegate_pointer_gestures, delegate_presentation,
     delegate_primary_selection, delegate_relative_pointer, delegate_seat, delegate_security_context,
     delegate_shm, delegate_tablet_manager, delegate_text_input_manager, delegate_viewporter,
-    delegate_virtual_keyboard_manager, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_virtual_keyboard_manager, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell, delegate_kde_decoration,
     desktop::{
         space::SpaceElement,
         utils::{
@@ -75,6 +75,7 @@ use smithay::{
             SelectionHandler,
         },
         shell::{
+            kde::decoration::{KdeDecorationHandler, KdeDecorationState},
             wlr_layer::WlrLayerShellState,
             xdg::{
                 decoration::{XdgDecorationHandler, XdgDecorationState},
@@ -148,6 +149,10 @@ pub struct OrchardState<BackendData: Backend + 'static> {
     pub viewporter_state: ViewporterState,
     pub xdg_activation_state: XdgActivationState,
     pub xdg_decoration_state: XdgDecorationState,
+    /// KDE's legacy server-decoration protocol. GTK 3/4 never bind
+    /// xdg-decoration, but they do read this one: with a "server" default mode,
+    /// GTK windows without a custom header bar drop their CSD for our title bar.
+    pub kde_decoration_state: KdeDecorationState,
     pub xdg_shell_state: XdgShellState,
     pub presentation_state: PresentationState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
@@ -512,6 +517,71 @@ impl<BackendData: Backend> XdgDecorationHandler for OrchardState<BackendData> {
 }
 delegate_xdg_decoration!(@<BackendData: Backend + 'static> OrchardState<BackendData>);
 
+impl<BackendData: Backend> OrchardState<BackendData> {
+    /// Apply a KDE server-decoration choice to the surface's xdg toplevel.
+    /// Only the pending xdg configure state changes; `ack_configure` then
+    /// flips the window's SSD flag exactly as it does for xdg-decoration.
+    fn apply_kde_decoration(&mut self, surface: &WlSurface, server_side: bool) {
+        use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        let Some(toplevel) = self
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|t| t.wl_surface() == surface)
+            .cloned()
+        else {
+            return;
+        };
+        let mode = if server_side { Mode::ServerSide } else { Mode::ClientSide };
+        let changed = toplevel.with_pending_state(|state| {
+            let changed = state.decoration_mode != Some(mode);
+            state.decoration_mode = Some(mode);
+            changed
+        });
+        if changed && toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+    }
+}
+
+use smithay::reexports::{
+    wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::{
+        Mode as KdeMode, OrgKdeKwinServerDecoration,
+    },
+    wayland_server::WEnum,
+};
+
+impl<BackendData: Backend> KdeDecorationHandler for OrchardState<BackendData> {
+    fn kde_decoration_state(&self) -> &KdeDecorationState {
+        &self.kde_decoration_state
+    }
+
+    fn new_decoration(&mut self, surface: &WlSurface, decoration: &OrgKdeKwinServerDecoration) {
+        decoration.mode(KdeMode::Server);
+        self.apply_kde_decoration(surface, true);
+    }
+
+    fn request_mode(
+        &mut self,
+        surface: &WlSurface,
+        decoration: &OrgKdeKwinServerDecoration,
+        mode: WEnum<KdeMode>,
+    ) {
+        // Honour the client: GTK asks for Client when the app has its own
+        // header bar (libadwaita, GtkHeaderBar), Server otherwise. "None" means
+        // undecorated, which for us is the same as client-side.
+        let WEnum::Value(mode) = mode else { return };
+        let server_side = mode == KdeMode::Server;
+        decoration.mode(if server_side { KdeMode::Server } else { mode });
+        self.apply_kde_decoration(surface, server_side);
+    }
+
+    fn release(&mut self, _decoration: &OrgKdeKwinServerDecoration, surface: &WlSurface) {
+        self.apply_kde_decoration(surface, false);
+    }
+}
+delegate_kde_decoration!(@<BackendData: Backend + 'static> OrchardState<BackendData>);
+
 delegate_xdg_shell!(@<BackendData: Backend + 'static> OrchardState<BackendData>);
 delegate_layer_shell!(@<BackendData: Backend + 'static> OrchardState<BackendData>);
 delegate_presentation!(@<BackendData: Backend + 'static> OrchardState<BackendData>);
@@ -676,6 +746,10 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         let viewporter_state = ViewporterState::new::<Self>(&dh);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        let kde_decoration_state = KdeDecorationState::new::<Self>(
+            &dh,
+            smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration_manager::Mode::Server,
+        );
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
         let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
@@ -762,6 +836,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             viewporter_state,
             xdg_activation_state,
             xdg_decoration_state,
+            kde_decoration_state,
             xdg_shell_state,
             presentation_state,
             fractional_scale_manager_state,
@@ -1307,5 +1382,10 @@ pub trait Backend {
     fn set_output_mode(&mut self, output: &Output, mode: smithay::output::Mode) -> bool {
         let _ = (output, mode);
         false
+    }
+    /// Variable Refresh Rate capability and live status `(supported, enabled)` for `output`.
+    fn output_vrr_info(&self, output: &Output) -> (bool, bool) {
+        let _ = output;
+        (false, false)
     }
 }
