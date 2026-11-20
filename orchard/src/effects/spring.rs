@@ -37,16 +37,6 @@ impl SpringParams {
         response: 0.5,
         damping: 1.0,
     };
-    /// Stage Manager glides and strip reveals: fluid macOS feel with subtle crispness.
-    pub const STAGE: SpringParams = SpringParams {
-        response: 0.36,
-        damping: 0.94,
-    };
-    /// Stage Manager hover tilt/scale response.
-    pub const STAGE_HOVER: SpringParams = SpringParams {
-        response: 0.20,
-        damping: 0.92,
-    };
 }
 
 #[derive(Debug, Clone, Copy)]

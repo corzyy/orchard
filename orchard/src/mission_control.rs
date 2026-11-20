@@ -359,17 +359,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     /// Windows Mission Control shows on a display: its current Space (only
     /// one app's windows for App Exposé), bottom to top, with their rects.
     fn mc_windows(&self, output: &Output, app: Option<&str>) -> Vec<(WindowElement, Rectangle<f64, Logical>)> {
-        let (active, _) = self.spaces.info(&output.name());
-        let mut out: Vec<(WindowElement, Rectangle<f64, Logical>)> = self
-            .stage
-            .strip_windows_for(&output.name(), active)
-            .into_iter()
-            .filter(|(w, _)| w.alive() && app.map(|a| w.app_id() == a).unwrap_or(true))
-            .map(|(w, loc)| {
-                let r = Rectangle::new(loc, w.geometry().size).to_f64();
-                (w, r)
-            })
-            .collect();
+        let mut out: Vec<(WindowElement, Rectangle<f64, Logical>)> = Vec::new();
         out.extend(
             self.space
                 .elements()
@@ -881,7 +871,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         // windows of each Space, bottom to top, with their locations
         let mut per_space: Vec<Vec<(WindowElement, Point<i32, Logical>)>> = Vec::new();
         for i in 0..count {
-            let mut v = self.stage.strip_windows_for(&name, i);
+            let mut v = Vec::new();
             if i == active {
                 v.extend(self.windows_on_output(output));
             } else {

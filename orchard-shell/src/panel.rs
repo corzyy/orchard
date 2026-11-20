@@ -29,14 +29,12 @@ pub const PULSE_WIFI: usize = 0;
 pub const PULSE_BT: usize = 1;
 pub const PULSE_DND: usize = 2;
 pub const PULSE_NIGHT: usize = 3;
-pub const PULSE_STAGE: usize = 4;
-pub const PULSE_GAME: usize = 5;
+pub const PULSE_GAME: usize = 4;
 
 struct PanelAnim {
     initialized: bool,
     dnd: SpringFloat,
     night_shift: SpringFloat,
-    stage_manager: SpringFloat,
     game_mode: SpringFloat,
     wifi: SpringFloat,
     ethernet: SpringFloat,
@@ -47,7 +45,7 @@ struct PanelAnim {
     vol: SpringFloat,
     displays: Vec<SpringFloat>,
     streams: Vec<SpringFloat>,
-    pulses: [Option<Instant>; 6],
+    pulses: [Option<Instant>; 5],
 }
 
 impl PanelAnim {
@@ -56,7 +54,6 @@ impl PanelAnim {
             initialized: false,
             dnd: SpringFloat::new(0.0, SpringParams::SWITCH),
             night_shift: SpringFloat::new(0.0, SpringParams::SWITCH),
-            stage_manager: SpringFloat::new(0.0, SpringParams::SWITCH),
             game_mode: SpringFloat::new(0.0, SpringParams::SWITCH),
             wifi: SpringFloat::new(0.0, SpringParams::SWITCH),
             ethernet: SpringFloat::new(0.0, SpringParams::SWITCH),
@@ -67,14 +64,13 @@ impl PanelAnim {
             vol: SpringFloat::new(0.0, SpringParams::SLIDER),
             displays: Vec::new(),
             streams: Vec::new(),
-            pulses: [None; 6],
+            pulses: [None; 5],
         }
     }
 
     fn is_animating(&self, now: Instant) -> bool {
         self.dnd.is_animating(now)
             || self.night_shift.is_animating(now)
-            || self.stage_manager.is_animating(now)
             || self.game_mode.is_animating(now)
             || self.wifi.is_animating(now)
             || self.ethernet.is_animating(now)
@@ -223,7 +219,6 @@ pub enum Target {
     ClearAll,
     Dnd,
     NightShift,
-    StageManager,
     GameMode,
     WifiToggle,
     EthernetToggle,
@@ -288,8 +283,6 @@ pub struct Panel {
     pub dragging: Option<Target>,
     /// Night Shift on right now (schedule or manual switch)
     pub night_shift: bool,
-    /// Stage Manager active right now
-    pub stage_manager: bool,
     /// Game Mode switches on by itself for full-screen games
     pub game_mode_enabled: bool,
     /// the game Game Mode is on for
@@ -322,7 +315,6 @@ impl Panel {
             network_hint: Network::Offline,
             dragging: None,
             night_shift: false,
-            stage_manager: false,
             game_mode_enabled: true,
             game_active: None,
             anim: PanelAnim::new(),
@@ -436,7 +428,6 @@ impl Panel {
     fn sync_springs(&mut self, center: &Center, now: Instant) {
         let dnd = if center.do_not_disturb { 1.0 } else { 0.0 };
         let night = if self.night_shift { 1.0 } else { 0.0 };
-        let stage = if self.stage_manager { 1.0 } else { 0.0 };
         let game = if self.game_mode_enabled || self.game_active.is_some() { 1.0 } else { 0.0 };
         let wifi = if self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false) { 1.0 } else { 0.0 };
         let eth = if self.control.ethernet_connected() || (self.control.ethernet.is_empty() && self.network_hint == Network::Wired) {
@@ -452,7 +443,6 @@ impl Panel {
         if !self.anim.initialized {
             self.anim.dnd.snap(dnd);
             self.anim.night_shift.snap(night);
-            self.anim.stage_manager.snap(stage);
             self.anim.game_mode.snap(game);
             self.anim.wifi.snap(wifi);
             self.anim.ethernet.snap(eth);
@@ -477,7 +467,6 @@ impl Panel {
 
         self.anim.dnd.set_target(dnd, now);
         self.anim.night_shift.set_target(night, now);
-        self.anim.stage_manager.set_target(stage, now);
         self.anim.game_mode.set_target(game, now);
         self.anim.wifi.set_target(wifi, now);
         self.anim.ethernet.set_target(eth, now);
@@ -834,7 +823,6 @@ impl Panel {
 
         // compute target height and morph container smoothly from previous view
         let mut target_h = pad + 110.0 + pad;
-        target_h += 50.0 + pad; // stage manager
         target_h += GAME_CARD_H + pad;
         let disp_count = self.control.displays.len();
         if disp_count == 1 {
@@ -862,7 +850,6 @@ impl Panel {
         let bt_t = self.anim.bluetooth.sample(now).clamp(0.0, 1.0);
         let dnd_t = self.anim.dnd.sample(now).clamp(0.0, 1.0);
         let night_t = self.anim.night_shift.sample(now).clamp(0.0, 1.0);
-        let sm_t = self.anim.stage_manager.sample(now).clamp(0.0, 1.0);
         let game_t = self.anim.game_mode.sample(now).clamp(0.0, 1.0);
         let vol_val = self.anim.vol.sample(now).clamp(0.0, 1.0);
 
@@ -1020,30 +1007,8 @@ impl Panel {
             self.targets.push(((fx, cy0, half, card_h), target));
         }
 
-        // Stage Manager: quick toggle card (macOS Control Center)
-        let sm_y = y + 110.0 + pad;
-        let sm_h = 50.0;
-        {
-            let sm_on = self.stage_manager;
-            let hovered = self.hovered(inner_x, sm_y, inner_w, sm_h);
-            fill_rounded(pm, inner_x * s, sm_y * s, inner_w * s, sm_h * s, 14.0 * s, if hovered && !sm_on { hover_bg } else { card });
-            stroke_rounded(pm, inner_x * s, sm_y * s, inner_w * s, sm_h * s, 14.0 * s, 0.75 * s, card_border);
-            let (cx, cy) = (inner_x + 22.0, sm_y + sm_h / 2.0);
-            let (ps, _) = tap_scale(self.anim.pulses[PULSE_STAGE], now);
-            fill_circle(pm, cx * s, cy * s, 14.0 * ps * s, lerp_rgba(off, accent, sm_t));
-            stage_manager_glyph(pm, cx * s, cy * s, 6.8 * ps * s, lerp_rgba(text, [255, 255, 255, 255], sm_t));
-            let tx = inner_x + 42.0;
-            let maxw = inner_w - 104.0;
-            let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
-            fonts.draw(pm, &fonts.elide("Stage Manager", 12.0 * s, Weight::Bold, maxw * s), tx * s, b1, 12.0 * s, Weight::Bold, text);
-            let b2 = fonts.baseline_centered((cy + 1.0) * s, 14.0 * s, 11.0 * s, Weight::Regular);
-            fonts.draw(pm, if sm_on { t("On", "Ein") } else { t("Off", "Aus") }, tx * s, b2, 11.0 * s, Weight::Regular, sub);
-            switch_anim(pm, s, inner_x + inner_w - 50.0, sm_y + (sm_h - 22.0) / 2.0, sm_t, accent, dark);
-            self.targets.push(((inner_x, sm_y, inner_w, sm_h), Target::StageManager));
-        }
-
-        // Game Mode: full width under Stage Manager
-        let gy = sm_y + sm_h + pad;
+        // Game Mode: full width under the toggles
+        let gy = y + 110.0 + pad;
         {
             let on = self.game_mode_enabled;
             let hovered = self.hovered(inner_x, gy, inner_w, GAME_CARD_H);
@@ -2141,25 +2106,6 @@ pub fn sun(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
         };
         pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
     }
-}
-
-/// macOS Stage Manager glyph: three stacked recent tiles on the left + main window on the right.
-pub fn stage_manager_glyph(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
-    let left_x = cx - r * 1.02;
-    let tile_w = r * 0.42;
-    let tile_h = r * 0.34;
-    let gap = r * 0.16;
-    let total_h = tile_h * 3.0 + gap * 2.0;
-    let top_y = cy - total_h / 2.0;
-    for i in 0..3 {
-        let ty = top_y + i as f32 * (tile_h + gap);
-        fill_rounded(pm, left_x, ty, tile_w, tile_h, r * 0.12, c);
-    }
-    let main_x = left_x + tile_w + r * 0.24;
-    let main_w = r * 1.38;
-    let main_h = total_h * 0.92;
-    let main_y = cy - main_h / 2.0;
-    stroke_rounded(pm, main_x, main_y, main_w, main_h, r * 0.24, (r * 0.22).max(1.2), c);
 }
 
 fn bluetooth(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {

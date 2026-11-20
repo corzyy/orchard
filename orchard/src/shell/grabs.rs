@@ -68,12 +68,10 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
                 return;
             }
             self.dragged = true;
-            // dragging a tiled / zoomed window away gives it its old size back (floating mode only)
-            if !data.is_tiling_mode() {
-                if let Some(loc) = data.restore_for_drag(&self.window, event.location) {
-                    self.initial_window_location = loc;
-                    self.start_data.location = event.location;
-                }
+            // dragging a tiled / zoomed window away gives it its old size back
+            if let Some(loc) = data.restore_for_drag(&self.window, event.location) {
+                self.initial_window_location = loc;
+                self.start_data.location = event.location;
             }
         }
 
@@ -82,10 +80,7 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
 
         data.space
             .map_element(self.window.clone(), new_location.to_i32_round(), true);
-        if !data.is_tiling_mode() {
-            data.stage_on_live_drag_motion(&self.window, event.location);
-            self.tile = data.update_tile_preview(&self.window, event.location, self.initial_window_location, self.tile);
-        }
+        self.tile = data.update_tile_preview(&self.window, event.location, self.initial_window_location, self.tile);
     }
 
     fn relative_motion(
@@ -107,26 +102,9 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             data.clear_tile_preview();
-            if data.is_tiling_mode() {
-                if self.dragged {
-                    let window = self.window.clone();
-                    // `handle`, not `data.pointer`: the pointer mutex is held for the
-                    // whole grab callback, so locking it again deadlocks the compositor
-                    let pointer = handle.current_location();
-                    data.dwindle_drop_drag(&window, pointer);
-                }
-            } else {
-                let window = self.window.clone();
-                let pointer = handle.current_location();
-                let peeled = self.dragged && data.stage_on_live_drag_end(&window, pointer);
-                if !peeled {
-                    if let Some((tile, area)) = self.tile.take() {
-                        data.tile_window_in(&window, tile, area);
-                        if let Some(o) = data.window_output(&window) {
-                            data.stage_update_autohide(&o);
-                        }
-                    }
-                }
+            let window = self.window.clone();
+            if let Some((tile, area)) = self.tile.take() {
+                data.tile_window_in(&window, tile, area);
             }
             // No more buttons are pressed, release the grab.
             handle.unset_grab(self, data, event.serial, event.time, true);
@@ -228,7 +206,6 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
 
     fn unset(&mut self, data: &mut OrchardState<BackendData>) {
         data.clear_tile_preview();
-        data.stage.peel_target = None;
         reset_grab_cursor(data);
     }
 }
@@ -704,9 +681,6 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
     }
 
     fn unset(&mut self, data: &mut OrchardState<BackendData>) {
-        if let Some(o) = data.window_output(&self.window) {
-            data.stage_update_autohide(&o);
-        }
         reset_grab_cursor(data);
     }
 }

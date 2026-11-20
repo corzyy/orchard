@@ -107,15 +107,6 @@ impl Theme {
             t.dock_tint = dock;
             t.menu_bg = menu;
             t.tooltip_bg[3] = 255;
-        } else if s.appearance.blur_style == orchard_config::BlurStyle::LiquidGlass {
-            // Liquid Glass lets the (refracting) desktop show through: the
-            // tint thins out as transparency goes up. Stays below 255 so
-            // panels never count as "solid".
-            let k = 1.5 - 1.4 * s.appearance.glass_transparency();
-            let thin = |c: &mut Rgba| c[3] = (c[3] as f32 * k).round().clamp(0.0, 250.0) as u8;
-            thin(&mut t.bar_tint);
-            thin(&mut t.dock_tint);
-            thin(&mut t.menu_bg);
         }
         t
     }

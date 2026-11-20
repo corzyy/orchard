@@ -44,40 +44,38 @@ impl App {
                 self.redraw(Which::Bar);
             }
         }
-        let until = Instant::now() + osd::SHOW_FOR;
-        self.osd = Some(osd::Osd { level, until });
-        match self.osd_surf.as_ref() {
-            Some(s) if s.configured => self.draw(Which::Osd),
-            Some(_) => {}
-            None => {
-                let surface = self.compositor.create_surface(&self.qh);
-                let layer = self.layer_shell.create_layer_surface(
-                    &self.qh,
-                    surface,
-                    Layer::Overlay,
-                    Some("orchard-osd"),
-                    self.output.as_ref(),
-                );
-                layer.set_size(osd::SIZE, osd::SIZE);
-                layer.set_anchor(Anchor::BOTTOM);
-                layer.set_margin(0, 0, osd::BOTTOM_MARGIN, 0);
-                layer.set_exclusive_zone(-1);
-                layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-                // clicks go through
-                if let Ok(region) = Region::new(&self.compositor) {
-                    layer.wl_surface().set_input_region(Some(region.wl_region()));
-                }
-                layer.commit();
-                self.osd_surf = Some(Surf::new(layer));
-                let sz = osd::SIZE as f32;
-                self.set_backdrop("orchard-osd", Some((0.0, 0.0, sz, sz, 22.0)));
+        if let (Some(o), Some(_)) = (self.osd.as_mut(), self.osd_surf.as_ref()) {
+            o.update(level);
+            self.redraw(Which::Osd);
+        } else {
+            self.osd = Some(osd::Osd::new(level));
+            let surface = self.compositor.create_surface(&self.qh);
+            let layer = self.layer_shell.create_layer_surface(
+                &self.qh,
+                surface,
+                Layer::Overlay,
+                Some("orchard-osd"),
+                self.output.as_ref(),
+            );
+            layer.set_size(osd::SURF_W, osd::SURF_H);
+            layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
+            // below the menu bar (its exclusive zone already offsets us)
+            layer.set_margin(0, 0, 0, 0);
+            layer.set_exclusive_zone(0);
+            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            // clicks go through
+            if let Ok(region) = Region::new(&self.compositor) {
+                layer.wl_surface().set_input_region(Some(region.wl_region()));
             }
+            layer.commit();
+            self.osd_surf = Some(Surf::new(layer));
         }
         let _ = self.loop_handle.insert_source(Timer::from_duration(osd::SHOW_FOR), |_, _, app: &mut App| {
-            if app.osd.as_ref().map(|o| o.until <= Instant::now()).unwrap_or(false) {
-                app.osd = None;
-                app.osd_surf = None;
-                app.set_backdrop("orchard-osd", None);
+            if let Some(o) = app.osd.as_mut() {
+                if o.until <= Instant::now() && !o.closing {
+                    o.begin_close();
+                    app.redraw(Which::Osd);
+                }
             }
             TimeoutAction::Drop
         });

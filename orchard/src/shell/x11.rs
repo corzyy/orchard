@@ -88,23 +88,6 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
                 self.animate_close(&elem);
             }
             self.space.unmap_elem(&elem);
-            if !window.is_override_redirect() {
-                self.stage_on_window_removed(&elem);
-                if self.is_tiling_mode() {
-                    self.dwindle.remove_everywhere(elem.ipc_id().0);
-                    self.retile_all();
-                }
-            }
-        } else if !window.is_override_redirect() {
-            let staged = self
-                .stage
-                .all_staged_windows()
-                .into_iter()
-                .find(|(_, _, sw)| matches!(sw.window.0.x11_surface(), Some(w) if w == &window))
-                .map(|(_, _, sw)| sw.window.clone());
-            if let Some(w) = staged {
-                self.stage_on_window_removed(&w);
-            }
         }
         self.minimized
             .retain(|e| !matches!(e.0.x11_surface(), Some(w) if w == &window));

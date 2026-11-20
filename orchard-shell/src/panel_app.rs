@@ -52,7 +52,6 @@ impl App {
             p.network_hint = self.menubar.network;
             let settings = orchard_config::Settings::load();
             p.night_shift = settings.night_shift.active_now();
-            p.stage_manager = settings.stage_manager.enabled;
             p.game_mode_enabled = settings.game_mode.enabled;
             p.game_active = self.game.clone();
             if let Some(sub) = submenu {
@@ -254,33 +253,6 @@ impl App {
         self.redraw(Which::Panel);
     }
 
-    /// Control Center → Stage Manager: toggle macOS-style Stage Manager on/off.
-    pub(crate) fn toggle_stage_manager(&mut self) {
-        let mut s = orchard_config::Settings::load();
-        let on = !s.stage_manager.enabled;
-        s.stage_manager.enabled = on;
-        let tiling_changed = on && s.windows.tiling_mode == orchard_config::TilingMode::Tiling;
-        if tiling_changed {
-            s.windows.tiling_mode = orchard_config::TilingMode::Floating;
-            self.menubar.tiling_mode = orchard_config::TilingMode::Floating;
-        }
-        if let Err(e) = s.save() {
-            tracing::warn!("saving stage manager: {e}");
-            return;
-        }
-        if let Some(p) = self.panel.as_mut() {
-            p.stage_manager = on;
-            p.pulse(panel::PULSE_STAGE);
-        }
-        if let Some(ipc) = self.ipc.as_mut() {
-            ipc.request("reload_settings", serde_json::json!({}));
-        }
-        if tiling_changed {
-            self.redraw(Which::Bar);
-        }
-        self.redraw(Which::Panel);
-    }
-
     /// Control Center → Game Mode: switch the automatic Game Mode on or off.
     pub(crate) fn toggle_game_mode(&mut self) {
         let mut s = orchard_config::Settings::load();
@@ -415,7 +387,6 @@ impl App {
                     Target::Panel => {}
                     Target::Dnd => self.toggle_dnd(),
                     Target::NightShift => self.toggle_night_shift(),
-                    Target::StageManager => self.toggle_stage_manager(),
                     Target::GameMode => self.toggle_game_mode(),
                     Target::ClearAll => {
                         let ids = self.notes.clear_history();

@@ -177,6 +177,8 @@ pub struct Runtime {
     pub idle_locked: bool,
     /// Last observed `(mtime, len)` of `settings.json` for live auto-reload.
     pub settings_stamp: Option<FileStamp>,
+    /// Snapping gaps last applied, so a change refits tiled/zoomed windows.
+    pub tiling_cfg: orchard_config::TilingSettings,
 }
 
 impl Default for Runtime {
@@ -186,6 +188,7 @@ impl Default for Runtime {
             last_activity: std::time::Instant::now(),
             idle_locked: false,
             settings_stamp: settings_file_stamp(),
+            tiling_cfg: orchard_config::TilingSettings::default(),
         }
     }
 }
@@ -279,29 +282,11 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
         }
 
-        // tiling mode (Floating <-> Dwindle)
-        if s.windows.tiling_mode != self.dwindle.mode {
-            self.dwindle.mode = s.windows.tiling_mode;
-            match s.windows.tiling_mode {
-                orchard_config::TilingMode::Tiling => {
-                    if self.stage.enabled {
-                        self.stage_manager_disable();
-                    }
-                    self.retile_all();
-                }
-                orchard_config::TilingMode::Floating => self.untile_all_dwindle(),
-            }
-        } else if scaled || s.tiling.clamped() != self.dwindle.cfg.clamped() {
-            self.dwindle.cfg = s.tiling.clone();
+        // snapping gaps or display scale changed: refit tiled/zoomed windows
+        let tiling = s.tiling.clamped();
+        if scaled || tiling != self.prefs_rt.tiling_cfg {
+            self.prefs_rt.tiling_cfg = tiling;
             self.refit_all_windows();
-        }
-        self.dwindle.cfg = s.tiling.clone();
-
-        // Stage Manager (mutually exclusive with Dwindle Tiling mode)
-        if s.windows.tiling_mode == orchard_config::TilingMode::Floating {
-            self.stage_apply_settings(&s.stage_manager);
-        } else if self.stage.enabled {
-            self.stage_manager_disable();
         }
 
         // pointer theme, and the appearance settings apps read
@@ -379,7 +364,6 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
         self.update_fs_reveal(pos);
         self.fs_reveal_cursor(pos);
-        self.stage_pointer_motion(pos);
         self.check_hot_corner(pos);
         if FOCUS_FOLLOWS_MOUSE.load(Ordering::Relaxed) {
             self.focus_under_pointer(pos);

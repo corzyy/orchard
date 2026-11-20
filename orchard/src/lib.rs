@@ -31,7 +31,6 @@ pub mod session;
 pub mod settings;
 pub mod shell;
 pub mod spaces;
-pub mod stage_manager;
 pub mod watchdog;
 pub mod tiling;
 pub mod state;

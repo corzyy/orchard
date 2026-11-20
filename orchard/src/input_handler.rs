@@ -201,16 +201,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 self.ipc_broadcast(&crate::ipc::Event::LaunchpadToggle)
             }
             KeyAction::AppExpose => self.toggle_mission_control(true),
-            KeyAction::ToggleStageManager => {
-                let mut s = orchard_config::Settings::load();
-                let on = !self.stage.enabled;
-                s.stage_manager.enabled = on;
-                if on && s.windows.tiling_mode == orchard_config::TilingMode::Tiling {
-                    s.windows.tiling_mode = orchard_config::TilingMode::Floating;
-                }
-                let _ = s.save();
-                self.reload_settings();
-            }
             KeyAction::CycleWindows => {
                 let bottom = self.space.elements().next().cloned();
                 if let Some(bottom) = bottom {
@@ -401,9 +391,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if self.tile_menu_button(button, state == wl_pointer::ButtonState::Pressed) {
             return;
         }
-        if self.stage_pointer_button(button, state == wl_pointer::ButtonState::Pressed) {
-            return;
-        }
         if wl_pointer::ButtonState::Pressed == state {
             // Super + left/right/middle: move / resize / raise-lower (KWin style)
             let logo = self.seat.get_keyboard().map(|k| k.modifier_state().logo).unwrap_or(false);
@@ -557,9 +544,8 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             }
         }
 
-        // Keep the per-output LayerMap mutex strictly scoped: `stage_owns_pointer`
-        // below also locks `layer_map_for_output`, which would self-deadlock if
-        // `layers` were held across it.
+        // Keep the per-output LayerMap mutex strictly scoped: looking up the
+        // pointer target below locks `layer_map_for_output` again.
         {
             let layers = layer_map_for_output(output);
             if let Some(focus) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, local)
@@ -568,10 +554,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             {
                 return Some(focus);
             }
-        }
-
-        if self.stage_owns_pointer(pos) {
-            return None;
         }
 
         if let Some(focus) = self.space.element_under(pos).and_then(|(window, loc)| {
@@ -821,9 +803,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if self.tile_menu_button(button, pressed) {
             return;
         }
-        if self.stage_pointer_button(button, pressed) {
-            return;
-        }
         let serial = SCOUNTER.next_serial();
         if pressed {
             let logo = self.seat.get_keyboard().map(|k| k.modifier_state().logo).unwrap_or(false)
@@ -867,7 +846,6 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             "move-space-right" => KeyAction::MoveToSpace(1),
             "mission-control" => KeyAction::MissionControl,
             "app-expose" => KeyAction::AppExpose,
-            "stage-manager" => KeyAction::ToggleStageManager,
             "switcher-next" => KeyAction::Switcher(true),
             "switcher-commit" => KeyAction::SwitcherCommit,
             "launcher" => KeyAction::Launcher,
@@ -1729,8 +1707,6 @@ enum KeyAction {
     MissionControl,
     /// Super+Down: windows of the focused app
     AppExpose,
-    /// Toggle macOS-style Stage Manager
-    ToggleStageManager,
     /// Super+Tab (true) / Super+Shift+Tab (false)
     Switcher(bool),
     /// Super released while the switcher is open

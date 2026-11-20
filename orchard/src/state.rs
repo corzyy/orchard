@@ -192,10 +192,6 @@ pub struct OrchardState<BackendData: Backend + 'static> {
     pub ipc: crate::ipc::IpcState,
     /// Spaces (virtual desktops) per output.
     pub spaces: crate::spaces::Spaces,
-    /// macOS-style Stage Manager state.
-    pub stage: crate::stage_manager::StageManager,
-    /// Hyprland-style dwindle tiling state (per output & Space).
-    pub dwindle: crate::tiling::DwindleState,
     /// Mission Control / App Exposé while open.
     pub mc: Option<crate::mission_control::MissionControl>,
     /// headless tests: act as if Super were held for mouse buttons
@@ -898,8 +894,6 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             fx: Default::default(),
             ipc: Default::default(),
             spaces: Default::default(),
-            stage: crate::stage_manager::StageManager::new(crate::settings::get().stage_manager.enabled),
-            dwindle: crate::tiling::DwindleState::new(crate::settings::get().windows.tiling_mode),
             mc: None,
             fake_logo: false,
             switcher: None,

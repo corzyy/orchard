@@ -206,13 +206,11 @@ pub fn device<'a, M: 'a>(is_laptop: bool) -> Element<'a, M> {
     })
 }
 
-// ---------------------------------------------------------------- Tiling preview
+// ---------------------------------------------------------------- Snap preview
 
 /// A miniature 16:9 desktop that lays out a few windows the way the compositor
-/// will with `t`: snapped halves / quarters in Floating mode, a dwindle spiral
-/// in Tiling mode. Gaps and split ratio follow the settings live.
-pub fn tiling_preview<'a, M: 'a>(t: &orchard_config::TilingSettings, tiling: bool) -> Element<'a, M> {
-    use orchard_config::SplitDirection;
+/// will with `t`: snapped halves / quarters. Gaps follow the settings live.
+pub fn tiling_preview<'a, M: 'a>(t: &orchard_config::TilingSettings) -> Element<'a, M> {
     let p = palette();
     let t = t.clamped();
     art(Length::Fill, 176.0, move |f, r| {
@@ -246,16 +244,7 @@ pub fn tiling_preview<'a, M: 'a>(t: &orchard_config::TilingSettings, tiling: boo
             }
         };
 
-        let wins: Vec<Rectangle> = if tiling {
-            let dir = |a: Rectangle| match t.split_direction {
-                SplitDirection::Auto => a.width >= a.height,
-                SplitDirection::Horizontal => true,
-                SplitDirection::Vertical => false,
-            };
-            let (a, rest) = split(inner, dir(inner), t.split_ratio);
-            let (b, c) = split(rest, dir(rest), t.split_ratio);
-            vec![a, b, c]
-        } else {
+        let wins: Vec<Rectangle> = {
             // snapped: left half + two right quarters
             let (l, rt) = split(inner, true, 0.5);
             let (tr, br) = split(rt, false, 0.5);

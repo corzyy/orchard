@@ -13,7 +13,7 @@ use iced::alignment::Horizontal;
 use iced::widget::image::Handle;
 use iced::widget::{button, column, container, hover, row, text, Image, Space};
 use iced::{Alignment, Color, ContentFit, Length, Theme};
-use orchard_config::{Accent, BlurStyle, Settings, ThemeMode};
+use orchard_config::{Accent, Settings, ThemeMode};
 use orchard_ui::icons::{self, Symbol};
 use orchard_ui::palette::{from_rgb, mix};
 use orchard_ui::text::truncate;
@@ -211,37 +211,8 @@ pub fn appearance(s: &Settings, st: &mut AppearanceState, wake: &Wake) -> El {
                 edit(move |s| s.appearance.icon_theme = (!v.is_empty()).then(|| v.clone()))
             }),
         ]),
-        form::section("Glass"),
-        glass_group(s),
     ]
     .into()
-}
-
-/// Blur style of the menu bar, Dock, menus and popups, plus the Liquid Glass
-/// transparency.
-fn glass_group(s: &Settings) -> El {
-    let a = &s.appearance;
-    let styles = [BlurStyle::Kawase, BlurStyle::LiquidGlass].map(|b| (b, b.name().to_string()));
-    let mut rows = vec![form::row(
-        "Blur style",
-        some(match a.blur_style {
-            BlurStyle::Kawase => "Soft frosted glass",
-            BlurStyle::LiquidGlass => "Clear glass that bends light at its edges",
-        }),
-        controls::segmented(styles.to_vec(), &a.blur_style, |b| edit(move |s| s.appearance.blur_style = b)),
-    )];
-    if a.blur_style == BlurStyle::LiquidGlass {
-        rows.push(form::slider_row(
-            "Transparency",
-            a.reduce_transparency.then(|| "Off while Reduce transparency is on".to_string()),
-            0.0..=1.0,
-            a.glass_transparency() as f64,
-            0.05,
-            Some(("Frosted", "Clear")),
-            |v| edit(move |s| s.appearance.glass_transparency = ((v * 20.0).round() / 20.0) as f32),
-        ));
-    }
-    form::group(rows)
 }
 
 pub fn accessibility(s: &Settings, st: &mut AppearanceState, wake: &Wake) -> El {

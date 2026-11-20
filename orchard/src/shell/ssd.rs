@@ -37,8 +37,6 @@ pub struct WindowState {
     pub restore_geometry: Option<Rectangle<i32, Logical>>,
     /// tiled to a screen half / quarter (see tiling.rs)
     pub tile: Option<crate::tiling::Tile>,
-    /// managed by the Hyprland-style dwindle tiling layout
-    pub dwindled: bool,
     /// hidden with ⌘H (kept in the minimized list, but not shown in the Dock)
     pub hidden: bool,
     pub chrome: WindowChrome,
@@ -269,7 +267,6 @@ impl WindowElement {
                 header_bar: HeaderBar::default(),
                 restore_geometry: None,
                 tile: None,
-                dwindled: false,
                 hidden: false,
                 chrome: WindowChrome::default(),
             })

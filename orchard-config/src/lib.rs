@@ -87,10 +87,6 @@ pub struct AppearanceSettings {
     pub reduce_motion: bool,
     /// Draw panels with solid colours instead of frosted glass.
     pub reduce_transparency: bool,
-    /// Look of the glass behind the menu bar, Dock, menus and popups.
-    pub blur_style: BlurStyle,
-    /// Liquid Glass transparency, 0.0 (frosted) ..= 1.0 (clear).
-    pub glass_transparency: f32,
     /// Window corner radius in logical px.
     pub corner_radius: f32,
     /// Icon theme for Orchard and the apps running in it.
@@ -123,30 +119,6 @@ impl AppearanceSettings {
     pub fn cursor_size(&self) -> u32 {
         if (8..=256).contains(&self.cursor_size) { self.cursor_size } else { 24 }
     }
-    /// [`Self::glass_transparency`], clamped to 0..=1.
-    pub fn glass_transparency(&self) -> f32 {
-        if self.glass_transparency.is_finite() { self.glass_transparency.clamp(0.0, 1.0) } else { 0.5 }
-    }
-}
-
-/// How shell panels render the desktop behind them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum BlurStyle {
-    /// Dual Kawase frosted glass.
-    #[default]
-    Kawase,
-    /// Lighter blur with refracting edges and a specular rim (macOS Tahoe).
-    LiquidGlass,
-}
-
-impl BlurStyle {
-    pub fn name(self) -> &'static str {
-        match self {
-            BlurStyle::Kawase => "Kawase",
-            BlurStyle::LiquidGlass => "Liquid Glass",
-        }
-    }
 }
 
 impl Default for AppearanceSettings {
@@ -157,8 +129,6 @@ impl Default for AppearanceSettings {
             wallpaper_accent: None,
             reduce_motion: false,
             reduce_transparency: false,
-            blur_style: BlurStyle::Kawase,
-            glass_transparency: 0.5,
             corner_radius: 10.0,
             icon_theme: None,
             cursor_theme: None,
@@ -184,48 +154,14 @@ pub enum TitlebarDoubleClick {
     Nothing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum TilingMode {
-    #[default]
-    Floating,
-    Tiling,
-}
-
-/// Where a new window goes in Tiling mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum NewWindowPlacement {
-    /// Splits the focused window.
-    #[default]
-    Focused,
-    /// Goes to the end of the layout (the tail of the spiral).
-    Last,
-}
-
-/// Which way Tiling mode splits a pane for a new window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum SplitDirection {
-    /// Along the longer side of the pane (dwindle).
-    #[default]
-    Auto,
-    /// Side by side.
-    Horizontal,
-    /// Stacked.
-    Vertical,
-}
-
-/// Floating-mode snapping and Tiling-mode layout.
+/// Floating-mode window snapping.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TilingSettings {
-    // ---- shared
     /// Margin between tiles and the screen edges, logical px.
     pub outer_gap: i32,
     /// Space between two tiles, logical px.
     pub inner_gap: i32,
-    // ---- floating
     /// Dragging a window against a screen edge tiles it.
     pub snap_to_edges: bool,
     /// Show the translucent drop preview while dragging.
@@ -234,13 +170,6 @@ pub struct TilingSettings {
     pub snap_corners: bool,
     /// How close to the edge (px) the pointer must get to snap.
     pub edge_zone: i32,
-    // ---- tiling
-    /// No gaps when a display has a single window.
-    pub smart_gaps: bool,
-    /// Share of a pane the existing window keeps when it splits, 0.3..=0.7.
-    pub split_ratio: f32,
-    pub split_direction: SplitDirection,
-    pub new_window: NewWindowPlacement,
 }
 
 impl TilingSettings {
@@ -252,7 +181,6 @@ impl TilingSettings {
         t.outer_gap = t.outer_gap.clamp(0, Self::GAP_MAX);
         t.inner_gap = t.inner_gap.clamp(0, Self::GAP_MAX);
         t.edge_zone = t.edge_zone.clamp(8, 120);
-        t.split_ratio = if t.split_ratio.is_finite() { t.split_ratio.clamp(0.3, 0.7) } else { 0.5 };
         t
     }
 }
@@ -266,10 +194,6 @@ impl Default for TilingSettings {
             snap_preview: true,
             snap_corners: true,
             edge_zone: 32,
-            smart_gaps: false,
-            split_ratio: 0.5,
-            split_direction: SplitDirection::Auto,
-            new_window: NewWindowPlacement::Focused,
         }
     }
 }
@@ -366,7 +290,6 @@ pub struct MenuBarSettings {
     pub show_network: bool,
     pub show_volume: bool,
     pub show_battery: bool,
-    pub show_tiling: bool,
 }
 
 impl Default for MenuBarSettings {
@@ -380,7 +303,6 @@ impl Default for MenuBarSettings {
             show_network: true,
             show_volume: true,
             show_battery: true,
-            show_tiling: true,
         }
     }
 }
@@ -393,8 +315,6 @@ pub struct WindowSettings {
     pub focus_follows_mouse: bool,
     /// Show files and folders from ~/Desktop on the desktop background.
     pub show_desktop_icons: bool,
-    /// Window layout mode: Floating (macOS-style) or Tiling (dwindle).
-    pub tiling_mode: TilingMode,
 }
 
 impl Default for WindowSettings {
@@ -403,7 +323,6 @@ impl Default for WindowSettings {
             double_click_titlebar: TitlebarDoubleClick::Zoom,
             focus_follows_mouse: false,
             show_desktop_icons: true,
-            tiling_mode: TilingMode::Floating,
         }
     }
 }
@@ -950,43 +869,6 @@ pub fn kelvin_to_rgb(kelvin: f32) -> [f32; 3] {
     [0, 1, 2].map(|i| (c[i] / white[i]).clamp(0.0, 1.0))
 }
 
-/// How Stage Manager groups windows of the same application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum StageAppWindows {
-    /// All windows of an app appear together in one stage (macOS default).
-    #[default]
-    AllAtOnce,
-    /// Each window forms its own stage.
-    OneAtATime,
-}
-
-/// macOS-style Stage Manager settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct StageManagerSettings {
-    /// Master toggle (also switchable from Control Center).
-    pub enabled: bool,
-    /// Keep the recent-apps strip visible along the side (when false, it
-    /// reveals on screen-edge hover).
-    pub show_recent_apps: bool,
-    /// Clicking empty wallpaper moves the active stage aside to reveal desktop items.
-    pub click_wallpaper_to_reveal: bool,
-    /// Show all windows of an app at once, or one at a time.
-    pub app_windows: StageAppWindows,
-}
-
-impl Default for StageManagerSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            show_recent_apps: true,
-            click_wallpaper_to_reveal: true,
-            app_windows: StageAppWindows::AllAtOnce,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
@@ -995,7 +877,6 @@ pub struct Settings {
     pub menu_bar: MenuBarSettings,
     pub windows: WindowSettings,
     pub tiling: TilingSettings,
-    pub stage_manager: StageManagerSettings,
     pub keyboard: KeyboardSettings,
     pub pointer: PointerSettings,
     pub desktop: DesktopSettings,
@@ -1287,21 +1168,16 @@ mod tests {
     }
 
     #[test]
-    fn stage_manager_settings_round_trip() {
-        let mut s = Settings::default();
-        assert!(!s.stage_manager.enabled);
-        assert!(s.stage_manager.show_recent_apps);
-        assert!(s.stage_manager.click_wallpaper_to_reveal);
-        assert_eq!(s.stage_manager.app_windows, StageAppWindows::AllAtOnce);
-
-        s.stage_manager.enabled = true;
-        s.stage_manager.show_recent_apps = false;
-        s.stage_manager.click_wallpaper_to_reveal = false;
-        s.stage_manager.app_windows = StageAppWindows::OneAtATime;
-        let json = serde_json::to_string(&s).unwrap();
-        let (loaded, problems) = Settings::from_json_lenient(&json);
+    fn removed_keys_still_load() {
+        let json = r#"{
+            "appearance": {"blur_style": "liquid_glass", "glass_transparency": 0.7},
+            "menu_bar": {"show_tiling": false},
+            "windows": {"tiling_mode": "tiling"},
+            "tiling": {"smart_gaps": true, "split_ratio": 0.6, "split_direction": "vertical", "new_window": "last"},
+            "stage_manager": {"enabled": true}
+        }"#;
+        let (_, problems) = Settings::from_json_lenient(json);
         assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(loaded.stage_manager, s.stage_manager);
     }
 
     #[test]
@@ -1311,11 +1187,11 @@ mod tests {
         mine.dock.icon_size = 64.0;
         let mut disk = base.clone();
         disk.night_shift.warmth = 0.9;
-        disk.windows.tiling_mode = TilingMode::Tiling;
+        disk.windows.focus_follows_mouse = true;
         let merged = merge_settings(&base, &mine, &disk);
         assert_eq!(merged.dock.icon_size, 64.0, "my edit applied");
         assert_eq!(merged.night_shift.warmth, 0.9, "other writer kept");
-        assert_eq!(merged.windows.tiling_mode, TilingMode::Tiling);
+        assert!(merged.windows.focus_follows_mouse);
         // both changed the same field: the editor (latest user action) wins
         disk.dock.icon_size = 40.0;
         assert_eq!(merge_settings(&base, &mine, &disk).dock.icon_size, 64.0);

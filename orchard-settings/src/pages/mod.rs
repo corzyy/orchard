@@ -151,7 +151,7 @@ impl Page {
             Appearance => "Appearance",
             MenuBar => "Menu Bar",
             DesktopDock => "Desktop & Dock",
-            Tiling => "Windows & Tiling",
+            Tiling => "Windows",
             Displays => "Displays",
             Wallpaper => "Wallpaper",
             LockScreen => "Lock Screen",
@@ -214,10 +214,10 @@ impl Page {
             LoginItems => "login items autostart startup",
             DefaultApps => "default apps browser terminal file manager text editor",
             Accessibility => "accessibility reduce motion transparency pointer cursor size theme shake locate find mouse",
-            Appearance => "appearance dark light mode accent color colour theme corner radius icon glass blur kawase liquid glass transparency frosted",
+            Appearance => "appearance dark light mode accent color colour theme corner radius icon",
             MenuBar => "menu bar control center clock battery percentage date seconds",
             DesktopDock => "desktop dock magnification minimize hot corners mission control windows title bar focus",
-            Tiling => "tiling tile floating snap snapping windows layout gaps margin dwindle split ratio edge corner preview smart gaps",
+            Tiling => "windows tiling tile floating snap snapping layout gaps margin edge corner preview",
             Displays => "displays screen monitor resolution scale refresh hidpi vrr freesync gsync adaptive sync night shift blue light warm colour color temperature redshift",
             Wallpaper => "wallpaper background desktop picture",
             LockScreen => "lock screen idle password locker shortcut",
@@ -249,8 +249,8 @@ impl Page {
             "accessibility" | "pointer" | "cursor" => Some(Accessibility),
             "appearance" | "theme" => Some(Appearance),
             "menubar" | "controlcenter" | "controlcentre" | "panel" | "clock" => Some(MenuBar),
-            "desktopdock" | "dock" | "desktop" | "windows" => Some(DesktopDock),
-            "tiling" | "windowstiling" | "snap" | "snapping" | "floating" | "layout" => Some(Tiling),
+            "desktopdock" | "dock" | "desktop" => Some(DesktopDock),
+            "windows" | "tiling" | "windowstiling" | "snap" | "snapping" | "floating" | "layout" => Some(Tiling),
             "displays" | "display" | "monitor" | "screen" => Some(Displays),
             "wallpaper" | "background" => Some(Wallpaper),
             "lockscreen" | "lock" | "lockpower" => Some(LockScreen),
@@ -325,6 +325,7 @@ mod tests {
         assert_eq!(Page::from_arg("About"), Some(Page::About));
         assert_eq!(Page::from_arg("Accessibility"), Some(Page::Accessibility));
         assert_eq!(Page::from_arg("Desktop & Dock"), Some(Page::DesktopDock));
+        assert_eq!(Page::from_arg("Windows"), Some(Page::Tiling));
         assert_eq!(Page::from_arg("Windows & Tiling"), Some(Page::Tiling));
         assert_eq!(Page::from_arg("Mouse"), Some(Page::Mouse));
         assert_eq!(Page::from_arg("Trackpad"), Some(Page::Trackpad));

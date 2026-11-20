@@ -35,7 +35,6 @@ const RUBBER: f32 = 72.0;
 const HL_SEL: f32 = 36.0;
 const HL_HOVER: f32 = 22.0;
 /// soft fade where the grid scrolls under the field / off the bottom
-const EDGE_FADE: f32 = 22.0;
 /// the scroll bar stays this long after scrolling, then fades out
 const BAR_SHOW: f32 = 0.9;
 const BAR_FADE: f32 = 0.35;

@@ -26,8 +26,6 @@ pub enum BarItem {
     Volume,
     /// Ethernet / Wi-Fi icon (left of Volume)
     Network,
-    /// Tiling mode switcher (Floating / Dwindle)
-    Tiling,
     /// one of the focused app's own menus (global menu), by index
     AppMenu(u8),
     /// "Rebuild Desktop" (only when running from a source checkout)
@@ -60,8 +58,6 @@ pub struct MenuBar {
     pub dev_spin: u8,
     /// system tray items (StatusNotifierItem)
     pub tray_items: Vec<crate::tray::TrayItem>,
-    /// current window layout mode (Floating / Tiling)
-    pub tiling_mode: orchard_config::TilingMode,
     pub german: bool,
 }
 
@@ -82,7 +78,6 @@ impl MenuBar {
             dev: crate::devbuild::DevBuild::detect(),
             dev_spin: 0,
             tray_items: Vec::new(),
-            tiling_mode: orchard_config::TilingMode::default(),
             german: std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false),
         }
     }
@@ -130,7 +125,7 @@ impl MenuBar {
             BarItem::Window => if self.german { "Fenster" } else { "Window" }.into(),
             BarItem::Help => if self.german { "Hilfe" } else { "Help" }.into(),
             BarItem::Clock => self.clock.clone(),
-            BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Tiling | BarItem::Dev | BarItem::Tray(_) => {
+            BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Dev | BarItem::Tray(_) => {
                 String::new()
             }
             BarItem::AppMenu(i) => self.app_menus.get(i as usize).cloned().unwrap_or_default(),
@@ -192,25 +187,11 @@ impl MenuBar {
         Some((right - 30.0, right - 2.0))
     }
 
-    /// The Tiling mode switcher icon, left of Network (if enabled in Settings).
-    pub fn tiling_range(&self, fonts: &Fonts, width: f32) -> Option<(f32, f32)> {
-        if !self.cfg.show_tiling {
-            return None;
-        }
-        let right = self
-            .network_range(fonts, width)
-            .or_else(|| self.volume_range(fonts, width))
-            .map(|(a, _)| a)
-            .unwrap_or_else(|| self.control_range(fonts, width).0);
-        Some((right - 30.0, right - 2.0))
-    }
-
     /// The Rebuild item, left of the other status icons (source checkouts only).
     pub fn dev_range(&self, fonts: &Fonts, width: f32) -> Option<(f32, f32)> {
         self.dev.as_ref()?;
         let right = self
-            .tiling_range(fonts, width)
-            .or_else(|| self.network_range(fonts, width))
+            .network_range(fonts, width)
             .or_else(|| self.volume_range(fonts, width))
             .map(|(a, _)| a)
             .unwrap_or_else(|| self.control_range(fonts, width).0);
@@ -220,7 +201,6 @@ impl MenuBar {
     /// Left edge of the fixed right-side items (DND moon and battery go further left).
     fn status_left_edge(&self, fonts: &Fonts, width: f32) -> f32 {
         self.dev_range(fonts, width)
-            .or_else(|| self.tiling_range(fonts, width))
             .or_else(|| self.network_range(fonts, width))
             .or_else(|| self.volume_range(fonts, width))
             .map(|(a, _)| a)
@@ -290,11 +270,6 @@ impl MenuBar {
                 return Some(BarItem::Network);
             }
         }
-        if let Some((a, b)) = self.tiling_range(fonts, width) {
-            if x >= a && x < b {
-                return Some(BarItem::Tiling);
-            }
-        }
         if let Some((a, b)) = self.dev_range(fonts, width) {
             if x >= a && x < b {
                 return Some(BarItem::Dev);
@@ -353,12 +328,6 @@ impl MenuBar {
                 fill_rounded(pm, na * s, 3.0 * s, (nb - na) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
             }
             draw_network(pm, (na + nb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.network, theme.bar_text);
-        }
-        if let Some((ta, tb)) = self.tiling_range(fonts, w) {
-            if self.open == Some(BarItem::Tiling) {
-                fill_rounded(pm, ta * s, 3.0 * s, (tb - ta) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
-            }
-            draw_tiling_icon(pm, (ta + tb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.tiling_mode, theme.bar_text);
         }
         if let (Some((da, db)), Some(dev)) = (self.dev_range(fonts, w), self.dev.as_ref()) {
             if self.open == Some(BarItem::Dev) {
@@ -707,40 +676,6 @@ pub(crate) fn draw_network(pm: &mut Pixmap, cx: f32, cy: f32, s: f32, n: Network
     }
 }
 
-/// Tiling mode icon: two overlapping windows in Floating mode, or a
-/// miniature Hyprland-style dwindle spiral (left half + two stacked right
-/// quarters) in Tiling mode.
-fn draw_tiling_icon(pm: &mut Pixmap, cx: f32, cy: f32, s: f32, mode: orchard_config::TilingMode, color: [u8; 4]) {
-    match mode {
-        orchard_config::TilingMode::Floating => {
-            let sw = 1.25 * s;
-            let r = 1.8 * s;
-            // Back window (top-left, slightly dimmed)
-            let mut dim = color;
-            dim[3] = (dim[3] as u16 * 3 / 5) as u8;
-            crate::draw::stroke_rounded(pm, cx - 7.0 * s, cy - 5.5 * s, 9.5 * s, 7.5 * s, r, sw, dim);
-            // Front window (bottom-right, full opacity)
-            crate::draw::stroke_rounded(pm, cx - 2.5 * s, cy - 2.0 * s, 9.5 * s, 7.5 * s, r, sw, color);
-        }
-        orchard_config::TilingMode::Tiling => {
-            let x0 = cx - 7.5 * s;
-            let y0 = cy - 5.5 * s;
-            let gap = 1.8 * s;
-            let lw = 6.6 * s;
-            let rw = 15.0 * s - lw - gap;
-            let th = 4.6 * s;
-            let bh = 11.0 * s - th - gap;
-            let r = 1.5 * s;
-            // Left half
-            fill_rounded(pm, x0, y0, lw, 11.0 * s, r, color);
-            // Top-right quarter
-            fill_rounded(pm, x0 + lw + gap, y0, rw, th, r, color);
-            // Bottom-right quarter
-            fill_rounded(pm, x0 + lw + gap, y0 + th + gap, rw, bh, r, color);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,11 +689,9 @@ mod tests {
         let (cca, ccb) = bar.control_range(&fonts, width);
         let (va, vb) = bar.volume_range(&fonts, width).unwrap();
         let (na, nb) = bar.network_range(&fonts, width).unwrap();
-        let (ta, tb) = bar.tiling_range(&fonts, width).unwrap();
 
-        // Tiling | Network | Volume | Control Center | Clock (left to right)
-        assert!(tb < na && nb < va && vb < cca && ccb < ca && ca < cb);
-        assert_eq!(bar.hit(&fonts, (ta + tb) / 2.0, width), Some(BarItem::Tiling));
+        // Network | Volume | Control Center | Clock (left to right)
+        assert!(nb < va && vb < cca && ccb < ca && ca < cb);
         assert_eq!(bar.hit(&fonts, (na + nb) / 2.0, width), Some(BarItem::Network));
         assert_eq!(bar.hit(&fonts, (va + vb) / 2.0, width), Some(BarItem::Volume));
         assert_eq!(bar.hit(&fonts, (cca + ccb) / 2.0, width), Some(BarItem::Control));
@@ -771,11 +704,9 @@ mod tests {
         assert_eq!((na2, nb2), (va, vb));
         assert_eq!(bar.hit(&fonts, (na2 + nb2) / 2.0, width), Some(BarItem::Network));
 
-        // Disabling Network and Tiling leaves only Control Center and Clock
+        // Disabling Network leaves only Control Center and Clock
         bar.cfg.show_network = false;
-        bar.cfg.show_tiling = false;
         assert!(bar.network_range(&fonts, width).is_none());
-        assert!(bar.tiling_range(&fonts, width).is_none());
         assert_eq!(bar.hit(&fonts, (na2 + nb2) / 2.0, width), None);
     }
 
@@ -787,9 +718,6 @@ mod tests {
         }
         for net in [Network::Wired, Network::Wifi(1), Network::Wifi(2), Network::Wifi(3), Network::Offline] {
             draw_network(&mut pm, 32.0, 24.0, 2.0, net, [255, 255, 255, 255]);
-        }
-        for mode in [orchard_config::TilingMode::Floating, orchard_config::TilingMode::Tiling] {
-            draw_tiling_icon(&mut pm, 32.0, 24.0, 2.0, mode, [255, 255, 255, 255]);
         }
     }
 }

@@ -1744,7 +1744,6 @@ impl OrchardState<UdevData> {
             fx: &mut self.fx,
             backdrops: &self.ipc.backdrops,
             mc: self.mc.as_ref(),
-            stage: Some(&self.stage),
             space_info: self.spaces.info(&output.name()),
             locked: self.protocols.locked,
             lock_surface: crate::protocols::lock_surface_of(&output),
@@ -1779,7 +1778,6 @@ impl OrchardState<UdevData> {
                         || cursor_animated
                         || self.fx.is_animating(now)
                         || self.mc.is_some()
-                        || self.stage.is_animating(now)
                         || crate::effects::any_animating(self.space.elements(), now);
                     (continuous, false, !continuous)
                 }

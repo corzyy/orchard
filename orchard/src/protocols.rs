@@ -267,17 +267,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// Keep ext-foreign-toplevel handles in sync with our windows.
     pub fn sync_foreign_toplevels(&mut self) {
-        let staged: Vec<_> = self
-            .stage
-            .all_staged_windows()
-            .into_iter()
-            .map(|(_, _, sw)| sw.window.clone())
-            .collect();
         let windows: Vec<_> = self
             .space
             .elements()
             .chain(self.minimized.iter())
-            .chain(staged.iter())
             .cloned()
             .chain(
                 self.spaces

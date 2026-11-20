@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use orchard_config::{
     CornerAction, DockAutohide, DockPosition, MinimizeEffect, NightShiftSchedule, NightShiftSettings, Settings,
-    StageAppWindows, TilingMode, TitlebarDoubleClick,
+    TitlebarDoubleClick,
 };
 
 use iced::widget::column;
@@ -161,54 +161,6 @@ pub fn desktop_dock(s: &Settings) -> El {
         ),
     ]);
 
-    let sm = &s.stage_manager;
-    let cur_app_wins = match sm.app_windows {
-        StageAppWindows::AllAtOnce => "all",
-        StageAppWindows::OneAtATime => "one",
-    };
-    let stage_manager = form::group([
-        form::toggle_row(
-            "Stage Manager",
-            some("Keep your active app front and centre while recent apps wait in a strip on the side"),
-            sm.enabled,
-            |v| {
-                edit(move |s| {
-                    s.stage_manager.enabled = v;
-                    if v {
-                        s.windows.tiling_mode = TilingMode::Floating;
-                    }
-                })
-            },
-        ),
-        form::toggle_row(
-            "Show recent applications",
-            some("When off, move the pointer to the side edge of the display to reveal the strip"),
-            sm.show_recent_apps,
-            |v| edit(move |s| s.stage_manager.show_recent_apps = v),
-        ),
-        form::toggle_row(
-            "Click wallpaper to reveal desktop",
-            some("Move the active stage aside when clicking empty wallpaper"),
-            sm.click_wallpaper_to_reveal,
-            |v| edit(move |s| s.stage_manager.click_wallpaper_to_reveal = v),
-        ),
-        form::popup_row(
-            "Show windows from an application",
-            None,
-            choices([("all", "All at Once"), ("one", "One at a Time")]),
-            cur_app_wins,
-            |v| {
-                edit(move |s| {
-                    s.stage_manager.app_windows = if v == "one" {
-                        StageAppWindows::OneAtATime
-                    } else {
-                        StageAppWindows::AllAtOnce
-                    };
-                })
-            },
-        ),
-    ]);
-
     let mission = form::group([form::toggle_row(
         "When switching to an application, switch to a Space with open windows for the application",
         None,
@@ -236,8 +188,6 @@ pub fn desktop_dock(s: &Settings) -> El {
         form::group(dock_rows),
         form::section("Windows"),
         windows,
-        form::section("Stage Manager"),
-        stage_manager,
         form::section("Mission Control"),
         mission,
         form::section("Hot Corners"),
@@ -258,9 +208,6 @@ pub fn menu_bar(s: &Settings) -> El {
     column![
         form::section("Status Icons"),
         form::group([
-            form::toggle_row("Tiling", some("Show Floating / Tiling switcher in Menu Bar"), m.show_tiling, |v| {
-                edit(move |s| s.menu_bar.show_tiling = v)
-            }),
             form::toggle_row("Network", some("Show Wi‑Fi or Ethernet in Menu Bar"), m.show_network, |v| {
                 edit(move |s| s.menu_bar.show_network = v)
             }),

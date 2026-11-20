@@ -449,7 +449,6 @@ fn main() {
     };
     app.dock.cfg = settings.dock.clone();
     app.menubar.cfg = settings.menu_bar.clone();
-    app.menubar.tiling_mode = settings.windows.tiling_mode;
     app.menubar.refresh_status();
     app.refresh_volume();
     app.notes.do_not_disturb = panel_app::load_dnd();
@@ -1081,6 +1080,7 @@ impl App {
         self.switcher_surf = None;
         self.osd = None;
         self.osd_surf = None;
+        self.set_backdrop("orchard-osd", None);
         self.panel = None;
         self.panel_surf = None;
         self.close_dialog();
@@ -1287,10 +1287,8 @@ impl App {
         let icons_changed = self.apps.set_icon_theme(s.appearance.icon_theme.clone());
         let was_showing_volume = self.menubar.cfg.show_volume;
         self.menubar.cfg = s.menu_bar.clone();
-        self.menubar.tiling_mode = s.windows.tiling_mode;
         if let Some(p) = self.panel.as_mut() {
             p.night_shift = s.night_shift.active_now();
-            p.stage_manager = s.stage_manager.enabled;
         }
         self.menubar.refresh_status_with(self.perf.battery_saver);
         if self.menubar.cfg.show_volume && !was_showing_volume {
@@ -1300,9 +1298,6 @@ impl App {
             || (self.menubar.open == Some(BarItem::Network) && !self.menubar.cfg.show_network)
         {
             self.close_panel();
-        }
-        if self.menubar.open == Some(BarItem::Tiling) && !self.menubar.cfg.show_tiling {
-            self.close_menu();
         }
         let old_h = self.dock.surface_height();
         let old_zone = self.dock.exclusive_zone();
@@ -1693,8 +1688,23 @@ impl App {
                 None => return,
             },
             Which::Osd => {
-                if let Some(o) = &self.osd {
-                    o.paint(&mut pm, fscale, &self.theme);
+                let Some(o) = self.osd.as_mut() else { return };
+                o.step(Instant::now());
+                if o.is_closed() {
+                    self.osd = None;
+                    self.osd_surf = None;
+                    self.set_backdrop("orchard-osd", None);
+                    return;
+                }
+                o.paint(&mut pm, fscale, &self.theme);
+                animating = o.is_animating();
+                if let Some((bx, by, bw, bh, br, ba)) = o.take_backdrop_update() {
+                    if let Some(ipc) = self.ipc.as_mut() {
+                        ipc.request(
+                            "set_backdrop",
+                            json!({"namespace": "orchard-osd", "rects": [{"x": bx, "y": by, "w": bw, "h": bh, "radius": br, "alpha": ba}]}),
+                        );
+                    }
                 }
             }
             Which::Notify => {
@@ -2425,20 +2435,6 @@ impl App {
                 Action::Launch("xdg-open https://github.com/Smithay/smithay".into()),
             )],
             BarItem::Control | BarItem::Volume | BarItem::Network => vec![],
-            BarItem::Tiling => {
-                let mode = self.menubar.tiling_mode;
-                vec![
-                    MenuItem::disabled("Tiling"),
-                    MenuItem::separator(),
-                    MenuItem::new("Floating", Action::SetTilingMode(orchard_config::TilingMode::Floating))
-                        .with_checked(mode == orchard_config::TilingMode::Floating),
-                    MenuItem::new(
-                        "Tiling (Dwindle)",
-                        Action::SetTilingMode(orchard_config::TilingMode::Tiling),
-                    )
-                    .with_checked(mode == orchard_config::TilingMode::Tiling),
-                ]
-            }
             BarItem::Dev => self.menubar.dev.as_ref().map(|d| d.menu()).unwrap_or_default(),
             BarItem::AppMenu(i) => {
                 let items = match (&self.menu_addr, self.app_menu_ids.get(i as usize), &self.gmenu) {
@@ -2628,21 +2624,6 @@ impl App {
                     }
                 });
             }
-            Action::SetTilingMode(mode) => {
-                let mut s = orchard_config::Settings::load();
-                s.windows.tiling_mode = mode;
-                if mode == orchard_config::TilingMode::Tiling {
-                    s.stage_manager.enabled = false;
-                }
-                if let Err(e) = s.save() {
-                    tracing::warn!("saving tiling mode: {e}");
-                }
-                self.menubar.tiling_mode = mode;
-                self.redraw(Which::Bar);
-                if let Some(ipc) = self.ipc.as_mut() {
-                    ipc.request("reload_settings", json!({}));
-                }
-            }
         }
     }
 
@@ -2782,7 +2763,6 @@ impl App {
                     .map(|(_, a, _)| a)
                     .or_else(|| match item {
                         BarItem::Dev => self.menubar.dev_range(&self.fonts, width).map(|(a, _)| a),
-                        BarItem::Tiling => self.menubar.tiling_range(&self.fonts, width).map(|(a, _)| a),
                         _ => None,
                     })
                     .unwrap_or_else(|| self.menubar.clock_range(&self.fonts, width).0);
@@ -2893,7 +2873,7 @@ impl App {
             if let Some(item) = self.menubar.hit(&self.fonts, x, width) {
                 if !matches!(
                     item,
-                    BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Tiling | BarItem::Dev
+                    BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Dev
                 )
                     && Some(MenuOwner::Bar(item)) != self.menu_owner
                 {
@@ -3023,6 +3003,7 @@ impl LayerShellHandler for App {
             Some(Which::Osd) => {
                 self.osd = None;
                 self.osd_surf = None;
+                self.set_backdrop("orchard-osd", None);
             }
             Some(Which::Notify) => self.notes_surf = None,
             Some(Which::Panel) => self.close_panel(),
