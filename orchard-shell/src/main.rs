@@ -22,6 +22,7 @@ mod notify;
 mod osd;
 mod panel;
 mod panel_app;
+mod polkit;
 mod screenshot;
 mod status;
 mod switcher;
@@ -103,6 +104,7 @@ enum Which {
     Launchpad,
     Screenshot,
     Dialog,
+    Polkit,
     Desktop,
 }
 
@@ -235,6 +237,12 @@ struct App {
     /// power / session confirmation dialog
     dialog: Option<dialog::ConfirmDialog>,
     dialog_surf: Option<Surf>,
+    /// Polkit authentication agent & macOS-style auth sheet
+    polkit: Option<polkit::PolkitDialog>,
+    polkit_surf: Option<Surf>,
+    polkit_queue: std::collections::VecDeque<polkit::Request>,
+    polkit_tx: Sender<polkit::Msg>,
+    _polkit_agent: Option<polkit::AgentHandle>,
     /// system tray (StatusNotifierWatcher)
     tray: Option<tray::Tray>,
     /// desktop icons (Layer::Bottom)
@@ -294,6 +302,15 @@ fn main() {
         })
         .expect("notification channel");
     let dbus = notify::start(note_tx);
+    let (polkit_tx, polkit_rx) = channel::channel::<polkit::Msg>();
+    loop_handle
+        .insert_source(polkit_rx, |ev, _, app: &mut App| {
+            if let channel::Event::Msg(msg) = ev {
+                app.on_polkit_msg(msg);
+            }
+        })
+        .expect("polkit channel");
+    let polkit_agent = polkit::start(polkit_tx.clone());
     let gmenu = globalmenu::GlobalMenu::start();
     let (gmenu_tx, gmenu_rx) = channel::channel::<(Option<(String, String)>, Vec<(i32, String)>)>();
     loop_handle
@@ -412,6 +429,11 @@ fn main() {
         gmenu_tx,
         dialog: None,
         dialog_surf: None,
+        polkit: None,
+        polkit_surf: None,
+        polkit_queue: std::collections::VecDeque::new(),
+        polkit_tx,
+        _polkit_agent: polkit_agent,
         tray,
         desktop,
         desktop_surf: None,
@@ -757,6 +779,198 @@ impl App {
         }
     }
 
+    // ---- Polkit authentication sheet ------------------------------------
+
+    fn on_polkit_msg(&mut self, msg: polkit::Msg) {
+        match msg {
+            polkit::Msg::Begin(req) => {
+                if self.polkit.is_some() {
+                    self.polkit_queue.push_back(*req);
+                } else {
+                    self.open_polkit(*req);
+                }
+            }
+            polkit::Msg::Cancel(cookie) => {
+                if self.polkit.as_ref().is_some_and(|p| p.cookie() == cookie) {
+                    self.close_polkit_and_advance(true);
+                } else {
+                    self.polkit_queue.retain(|r| r.cookie != cookie);
+                }
+            }
+            polkit::Msg::HelperPrompt { cookie, attempt, echo, prompt } => {
+                if let Some(p) = self.polkit.as_mut().filter(|p| p.cookie() == cookie) {
+                    p.on_prompt(attempt, echo, prompt);
+                    self.redraw(Which::Polkit);
+                }
+            }
+            polkit::Msg::HelperInfo { cookie, attempt, text } => {
+                if let Some(p) = self.polkit.as_mut().filter(|p| p.cookie() == cookie) {
+                    p.on_info(attempt, text);
+                    self.redraw(Which::Polkit);
+                }
+            }
+            polkit::Msg::HelperError { cookie, attempt, text } => {
+                if let Some(p) = self.polkit.as_mut().filter(|p| p.cookie() == cookie) {
+                    p.on_error(attempt, text);
+                    self.redraw(Which::Polkit);
+                }
+            }
+            polkit::Msg::HelperFinished { cookie, attempt, success } => {
+                let done = if let Some(p) = self.polkit.as_mut().filter(|p| p.cookie() == cookie) {
+                    let ok = p.on_finished(attempt, success, self.german);
+                    if !ok {
+                        self.redraw(Which::Polkit);
+                    }
+                    ok
+                } else {
+                    false
+                };
+                if done {
+                    self.close_polkit_and_advance(false);
+                }
+            }
+        }
+    }
+
+    fn open_polkit(&mut self, req: polkit::Request) {
+        self.close_menu();
+        self.close_panel();
+        if self.launcher.is_some() {
+            self.close_launcher_now();
+        }
+        self.polkit = Some(polkit::PolkitDialog::new(req, self.polkit_tx.clone()));
+        self.ensure_polkit_surface();
+    }
+
+    fn ensure_polkit_surface(&mut self) {
+        if self.polkit_surf.is_none() {
+            let surface = self.compositor.create_surface(&self.qh);
+            let layer = self.layer_shell.create_layer_surface(
+                &self.qh,
+                surface,
+                Layer::Overlay,
+                Some("orchard-polkit"),
+                self.output.as_ref(),
+            );
+            layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+            layer.set_exclusive_zone(-1);
+            layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            layer.commit();
+            self.polkit_surf = Some(Surf::new(layer));
+        } else {
+            self.redraw(Which::Polkit);
+        }
+    }
+
+    fn cancel_polkit(&mut self) {
+        self.close_polkit_and_advance(true);
+    }
+
+    fn close_polkit_and_advance(&mut self, cancelled: bool) {
+        if let Some(mut p) = self.polkit.take() {
+            if cancelled {
+                p.cancel();
+            }
+        }
+        if let Some(next) = self.polkit_queue.pop_front() {
+            self.polkit = Some(polkit::PolkitDialog::new(next, self.polkit_tx.clone()));
+            self.ensure_polkit_surface();
+        } else {
+            self.polkit_surf = None;
+            self.set_backdrop("orchard-polkit", None);
+        }
+    }
+
+    fn polkit_pointer(&mut self, kind: &PointerEventKind, x: f64, y: f64) {
+        let (x, y) = (x as f32, y as f32);
+        match kind {
+            PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                if let Some(p) = self.polkit.as_mut() {
+                    let h = p.hit(x, y);
+                    if h != p.hovered {
+                        p.hovered = h;
+                        self.redraw(Which::Polkit);
+                    }
+                }
+            }
+            PointerEventKind::Leave { .. } => {
+                if let Some(p) = self.polkit.as_mut() {
+                    if p.hovered.take().is_some() {
+                        self.redraw(Which::Polkit);
+                    }
+                }
+            }
+            PointerEventKind::Press { button: BTN_LEFT, .. } => {
+                let hit = self.polkit.as_ref().and_then(|p| p.hit(x, y));
+                match hit {
+                    Some(polkit::Hit::Cancel) => self.cancel_polkit(),
+                    Some(polkit::Hit::Confirm) => {
+                        if let Some(p) = self.polkit.as_mut() {
+                            p.submit();
+                            self.redraw(Which::Polkit);
+                        }
+                    }
+                    Some(polkit::Hit::UserField) => {
+                        if let Some(p) = self.polkit.as_mut() {
+                            p.cycle_identity();
+                            self.redraw(Which::Polkit);
+                        }
+                    }
+                    Some(polkit::Hit::DetailsToggle) => {
+                        if let Some(p) = self.polkit.as_mut() {
+                            p.show_details = !p.show_details;
+                            self.redraw(Which::Polkit);
+                        }
+                    }
+                    Some(polkit::Hit::PasswordField) | None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn polkit_key(&mut self, event: &KeyEvent) {
+        match event.keysym {
+            Keysym::Escape => self.cancel_polkit(),
+            Keysym::Return | Keysym::KP_Enter => {
+                if let Some(p) = self.polkit.as_mut() {
+                    p.submit();
+                    self.redraw(Which::Polkit);
+                }
+            }
+            Keysym::BackSpace => {
+                if let Some(p) = self.polkit.as_mut() {
+                    p.backspace(self.mods.ctrl);
+                    self.redraw(Which::Polkit);
+                }
+            }
+            Keysym::Tab => {
+                if let Some(p) = self.polkit.as_mut() {
+                    p.cycle_identity();
+                    self.redraw(Which::Polkit);
+                }
+            }
+            _ => {
+                if self.mods.ctrl && matches!(event.keysym, Keysym::u | Keysym::U) {
+                    if let Some(p) = self.polkit.as_mut() {
+                        p.backspace(true);
+                        self.redraw(Which::Polkit);
+                    }
+                    return;
+                }
+                if self.mods.ctrl || self.mods.alt || self.mods.logo {
+                    return;
+                }
+                if let Some(text) = event.utf8.as_deref().filter(|t| !t.is_empty() && !t.chars().any(|c| c.is_control())) {
+                    if let Some(p) = self.polkit.as_mut() {
+                        p.push_str(text);
+                        self.redraw(Which::Polkit);
+                    }
+                }
+            }
+        }
+    }
+
     // ---- Desktop icons --------------------------------------------------
 
     fn open_desktop_path(&mut self, path: &std::path::Path) {
@@ -858,6 +1072,8 @@ impl App {
         self.panel = None;
         self.panel_surf = None;
         self.close_dialog();
+        self.polkit_surf = None;
+        self.set_backdrop("orchard-polkit", None);
         self.desktop_surf = None;
         self.close_screenshot_tool();
         // banners stay in the model and come back on the new output
@@ -906,6 +1122,9 @@ impl App {
         if !self.notes.banners.is_empty() {
             self.update_notes_surface();
         }
+        if self.polkit.is_some() {
+            self.ensure_polkit_surface();
+        }
     }
 
     fn surf(&mut self, which: Which) -> Option<&mut Surf> {
@@ -921,6 +1140,7 @@ impl App {
             Which::Launchpad => self.launchpad_surf.as_mut(),
             Which::Screenshot => self.screenshot_surf.as_mut(),
             Which::Dialog => self.dialog_surf.as_mut(),
+            Which::Polkit => self.polkit_surf.as_mut(),
             Which::Desktop => self.desktop_surf.as_mut(),
         }
     }
@@ -948,6 +1168,8 @@ impl App {
             Some(Which::Screenshot)
         } else if self.dialog_surf.as_ref().map(|s| s.layer.wl_surface() == surface).unwrap_or(false) {
             Some(Which::Dialog)
+        } else if self.polkit_surf.as_ref().map(|s| s.layer.wl_surface() == surface).unwrap_or(false) {
+            Some(Which::Polkit)
         } else if self.desktop_surf.as_ref().map(|s| s.layer.wl_surface() == surface).unwrap_or(false) {
             Some(Which::Desktop)
         } else {
@@ -1279,6 +1501,8 @@ impl App {
             self.panel_surf.as_ref(),
             self.launchpad_surf.as_ref(),
             self.screenshot_surf.as_ref(),
+            self.dialog_surf.as_ref(),
+            self.polkit_surf.as_ref(),
         ];
         if surfaces.into_iter().flatten().any(|s| s.dirty && s.frame_pending) {
             Some(Duration::from_millis(260))
@@ -1295,7 +1519,7 @@ impl App {
 
     /// Paint every dirty surface that is not waiting for a frame callback.
     fn flush_draws(&mut self) {
-        const ALL: [Which; 12] = [
+        const ALL: [Which; 13] = [
             Which::Launchpad,
             Which::Bar,
             Which::Dock,
@@ -1307,6 +1531,7 @@ impl App {
             Which::Panel,
             Which::Screenshot,
             Which::Dialog,
+            Which::Polkit,
             Which::Desktop,
         ];
         for which in ALL {
@@ -1434,6 +1659,14 @@ impl App {
                     self.set_backdrop("orchard-dialog", Some((x, y, dw, dh, 16.0)));
                 }
             }
+            Which::Polkit => {
+                if let Some(p) = self.polkit.as_mut() {
+                    p.paint(&mut pm, fscale, &self.fonts, &self.apps, &self.theme, self.mods.caps_lock, self.german);
+                    animating = p.is_animating();
+                    let (x, y, dw, dh) = p.rect;
+                    self.set_backdrop("orchard-polkit", Some((x, y, dw, dh, 16.0)));
+                }
+            }
             Which::Desktop => {
                 self.desktop.paint(&mut pm, fscale, &self.fonts, &mut self.apps, &self.theme);
             }
@@ -1453,6 +1686,7 @@ impl App {
             Which::Launchpad => self.launchpad_surf.as_mut(),
             Which::Screenshot => self.screenshot_surf.as_mut(),
             Which::Dialog => self.dialog_surf.as_mut(),
+            Which::Polkit => self.polkit_surf.as_mut(),
             Which::Desktop => self.desktop_surf.as_mut(),
         };
         let Some(s) = s else { return };
@@ -2616,6 +2850,7 @@ impl LayerShellHandler for App {
             Some(Which::Launchpad) => self.drop_launchpad(),
             Some(Which::Screenshot) => self.close_screenshot_tool(),
             Some(Which::Dialog) => self.close_dialog(),
+            Some(Which::Polkit) => self.cancel_polkit(),
             Some(Which::Desktop) => self.desktop_surf = None,
             // the compositor closes layers of an output that went away
             Some(Which::Bar | Which::Dock) => {
@@ -2713,6 +2948,7 @@ impl PointerHandler for App {
                 Which::Launchpad => self.launchpad_pointer(&ev.kind, x, y),
                 Which::Screenshot => self.screenshot_pointer(&ev.kind, x, y),
                 Which::Dialog => self.dialog_pointer(&ev.kind, x, y),
+                Which::Polkit => self.polkit_pointer(&ev.kind, x, y),
                 Which::Desktop => self.desktop_pointer(qh, &ev.kind, x, y),
             }
         }
@@ -2754,6 +2990,10 @@ impl KeyboardHandler for App {
     }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, event: KeyEvent) {
+        if self.polkit.is_some() {
+            self.polkit_key(&event);
+            return;
+        }
         if self.dialog.is_some() {
             self.dialog_key(&event);
             return;
@@ -2794,7 +3034,11 @@ impl KeyboardHandler for App {
         modifiers: Modifiers,
         _: u32,
     ) {
+        let caps_changed = modifiers.caps_lock != self.mods.caps_lock;
         self.mods = modifiers;
+        if caps_changed && self.polkit.is_some() {
+            self.redraw(Which::Polkit);
+        }
     }
 }
 delegate_layer!(App);

@@ -111,14 +111,16 @@ impl DesktopEntry {
         if self.list("NotShowIn").iter().any(|d| d == "Orchard") {
             return false;
         }
+        // Orchard ships its own built-in polkit authentication agent in orchard-shell;
+        // skip external DE polkit agents so they don't race to claim the session.
+        if self.command().map(|c| c.contains("polkit")).unwrap_or(false)
+            && std::env::var_os("ORCHARD_NO_POLKIT").is_none()
+        {
+            return false;
+        }
         let only = self.list("OnlyShowIn");
         if !only.is_empty() && !only.iter().any(|d| d == "Orchard") {
-            // a polkit agent is needed for password prompts (timedatectl,
-            // hostnamectl, …) and Orchard has none of its own
-            let is_polkit_agent = self.command().map(|c| c.contains("polkit")).unwrap_or(false);
-            if !is_polkit_agent {
-                return false;
-            }
+            return false;
         }
         if let Some(try_exec) = self.get("TryExec") {
             if !command_exists(try_exec) {
