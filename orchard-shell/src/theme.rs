@@ -19,16 +19,34 @@ pub fn appearance(mode: orchard_config::ThemeMode) -> Appearance {
         orchard_config::ThemeMode::Dark => return Appearance::Dark,
         orchard_config::ThemeMode::Auto => {}
     }
+    detect_system_appearance()
+}
+
+/// `gsettings` spawns a process, and settings are re-applied on every save
+/// (sliders save continuously), so keep the answer for a few seconds.
+fn detect_system_appearance() -> Appearance {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static CACHE: OnceLock<Mutex<Option<(Instant, Appearance)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, appearance)) = *guard {
+        if at.elapsed() < Duration::from_secs(5) {
+            return appearance;
+        }
+    }
     let out = std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "color-scheme"])
         .output();
-    match out {
+    let appearance = match out {
         Ok(o) if String::from_utf8_lossy(&o.stdout).contains("dark") => Appearance::Dark,
         _ => Appearance::Light,
-    }
+    };
+    *guard = Some((Instant::now(), appearance));
+    appearance
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub bar_tint: Rgba,
     pub bar_text: Rgba,

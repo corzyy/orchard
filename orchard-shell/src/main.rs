@@ -1282,15 +1282,18 @@ impl App {
             self.primary = s.displays.primary.clone();
             self.retarget_output();
         }
+        let old_theme = self.theme.clone();
         self.theme = Theme::from_settings(&s);
+        let theme_changed = self.theme != old_theme;
         self.perf = s.performance.clone();
         let icons_changed = self.apps.set_icon_theme(s.appearance.icon_theme.clone());
         let was_showing_volume = self.menubar.cfg.show_volume;
+        let old_bar_cfg = self.menubar.cfg.clone();
         self.menubar.cfg = s.menu_bar.clone();
         if let Some(p) = self.panel.as_mut() {
             p.night_shift = s.night_shift.active_now();
         }
-        self.menubar.refresh_status_with(self.perf.battery_saver);
+        let status_changed = self.menubar.refresh_status_with(self.perf.battery_saver);
         if self.menubar.cfg.show_volume && !was_showing_volume {
             self.refresh_volume();
         }
@@ -1302,7 +1305,9 @@ impl App {
         let old_h = self.dock.surface_height();
         let old_zone = self.dock.exclusive_zone();
         let old_edge = self.dock.edge();
+        let old_dock_cfg = self.dock.cfg.clone();
         self.dock.cfg = s.dock.clone();
+        let dock_changed = self.dock.cfg != old_dock_cfg;
         if self.dock.cfg.autohide == DockAutohide::Never {
             self.dock.hidden = 0.0;
         }
@@ -1332,11 +1337,16 @@ impl App {
                 surf.layer.commit();
             }
         }
-        self.last_backdrop = None;
-        self.last_tiles.clear();
-        self.redraw(Which::Bar);
-        self.redraw(Which::Dock);
-        self.send_dock_tiles();
+        let bar_changed = theme_changed || status_changed || self.menubar.cfg != old_bar_cfg;
+        if bar_changed {
+            self.redraw(Which::Bar);
+        }
+        if dock_changed || theme_changed || icons_changed {
+            self.last_backdrop = None;
+            self.last_tiles.clear();
+            self.redraw(Which::Dock);
+            self.send_dock_tiles();
+        }
         if self.menu.is_some() {
             self.redraw(Which::Menu);
         }

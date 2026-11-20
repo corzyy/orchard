@@ -134,7 +134,12 @@ impl ConfirmDialog {
     fn paint_sheet(&mut self, pm: &mut Pixmap, s: f32, x0: f32, y0: f32, fonts: &Fonts, theme: &Theme, german: bool) {
 
         let dark = theme.menu_text[0] > 128;
-        let bg: Rgba = if dark { [40, 40, 44, 224] } else { [248, 248, 252, 232] };
+        let solid = theme.menu_bg[3] == 255;
+        let bg: Rgba = if dark {
+            [40, 40, 44, if solid { 255 } else { 224 }]
+        } else {
+            [248, 248, 252, if solid { 255 } else { 232 }]
+        };
         let border: Rgba = if dark { [255, 255, 255, 44] } else { [0, 0, 0, 32] };
         let text = theme.menu_text;
         let sub: Rgba = if dark { [220, 220, 226, 175] } else { [40, 40, 46, 165] };

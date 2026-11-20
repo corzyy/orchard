@@ -143,12 +143,15 @@ impl<E: Element> Element for RoundedElement<E> {
         self.inner.damage_since(scale, commit)
     }
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        let regions = self.inner.opaque_regions(scale);
+        let c = self.corners.0;
+        if regions.is_empty() || !c.iter().any(|&on| on) {
+            return regions;
+        }
         // carve the rounded corners out of the opaque region so whatever is
         // behind them still gets drawn
-        let regions = self.inner.opaque_regions(scale);
         let geo = self.inner.geometry(scale);
         let r = self.radius.ceil() as i32;
-        let c = self.corners.0;
         let mut cuts = Vec::new();
         let (w, h) = (geo.size.w, geo.size.h);
         if c[0] {

@@ -201,6 +201,19 @@ impl MissionControl {
         self.closing && self.spring.is_done_at(now)
     }
 
+    /// Whether anything still moves: open/close spring, window cell glides,
+    /// windows flying in, or the dragged window's shrink.
+    pub fn is_animating(&self, now: Duration) -> bool {
+        !self.spring.is_done_at(now)
+            || self.screens.iter().any(|s| {
+                s.wins.iter().any(|w| {
+                    w.move_spring.as_ref().is_some_and(|sp| !sp.is_done_at(now))
+                        || w.enter.as_ref().is_some_and(|sp| !sp.is_done_at(now))
+                })
+            })
+            || self.drag.as_ref().is_some_and(|d| !d.shrink.is_done_at(now))
+    }
+
     pub fn screen_of(&self, output: &Output) -> Option<&McScreen> {
         self.screens.iter().find(|s| s.output == *output)
     }

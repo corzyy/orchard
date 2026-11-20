@@ -54,6 +54,21 @@ impl ItemKind {
             ItemKind::Trash => "trash".into(),
         }
     }
+
+    /// Compare with a key from [`Self::key`] without allocating.
+    fn key_eq(&self, key: &str) -> bool {
+        match self {
+            ItemKind::App { desktop_id, app_id, .. } => {
+                key.strip_prefix("app:") == Some(desktop_id.as_deref().unwrap_or(app_id))
+            }
+            ItemKind::Launchpad => key == "launchpad",
+            ItemKind::Minimized { window_id, .. } => {
+                key.strip_prefix("min:").and_then(|n| n.parse::<u64>().ok()) == Some(*window_id)
+            }
+            ItemKind::Separator => key == "sep",
+            ItemKind::Trash => key == "trash",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -842,6 +857,7 @@ impl Dock {
         let sh = pm.height() as f32 / scale;
         let (placed, cbg) = self.layout(sw, sh);
         let bg = self.map_rect(cbg, sw, sh);
+        let drag_key = self.drag.as_ref().filter(|d| d.active).map(|d| d.key.as_str());
         let s = scale;
         // background (the compositor draws the frosted blur behind it)
         let radius = self.radius();
@@ -867,7 +883,7 @@ impl Dock {
                 continue;
             }
             // the dragged icon is drawn under the pointer instead (its slot stays free)
-            if self.drag.as_ref().map(|d| d.active && d.key == it.kind.key()).unwrap_or(false) {
+            if drag_key.is_some_and(|k| it.kind.key_eq(k)) {
                 continue;
             }
             let bounce = it

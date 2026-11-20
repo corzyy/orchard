@@ -183,7 +183,9 @@ pub fn paint_card(
     theme: &Theme,
 ) -> CardHit {
     let dark = theme.bar_text[0] > 128;
-    let bg: Rgba = if dark { [44, 44, 46, 205] } else { [246, 246, 246, 205] };
+    let solid = theme.menu_bg[3] == 255;
+    let alpha = if solid { 255 } else { 205 };
+    let bg: Rgba = if dark { [44, 44, 46, alpha] } else { [246, 246, 246, alpha] };
     let border: Rgba = if dark { [255, 255, 255, 30] } else { [0, 0, 0, 22] };
     let title_c = theme.menu_text;
     let body_c: Rgba = if dark { [220, 220, 220, 255] } else { [45, 45, 45, 255] };

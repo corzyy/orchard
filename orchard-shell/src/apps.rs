@@ -193,7 +193,8 @@ pub struct Apps {
     /// separate so app icon lookup stays exactly as it was
     extra_icons: RefCell<Option<IconTheme>>,
     icon_theme: Option<String>,
-    icon_cache: RefCell<HashMap<(String, u32), Option<Rc<Pixmap>>>>,
+    /// size -> name -> pixmap
+    icon_cache: RefCell<HashMap<u32, HashMap<String, Option<Rc<Pixmap>>>>>,
 }
 
 type ScannedApps = (
@@ -311,31 +312,32 @@ impl Apps {
 
     /// Icon for an app, rendered at `size` physical px.
     pub fn icon(&self, icon_name: &str, size: u32) -> Option<Rc<Pixmap>> {
-        let key = (icon_name.to_string(), size);
-        if let Some(v) = self.icon_cache.borrow().get(&key) {
+        if let Some(v) = self.icon_cache.borrow().get(&size).and_then(|m| m.get(icon_name)) {
             return v.clone();
         }
         let pm = self.icons.find(icon_name, size).and_then(|p| render_icon(&p, size)).map(Rc::new);
         let mut cache = self.icon_cache.borrow_mut();
-        if cache.len() >= 512 {
-            cache.clear();
+        let map = cache.entry(size).or_default();
+        if map.len() >= 512 {
+            map.clear();
         }
-        cache.insert(key, pm.clone());
+        map.insert(icon_name.to_string(), pm.clone());
         pm
     }
 
     /// Icon from an explicit filesystem path, cached in `icon_cache`.
     pub fn icon_by_path(&self, path: &str, size: u32) -> Option<Rc<Pixmap>> {
-        let key = (format!("\x01{path}"), size);
-        if let Some(v) = self.icon_cache.borrow().get(&key) {
+        let key = format!("\x01{path}");
+        if let Some(v) = self.icon_cache.borrow().get(&size).and_then(|m| m.get(&key)) {
             return v.clone();
         }
         let pm = render_icon(Path::new(path), size).map(Rc::new);
         let mut cache = self.icon_cache.borrow_mut();
-        if cache.len() >= 512 {
-            cache.clear();
+        let map = cache.entry(size).or_default();
+        if map.len() >= 512 {
+            map.clear();
         }
-        cache.insert(key, pm.clone());
+        map.insert(key, pm.clone());
         pm
     }
 }
@@ -347,8 +349,8 @@ impl Apps {
         if let Some(pm) = self.icon(icon_name, size) {
             return Some(pm);
         }
-        let key = (format!("\0{icon_name}"), size);
-        if let Some(v) = self.icon_cache.borrow().get(&key) {
+        let key = format!("\0{icon_name}");
+        if let Some(v) = self.icon_cache.borrow().get(&size).and_then(|m| m.get(&key)) {
             return v.clone();
         }
         if self.extra_icons.borrow().is_none() {
@@ -362,10 +364,11 @@ impl Apps {
             .and_then(|p| render_icon(&p, size))
             .map(Rc::new);
         let mut cache = self.icon_cache.borrow_mut();
-        if cache.len() >= 512 {
-            cache.clear();
+        let map = cache.entry(size).or_default();
+        if map.len() >= 512 {
+            map.clear();
         }
-        cache.insert(key, pm.clone());
+        map.insert(key, pm.clone());
         pm
     }
 }
@@ -388,7 +391,9 @@ impl Apps {
     pub fn set_extra_icons(&self, theme: Option<String>, icons: ExtraIcons) {
         if theme == self.icon_theme {
             *self.extra_icons.borrow_mut() = Some(icons.0);
-            self.icon_cache.borrow_mut().retain(|k, _| !k.0.starts_with('\0'));
+            for map in self.icon_cache.borrow_mut().values_mut() {
+                map.retain(|k, _| !k.starts_with('\0'));
+            }
         }
     }
 

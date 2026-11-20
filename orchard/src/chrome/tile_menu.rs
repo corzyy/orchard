@@ -76,7 +76,8 @@ pub struct TileMenuArm {
 }
 
 fn is_german() -> bool {
-    std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false)
+    static GERMAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GERMAN.get_or_init(|| std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false))
 }
 
 impl TileMenu {

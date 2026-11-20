@@ -26,14 +26,16 @@ pub enum LabelStyle {
 
 #[derive(Default)]
 pub struct Labels {
-    cache: HashMap<(String, LabelStyle, u32), (MemoryRenderBuffer, (i32, i32))>,
+    /// style + scale bucket -> text -> buffer
+    cache: HashMap<(LabelStyle, u32), HashMap<String, (MemoryRenderBuffer, (i32, i32))>>,
 }
 
 impl Labels {
     /// Returns the buffer and its logical size.
     pub fn get(&mut self, text: &str, style: LabelStyle, scale: f64) -> Option<(&MemoryRenderBuffer, (i32, i32))> {
-        let key = (text.to_string(), style, (scale * 100.0) as u32);
-        if !self.cache.contains_key(&key) {
+        let bucket = (style, (scale * 100.0) as u32);
+        let cached = self.cache.get(&bucket).is_some_and(|m| m.contains_key(text));
+        if !cached {
             let (pm, logical) = paint(text, style, scale)?;
             let buf = MemoryRenderBuffer::from_slice(
                 pm.data(),
@@ -43,12 +45,13 @@ impl Labels {
                 Transform::Normal,
                 None,
             );
-            if self.cache.len() > 256 {
-                self.cache.clear();
+            let map = self.cache.entry(bucket).or_default();
+            if map.len() > 64 {
+                map.clear();
             }
-            self.cache.insert(key.clone(), (buf, logical));
+            map.insert(text.to_string(), (buf, logical));
         }
-        self.cache.get(&key).map(|(b, s)| (b, *s))
+        self.cache.get(&bucket).and_then(|m| m.get(text)).map(|(b, s)| (b, *s))
     }
 }
 

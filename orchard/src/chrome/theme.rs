@@ -99,14 +99,26 @@ pub fn appearance() -> Appearance {
 }
 
 /// Follow the freedesktop colour-scheme preference if gsettings knows one.
+/// Spawning `gsettings` is slow (a few ms), and settings reloads can happen in
+/// quick succession while dragging a slider, so cache the answer briefly.
 fn detect_system_appearance() -> Appearance {
+    static CACHE: OnceLock<std::sync::Mutex<Option<(std::time::Instant, Appearance)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, appearance)) = *guard {
+        if at.elapsed() < std::time::Duration::from_secs(5) {
+            return appearance;
+        }
+    }
     let out = std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.interface", "color-scheme"])
         .output();
-    match out {
+    let appearance = match out {
         Ok(o) if String::from_utf8_lossy(&o.stdout).contains("dark") => Appearance::Dark,
         _ => Appearance::Light,
-    }
+    };
+    *guard = Some((std::time::Instant::now(), appearance));
+    appearance
 }
 
 pub fn palette(appearance: Appearance) -> &'static Palette {

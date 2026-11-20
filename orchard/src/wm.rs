@@ -174,6 +174,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         self.space.map_element(window.clone(), (x, y), false);
         window.start_open_animation(self.clock.now().into());
         // new windows come to the front with keyboard focus, like on macOS
+        self.prefs_rt.force_toplevel_sync = true;
         self.focus_window(window);
     }
 
@@ -438,11 +439,24 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     /// Advance animations; finish restores whose genie has completed.
     pub fn tick_effects(&mut self) {
         self.prune_spaces();
-        self.sync_foreign_toplevels();
-        self.tick_mission_control();
-        self.update_game_mode();
-        self.ipc_broadcast_if_changed();
         let now: std::time::Duration = self.clock.now().into();
+        // Foreign-toplevel mirroring and game detection allocate titles and scan
+        // every window; they don't need to run at full frame rate.
+        const TOPLEVEL_SYNC: std::time::Duration = std::time::Duration::from_millis(250);
+        if self.prefs_rt.force_toplevel_sync
+            || self.prefs_rt.last_toplevel_sync.map_or(true, |t| now.saturating_sub(t) >= TOPLEVEL_SYNC)
+        {
+            self.prefs_rt.last_toplevel_sync = Some(now);
+            self.prefs_rt.force_toplevel_sync = false;
+            self.sync_foreign_toplevels();
+        }
+        const GAME_CHECK: std::time::Duration = std::time::Duration::from_millis(500);
+        if self.prefs_rt.last_game_check.map_or(true, |t| now.saturating_sub(t) >= GAME_CHECK) {
+            self.prefs_rt.last_game_check = Some(now);
+            self.update_game_mode();
+        }
+        self.tick_mission_control();
+        self.ipc_broadcast_if_changed();
         if self
             .fx
             .space_transition

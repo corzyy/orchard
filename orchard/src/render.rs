@@ -115,6 +115,9 @@ struct PendingBackdrop {
     region: Rectangle<i32, Physical>,
     radius: f32,
     alpha: f32,
+    /// a shell surface (menu bar, Dock, panel…); client window blur stays on
+    /// even when Reduce transparency makes panels solid
+    panel: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -196,6 +199,7 @@ fn layer_elements_filtered(
                     region,
                     radius: (rect.radius * scale) as f32,
                     alpha: rect.alpha.clamp(0.0, 1.0) as f32,
+                    panel: true,
                 });
             }
         }
@@ -221,7 +225,12 @@ fn resolve_backdrops(
     fx.blur.evict(now);
     let program = crate::effects::rounded::program(renderer);
     let live = crate::settings::effective_live_blur();
+    // "Reduce transparency" paints panels solid: no blur behind them at all.
+    let solid_panels = crate::settings::get().appearance.reduce_transparency;
     for p in pending.into_iter().rev() {
+        if p.panel && solid_panels {
+            continue;
+        }
         let iterations = crate::effects::blur::ITERATIONS;
         let blurred = if live {
             fx.blur
@@ -595,6 +604,12 @@ fn mc_id(fx: &mut Effects, idx: usize) -> Id {
     fx.mc_ids[idx].clone()
 }
 
+/// German UI strings for the compositor-drawn labels.
+fn german() -> bool {
+    static GERMAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GERMAN.get_or_init(|| std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false))
+}
+
 fn label_element(
     renderer: &mut GlesRenderer,
     fx: &mut Effects,
@@ -829,7 +844,7 @@ fn mission_control_elements(
             }
         }
         // name below the thumbnail
-        let name = if std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false) {
+        let name = if german() {
             format!("Schreibtisch {}", i + 1)
         } else {
             format!("Desktop {}", i + 1)
@@ -1138,6 +1153,7 @@ fn output_elements_inner(
                 region: phys,
                 radius,
                 alpha: 1.0,
+                panel: true,
             });
         }
     }
@@ -1182,6 +1198,7 @@ fn output_elements_inner(
                         region: rect,
                         radius,
                         alpha,
+                        panel: false,
                     });
                 }
             }

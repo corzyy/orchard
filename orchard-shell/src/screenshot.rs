@@ -697,7 +697,12 @@ impl ScreenshotTool {
 
     fn paint_toolbar(&mut self, pm: &mut Pixmap, s: f32, sw: f32, sh: f32, fonts: &Fonts, theme: &Theme, german: bool) {
         let dark = theme.bar_text[0] > 128;
-        let bg: Rgba = if dark { [38, 38, 42, 216] } else { [244, 244, 248, 224] };
+        let solid = theme.menu_bg[3] == 255;
+        let bg: Rgba = if dark {
+            [38, 38, 42, if solid { 255 } else { 216 }]
+        } else {
+            [244, 244, 248, if solid { 255 } else { 224 }]
+        };
         let border: Rgba = if dark { [255, 255, 255, 48] } else { [0, 0, 0, 38] };
         let fg: Rgba = if dark { [242, 242, 246, 255] } else { [32, 32, 36, 255] };
         let sep: Rgba = if dark { [255, 255, 255, 42] } else { [0, 0, 0, 32] };

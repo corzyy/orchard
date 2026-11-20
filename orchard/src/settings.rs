@@ -7,14 +7,13 @@
 //! live objects (keyboard, input devices, outputs, wallpaper).
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, RwLock,
 };
 
 pub use orchard_config::Settings;
 
 static CURRENT: RwLock<Option<Arc<Settings>>> = RwLock::new(None);
-static GENERATION: AtomicU64 = AtomicU64::new(0);
 static FOCUS_FOLLOWS_MOUSE: AtomicBool = AtomicBool::new(false);
 static ON_BATTERY: AtomicBool = AtomicBool::new(false);
 
@@ -105,17 +104,20 @@ pub fn get() -> Arc<Settings> {
 
 /// Re-read the settings file. Returns the new settings.
 pub fn reload() -> Arc<Settings> {
+    let previous = CURRENT.read().unwrap().clone();
     let s = Arc::new(Settings::load());
     FOCUS_FOLLOWS_MOUSE.store(s.windows.focus_follows_mouse, Ordering::Relaxed);
     *CURRENT.write().unwrap() = Some(s.clone());
-    GENERATION.fetch_add(1, Ordering::Relaxed);
-    crate::chrome::theme::refresh_appearance();
+    // The cached chrome palette only depends on these, plus the system scheme
+    // in Auto mode. Skip the (possibly spawning) refresh on unrelated saves.
+    let appearance_dirty = previous.as_ref().map_or(true, |p| {
+        p.appearance.mode != s.appearance.mode
+            || p.appearance.corner_radius.to_bits() != s.appearance.corner_radius.to_bits()
+    });
+    if appearance_dirty || s.appearance.mode == orchard_config::ThemeMode::Auto {
+        crate::chrome::theme::refresh_appearance();
+    }
     s
-}
-
-/// Bumped on every reload; caches keyed on it are rebuilt after a change.
-pub fn generation() -> u64 {
-    GENERATION.load(Ordering::Relaxed)
 }
 
 /// Command for ⌘Return (env var wins, then settings, then auto-detected terminal).
@@ -179,6 +181,18 @@ pub struct Runtime {
     pub settings_stamp: Option<FileStamp>,
     /// Snapping gaps last applied, so a change refits tiled/zoomed windows.
     pub tiling_cfg: orchard_config::TilingSettings,
+    /// Input/appearance settings last pushed to the backends, so unrelated
+    /// settings saves don't rebuild keymaps, cursor themes or gsettings.
+    pub keyboard: Option<orchard_config::KeyboardSettings>,
+    pub pointer: Option<orchard_config::PointerSettings>,
+    pub cursor: Option<(Option<String>, u32)>,
+    pub appearance: Option<(orchard_config::ThemeMode, Option<String>, Option<String>, u32)>,
+    pub performance: Option<orchard_config::PerformanceSettings>,
+    /// Last foreign-toplevel / game-mode background scan (throttled).
+    pub last_toplevel_sync: Option<std::time::Duration>,
+    pub last_game_check: Option<std::time::Duration>,
+    /// A window appeared or went away: mirror it to foreign-toplevel clients now.
+    pub force_toplevel_sync: bool,
 }
 
 impl Default for Runtime {
@@ -189,6 +203,14 @@ impl Default for Runtime {
             idle_locked: false,
             settings_stamp: settings_file_stamp(),
             tiling_cfg: orchard_config::TilingSettings::default(),
+            keyboard: None,
+            pointer: None,
+            cursor: None,
+            appearance: None,
+            performance: None,
+            last_toplevel_sync: None,
+            last_game_check: None,
+            force_toplevel_sync: true,
         }
     }
 }
@@ -225,24 +247,30 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
     /// Push settings into live objects. Things read on demand (corner radius,
     /// appearance, shortcuts, double-click, minimize effect, …) need nothing.
     pub fn apply_settings(&mut self, s: &Settings) {
-        // keyboard layout + repeat
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            let kb = crate::wm::keyboard_settings();
-            let xkb = XkbConfig {
-                rules: "",
-                model: &kb.model,
-                layout: &kb.layout,
-                variant: &kb.variant,
-                options: kb.options.clone(),
-            };
-            if let Err(e) = keyboard.set_xkb_config(self, xkb) {
-                tracing::warn!(layout = kb.layout, "keyboard layout from settings rejected: {e:?}");
+        // keyboard layout + repeat (only when changed: rebuilding the XKB keymap is costly)
+        if self.prefs_rt.keyboard.as_ref() != Some(&s.keyboard) {
+            if let Some(keyboard) = self.seat.get_keyboard() {
+                let kb = crate::wm::keyboard_settings();
+                let xkb = XkbConfig {
+                    rules: "",
+                    model: &kb.model,
+                    layout: &kb.layout,
+                    variant: &kb.variant,
+                    options: kb.options.clone(),
+                };
+                if let Err(e) = keyboard.set_xkb_config(self, xkb) {
+                    tracing::warn!(layout = kb.layout, "keyboard layout from settings rejected: {e:?}");
+                }
+                keyboard.change_repeat_info(kb.repeat_rate, kb.repeat_delay);
+                self.prefs_rt.keyboard = Some(s.keyboard.clone());
             }
-            keyboard.change_repeat_info(kb.repeat_rate, kb.repeat_delay);
         }
 
         // mouse / trackpad
-        self.backend_data.apply_input_settings(&s.pointer);
+        if self.prefs_rt.pointer.as_ref() != Some(&s.pointer) {
+            self.backend_data.apply_input_settings(&s.pointer);
+            self.prefs_rt.pointer = Some(s.pointer.clone());
+        }
 
         // display scale
         let outputs: Vec<_> = self.space.outputs().cloned().collect();
@@ -289,15 +317,39 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             self.refit_all_windows();
         }
 
-        // pointer theme, and the appearance settings apps read
-        self.backend_data.reload_cursor();
-        crate::session::sync_app_appearance(s);
+        // pointer theme, and the appearance settings apps read (all spawn work
+        // in the background, so only do it when the relevant settings changed)
+        let cursor_changed = !self.prefs_rt.cursor.as_ref().is_some_and(|(theme, size)| {
+            theme.as_ref() == s.appearance.cursor_theme.as_ref() && *size == s.appearance.cursor_size
+        });
+        if cursor_changed {
+            self.backend_data.reload_cursor();
+            self.prefs_rt.cursor = Some((s.appearance.cursor_theme.clone(), s.appearance.cursor_size));
+        }
+        let appearance_changed = !self.prefs_rt.appearance.as_ref().is_some_and(|(mode, icon, cursor, size)| {
+            *mode == s.appearance.mode
+                && icon.as_ref() == s.appearance.icon_theme.as_ref()
+                && cursor.as_ref() == s.appearance.cursor_theme.as_ref()
+                && *size == s.appearance.cursor_size
+        });
+        if appearance_changed {
+            crate::session::sync_app_appearance(s);
+            self.prefs_rt.appearance = Some((
+                s.appearance.mode,
+                s.appearance.icon_theme.clone(),
+                s.appearance.cursor_theme.clone(),
+                s.appearance.cursor_size,
+            ));
+        }
 
         // wallpaper & blur cache (live_blur / VRR / direct_scanout may have changed)
         self.fx.wallpaper.reset();
-        self.fx.blur.invalidate();
-        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
-            self.backend_data.reset_buffers(&output);
+        if self.prefs_rt.performance.as_ref() != Some(&s.performance) {
+            self.fx.blur.invalidate();
+            for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+                self.backend_data.reset_buffers(&output);
+            }
+            self.prefs_rt.performance = Some(s.performance.clone());
         }
 
         self.prefs_rt.idle_locked = false;

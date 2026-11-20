@@ -81,8 +81,29 @@ impl Cursor {
     /// Image for a named cursor (CSS names like "text", "pointer", "ew-resize"),
     /// trying the given alternatives, falling back to the default arrow.
     pub fn get_named_image_cached(&self, names: &[&str], scale: u32, time: Duration) -> (u64, Arc<Image>, bool) {
+        self.named_image_cached(names.iter().copied(), scale, time)
+    }
+
+    /// The same lookup without building a temporary `Vec` of names: the first
+    /// name plus its alternative names, tried in order.
+    pub fn get_named_image_cached_first(
+        &self,
+        name: &str,
+        alt_names: &[&str],
+        scale: u32,
+        time: Duration,
+    ) -> (u64, Arc<Image>, bool) {
+        self.named_image_cached(std::iter::once(name).chain(alt_names.iter().copied()), scale, time)
+    }
+
+    fn named_image_cached<'a>(
+        &self,
+        names: impl Iterator<Item = &'a str>,
+        scale: u32,
+        time: Duration,
+    ) -> (u64, Arc<Image>, bool) {
         for name in names {
-            if *name == "default" {
+            if name == "default" {
                 break;
             }
             let mut cache = self.named.borrow_mut();

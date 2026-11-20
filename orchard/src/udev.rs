@@ -1674,13 +1674,12 @@ impl OrchardState<UdevData> {
         let zoom = self.fx.shake.zoom(shake_now);
         let mult = if zoom > 1.001 { zoom.ceil() as u32 } else { 1 };
         let (cursor_id, frame, cursor_animated) = match &self.cursor_status {
-            CursorImageStatus::Named(icon) => {
-                let mut names = vec![icon.name()];
-                names.extend(icon.alt_names().iter().copied());
-                self.backend_data
-                    .pointer_image
-                    .get_named_image_cached(&names, mult, self.clock.now().into())
-            }
+            CursorImageStatus::Named(icon) => self.backend_data.pointer_image.get_named_image_cached_first(
+                icon.name(),
+                icon.alt_names(),
+                mult,
+                self.clock.now().into(),
+            ),
             _ => self
                 .backend_data
                 .pointer_image
@@ -1777,7 +1776,7 @@ impl OrchardState<UdevData> {
                     let continuous = full_damage_pending
                         || cursor_animated
                         || self.fx.is_animating(now)
-                        || self.mc.is_some()
+                        || self.mc.as_ref().is_some_and(|m| m.is_animating(now))
                         || crate::effects::any_animating(self.space.elements(), now);
                     (continuous, false, !continuous)
                 }

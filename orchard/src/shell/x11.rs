@@ -89,6 +89,7 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
             }
             self.space.unmap_elem(&elem);
         }
+        self.prefs_rt.force_toplevel_sync = true;
         self.minimized
             .retain(|e| !matches!(e.0.x11_surface(), Some(w) if w == &window));
         if !window.is_override_redirect() {
