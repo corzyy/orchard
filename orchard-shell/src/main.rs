@@ -379,7 +379,7 @@ fn main() {
                 app.redraw(Which::Bar);
             }
             app.status_tick = app.status_tick.wrapping_add(1);
-            if app.status_tick.is_multiple_of(2) {
+            if app.menubar.cfg.show_volume && app.status_tick.is_multiple_of(2) {
                 app.refresh_volume();
             }
             // X11 apps register their menu some time after mapping
@@ -666,8 +666,17 @@ impl App {
         }
         self.theme = Theme::from_settings(&s);
         let icons_changed = self.apps.set_icon_theme(s.appearance.icon_theme.clone());
+        let was_showing_volume = self.menubar.cfg.show_volume;
         self.menubar.cfg = s.menu_bar.clone();
         self.menubar.refresh_status();
+        if self.menubar.cfg.show_volume && !was_showing_volume {
+            self.refresh_volume();
+        }
+        if (self.menubar.open == Some(BarItem::Volume) && !self.menubar.cfg.show_volume)
+            || (self.menubar.open == Some(BarItem::Network) && !self.menubar.cfg.show_network)
+        {
+            self.close_panel();
+        }
         let old_h = self.dock.surface_height();
         let old_zone = self.dock.exclusive_zone();
         let old_edge = self.dock.edge();

@@ -16,7 +16,7 @@ use crate::{
     sys::{self, Bg},
     widgets::{
         button, button_enabled, footnote, group, header, mix, popup, primary_button, rgb, secondary, slider, text_field,
-        toggle, SliderOpts,
+        toggle, RowOpts, SliderOpts,
     },
     Page,
 };
@@ -280,6 +280,39 @@ pub fn accessibility(ui: &mut Ui, cx: &mut Cx) {
 
 pub fn menu_bar(ui: &mut Ui, cx: &mut Cx) {
     hero(ui, cx, Page::MenuBar, "Choose what the menu bar shows on the right.");
+    header(ui, "Control Center Modules");
+    group(ui, |g| {
+        let mut net = cx.s.menu_bar.show_network;
+        g.row_with(
+            "Network",
+            RowOpts {
+                sub: Some("Show Wi-Fi or Ethernet in Menu Bar"),
+                icon: Some(Page::Wifi.icon()),
+                ..Default::default()
+            },
+            Some(cx.icons),
+            |ui| {
+                if toggle(ui, &mut net).changed() {
+                    cx.s.menu_bar.show_network = net;
+                }
+            },
+        );
+        let mut vol = cx.s.menu_bar.show_volume;
+        g.row_with(
+            "Sound",
+            RowOpts {
+                sub: Some("Show Volume in Menu Bar"),
+                icon: Some(Page::Sound.icon()),
+                ..Default::default()
+            },
+            Some(cx.icons),
+            |ui| {
+                if toggle(ui, &mut vol).changed() {
+                    cx.s.menu_bar.show_volume = vol;
+                }
+            },
+        );
+    });
     header(ui, "Clock");
     group(ui, |g| {
         super::general::clock_format_row(g, cx.s);

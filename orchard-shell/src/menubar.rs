@@ -124,16 +124,25 @@ impl MenuBar {
         (ca - 32.0, ca - 2.0)
     }
 
-    /// The Volume icon, left of Control Center.
-    pub fn volume_range(&self, fonts: &Fonts, width: f32) -> (f32, f32) {
+    /// The Volume icon, left of Control Center (if enabled in Settings).
+    pub fn volume_range(&self, fonts: &Fonts, width: f32) -> Option<(f32, f32)> {
+        if !self.cfg.show_volume {
+            return None;
+        }
         let (cca, _) = self.control_range(fonts, width);
-        (cca - 30.0, cca - 2.0)
+        Some((cca - 30.0, cca - 2.0))
     }
 
-    /// The Ethernet / Wi-Fi icon, left of Volume.
-    pub fn network_range(&self, fonts: &Fonts, width: f32) -> (f32, f32) {
-        let (va, _) = self.volume_range(fonts, width);
-        (va - 30.0, va - 2.0)
+    /// The Ethernet / Wi-Fi icon, left of Volume or Control Center (if enabled in Settings).
+    pub fn network_range(&self, fonts: &Fonts, width: f32) -> Option<(f32, f32)> {
+        if !self.cfg.show_network {
+            return None;
+        }
+        let right = self
+            .volume_range(fonts, width)
+            .map(|(va, _)| va)
+            .unwrap_or_else(|| self.control_range(fonts, width).0);
+        Some((right - 30.0, right - 2.0))
     }
 
     pub fn hit(&self, fonts: &Fonts, x: f32, width: f32) -> Option<BarItem> {
@@ -148,12 +157,17 @@ impl MenuBar {
         if x >= a && x < b {
             return Some(BarItem::Control);
         }
-        let (a, b) = self.volume_range(fonts, width);
-        if x >= a && x < b {
-            return Some(BarItem::Volume);
+        if let Some((a, b)) = self.volume_range(fonts, width) {
+            if x >= a && x < b {
+                return Some(BarItem::Volume);
+            }
         }
-        let (a, b) = self.network_range(fonts, width);
-        (x >= a && x < b).then_some(BarItem::Network)
+        if let Some((a, b)) = self.network_range(fonts, width) {
+            if x >= a && x < b {
+                return Some(BarItem::Network);
+            }
+        }
+        None
     }
 
     pub fn paint(&self, pm: &mut Pixmap, scale: f32, fonts: &Fonts, theme: &Theme) {
@@ -190,19 +204,23 @@ impl MenuBar {
         }
         draw_control_icon(pm, (cca + ccb) / 2.0 * s, HEIGHT / 2.0 * s, s, theme.bar_text);
 
-        let (va, vb) = self.volume_range(fonts, w);
-        if self.open == Some(BarItem::Volume) {
-            fill_rounded(pm, va * s, 3.0 * s, (vb - va) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+        let mut left_edge = cca;
+        if let Some((va, vb)) = self.volume_range(fonts, w) {
+            if self.open == Some(BarItem::Volume) {
+                fill_rounded(pm, va * s, 3.0 * s, (vb - va) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+            }
+            draw_volume(pm, (va + vb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.volume, theme.bar_text);
+            left_edge = va;
         }
-        draw_volume(pm, (va + vb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.volume, theme.bar_text);
-
-        let (na, nb) = self.network_range(fonts, w);
-        if self.open == Some(BarItem::Network) {
-            fill_rounded(pm, na * s, 3.0 * s, (nb - na) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+        if let Some((na, nb)) = self.network_range(fonts, w) {
+            if self.open == Some(BarItem::Network) {
+                fill_rounded(pm, na * s, 3.0 * s, (nb - na) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+            }
+            draw_network(pm, (na + nb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.network, theme.bar_text);
+            left_edge = na;
         }
-        draw_network(pm, (na + nb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.network, theme.bar_text);
 
-        let mut x = na - 4.0;
+        let mut x = left_edge - 4.0;
         if self.dnd {
             x -= 22.0;
             crate::panel::moon(pm, (x + 11.0) * s, HEIGHT / 2.0 * s, 6.0 * s, theme.bar_text);
@@ -441,12 +459,12 @@ mod tests {
     #[test]
     fn right_side_hit_order_matches_macos() {
         let fonts = Fonts::load();
-        let bar = MenuBar::new();
+        let mut bar = MenuBar::new();
         let width = 1440.0;
         let (ca, cb) = bar.clock_range(&fonts, width);
         let (cca, ccb) = bar.control_range(&fonts, width);
-        let (va, vb) = bar.volume_range(&fonts, width);
-        let (na, nb) = bar.network_range(&fonts, width);
+        let (va, vb) = bar.volume_range(&fonts, width).unwrap();
+        let (na, nb) = bar.network_range(&fonts, width).unwrap();
 
         // Network | Volume | Control Center | Clock (left to right)
         assert!(nb < va && vb < cca && ccb < ca && ca < cb);
@@ -454,6 +472,18 @@ mod tests {
         assert_eq!(bar.hit(&fonts, (va + vb) / 2.0, width), Some(BarItem::Volume));
         assert_eq!(bar.hit(&fonts, (cca + ccb) / 2.0, width), Some(BarItem::Control));
         assert_eq!(bar.hit(&fonts, (ca + cb) / 2.0, width), Some(BarItem::Clock));
+
+        // Disabling Volume shifts Network right next to Control Center
+        bar.cfg.show_volume = false;
+        assert!(bar.volume_range(&fonts, width).is_none());
+        let (na2, nb2) = bar.network_range(&fonts, width).unwrap();
+        assert_eq!((na2, nb2), (va, vb));
+        assert_eq!(bar.hit(&fonts, (na2 + nb2) / 2.0, width), Some(BarItem::Network));
+
+        // Disabling Network too leaves only Control Center and Clock
+        bar.cfg.show_network = false;
+        assert!(bar.network_range(&fonts, width).is_none());
+        assert_eq!(bar.hit(&fonts, (na2 + nb2) / 2.0, width), None);
     }
 
     #[test]

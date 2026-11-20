@@ -191,6 +191,8 @@ pub struct MenuBarSettings {
     pub show_date: bool,
     pub show_weekday: bool,
     pub battery_percentage: bool,
+    pub show_network: bool,
+    pub show_volume: bool,
 }
 
 impl Default for MenuBarSettings {
@@ -201,6 +203,8 @@ impl Default for MenuBarSettings {
             show_date: true,
             show_weekday: true,
             battery_percentage: false,
+            show_network: true,
+            show_volume: true,
         }
     }
 }

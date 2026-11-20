@@ -31,8 +31,18 @@ impl App {
         }
         let width = self.bar.as_ref().map(|s| s.width).unwrap_or(0) as f32;
         let anchor = match item {
-            BarItem::Volume => self.menubar.volume_range(&self.fonts, width).1 + 8.0,
-            BarItem::Network => self.menubar.network_range(&self.fonts, width).1 + 8.0,
+            BarItem::Volume => self
+                .menubar
+                .volume_range(&self.fonts, width)
+                .unwrap_or_else(|| self.menubar.control_range(&self.fonts, width))
+                .1
+                + 8.0,
+            BarItem::Network => self
+                .menubar
+                .network_range(&self.fonts, width)
+                .unwrap_or_else(|| self.menubar.control_range(&self.fonts, width))
+                .1
+                + 8.0,
             _ => self.menubar.control_range(&self.fonts, width).1 + 8.0,
         };
         let mut p = Panel::new(kind, anchor);
