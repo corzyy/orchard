@@ -447,38 +447,40 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         {
             let output = self.space.output_under(location).next().cloned();
             if let Some(output) = output.as_ref() {
-                let output_geo = self.space.output_geometry(output).unwrap();
-                let revealed = crate::fs_reveal::reveal_hit(output, location - output_geo.loc.to_f64(), output_geo.size.w)
-                    .is_some();
-                if let Some(window) = output
-                    .user_data()
-                    .get::<FullscreenSurface>()
-                    .and_then(|f| f.get())
-                    .filter(|_| !revealed)
-                {
-                    if let Some((_, _)) =
-                        window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
+                if let Some(output_geo) = self.space.output_geometry(output) {
+                    let revealed =
+                        crate::fs_reveal::reveal_hit(output, location - output_geo.loc.to_f64(), output_geo.size.w)
+                            .is_some();
+                    if let Some(window) = output
+                        .user_data()
+                        .get::<FullscreenSurface>()
+                        .and_then(|f| f.get())
+                        .filter(|_| !revealed)
                     {
-                        #[cfg(feature = "xwayland")]
-                        if let Some(surface) = window.0.x11_surface() {
-                            if let Some(Err(err)) = self.xwm.as_mut().map(|xwm| xwm.raise_window(surface)) {
-                                tracing::debug!("raise X11 window: {err}");
+                        if let Some((_, _)) =
+                            window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
+                        {
+                            #[cfg(feature = "xwayland")]
+                            if let Some(surface) = window.0.x11_surface() {
+                                if let Some(Err(err)) = self.xwm.as_mut().map(|xwm| xwm.raise_window(surface)) {
+                                    tracing::debug!("raise X11 window: {err}");
+                                }
                             }
+                            keyboard.set_focus(self, Some(window.into()), serial);
+                            return;
                         }
-                        keyboard.set_focus(self, Some(window.into()), serial);
-                        return;
                     }
-                }
 
-                let layers = layer_map_for_output(output);
-                let local = location - output_geo.loc.to_f64();
-                if let Some((layer, _, _)) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, local)
-                    .or_else(|| crate::render::layer_input_under(&layers, WlrLayer::Top, local))
-                {
-                    if layer.can_receive_keyboard_focus() {
-                        drop(layers);
-                        keyboard.set_focus(self, Some(layer.into()), serial);
-                        return;
+                    let layers = layer_map_for_output(output);
+                    let local = location - output_geo.loc.to_f64();
+                    if let Some((layer, _, _)) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, local)
+                        .or_else(|| crate::render::layer_input_under(&layers, WlrLayer::Top, local))
+                    {
+                        if layer.can_receive_keyboard_focus() {
+                            drop(layers);
+                            keyboard.set_focus(self, Some(layer.into()), serial);
+                            return;
+                        }
                     }
                 }
             }
@@ -496,21 +498,23 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             }
 
             if let Some(output) = output.as_ref() {
-                let output_geo = self.space.output_geometry(output).unwrap();
-                let layers = layer_map_for_output(output);
-                if let Some(layer) = layers
-                    .layer_under(WlrLayer::Bottom, location - output_geo.loc.to_f64())
-                    .or_else(|| layers.layer_under(WlrLayer::Background, location - output_geo.loc.to_f64()))
-                {
-                    if layer.can_receive_keyboard_focus() {
-                        if let Some((_, _)) = layer.surface_under(
-                            location
-                                - output_geo.loc.to_f64()
-                                - layers.layer_geometry(layer).unwrap().loc.to_f64(),
-                            WindowSurfaceType::ALL,
-                        ) {
-                            keyboard.set_focus(self, Some(layer.clone().into()), serial);
-                        }
+                if let Some(output_geo) = self.space.output_geometry(output) {
+                    let focus_layer = {
+                        let layers = layer_map_for_output(output);
+                        let local = location - output_geo.loc.to_f64();
+                        layers
+                            .layer_under(WlrLayer::Bottom, local)
+                            .or_else(|| layers.layer_under(WlrLayer::Background, local))
+                            .filter(|layer| layer.can_receive_keyboard_focus())
+                            .and_then(|layer| {
+                                let layer_geo = layers.layer_geometry(layer)?;
+                                layer
+                                    .surface_under(local - layer_geo.loc.to_f64(), WindowSurfaceType::ALL)
+                                    .map(|_| layer.clone())
+                            })
+                    };
+                    if let Some(layer) = focus_layer {
+                        keyboard.set_focus(self, Some(layer.into()), serial);
                     }
                 }
             };
@@ -531,62 +535,68 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             let lock = self.lock_surface_for(output)?;
             return Some((PointerFocusTarget::from(lock.wl_surface()), geo.loc.to_f64()));
         }
-        let output = self.space.outputs().find(|o| {
-            let geometry = self.space.output_geometry(o).unwrap();
-            geometry.contains(pos.to_i32_floor())
+        let (output, output_geo) = self.space.outputs().find_map(|o| {
+            let geometry = self.space.output_geometry(o)?;
+            geometry.contains(pos.to_i32_floor()).then_some((o, geometry))
         })?;
-        let output_geo = self.space.output_geometry(output).unwrap();
-        let layers = layer_map_for_output(output);
+        let local = pos - output_geo.loc.to_f64();
 
-        let mut under = None;
         // full-screen reveal: the menu bar is a layer, the title bar is ours
-        let reveal = crate::fs_reveal::reveal_hit(output, pos - output_geo.loc.to_f64(), output_geo.size.w);
+        let reveal = crate::fs_reveal::reveal_hit(output, local, output_geo.size.w);
         if matches!(reveal, Some(crate::fs_reveal::RevealHit::TitleBar)) {
             return None;
         }
-        if reveal.is_some() {
-            // (menu bar: falls through to the Top layer below)
-        } else if let Some((surface, loc)) = output
-            .user_data()
-            .get::<FullscreenSurface>()
-            .and_then(|f| f.get())
-            .and_then(|w| w.surface_under(pos - output_geo.loc.to_f64(), WindowSurfaceType::ALL))
+        if reveal.is_none() {
+            if let Some((surface, loc)) = output
+                .user_data()
+                .get::<FullscreenSurface>()
+                .and_then(|f| f.get())
+                .and_then(|w| w.surface_under(local, WindowSurfaceType::ALL))
+            {
+                return Some((surface, (loc + output_geo.loc).to_f64()));
+            }
+        }
+
+        // Keep the per-output LayerMap mutex strictly scoped: `stage_owns_pointer`
+        // below also locks `layer_map_for_output`, which would self-deadlock if
+        // `layers` were held across it.
         {
-            under = Some((surface, loc + output_geo.loc));
-        } else if let Some(focus) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, pos - output_geo.loc.to_f64())
-            .or_else(|| crate::render::layer_input_under(&layers, WlrLayer::Top, pos - output_geo.loc.to_f64()))
-            .map(|(_, surface, loc)| (PointerFocusTarget::from(surface), loc + output_geo.loc))
-        {
-            under = Some(focus)
-        } else if self.stage_owns_pointer(pos) {
+            let layers = layer_map_for_output(output);
+            if let Some(focus) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, local)
+                .or_else(|| crate::render::layer_input_under(&layers, WlrLayer::Top, local))
+                .map(|(_, surface, loc)| (PointerFocusTarget::from(surface), (loc + output_geo.loc).to_f64()))
+            {
+                return Some(focus);
+            }
+        }
+
+        if self.stage_owns_pointer(pos) {
             return None;
-        } else if let Some(focus) = self.space.element_under(pos).and_then(|(window, loc)| {
+        }
+
+        if let Some(focus) = self.space.element_under(pos).and_then(|(window, loc)| {
             window
                 .surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
-                .map(|(surface, surf_loc)| (surface, surf_loc + loc))
+                .map(|(surface, surf_loc)| (surface, (surf_loc + loc).to_f64()))
         }) {
-            under = Some(focus);
-        } else if let Some(focus) = layers
-            .layer_under(WlrLayer::Bottom, pos - output_geo.loc.to_f64())
-            .or_else(|| layers.layer_under(WlrLayer::Background, pos - output_geo.loc.to_f64()))
+            return Some(focus);
+        }
+
+        let layers = layer_map_for_output(output);
+        layers
+            .layer_under(WlrLayer::Bottom, local)
+            .or_else(|| layers.layer_under(WlrLayer::Background, local))
             .and_then(|layer| {
-                let layer_loc = layers.layer_geometry(layer).unwrap().loc;
+                let layer_loc = layers.layer_geometry(layer)?.loc;
                 layer
-                    .surface_under(
-                        pos - output_geo.loc.to_f64() - layer_loc.to_f64(),
-                        WindowSurfaceType::ALL,
-                    )
+                    .surface_under(local - layer_loc.to_f64(), WindowSurfaceType::ALL)
                     .map(|(surface, loc)| {
                         (
                             PointerFocusTarget::from(surface),
-                            loc + layer_loc + output_geo.loc,
+                            (loc + layer_loc + output_geo.loc).to_f64(),
                         )
                     })
             })
-        {
-            under = Some(focus)
-        };
-        under.map(|(s, l)| (s, l.to_f64()))
     }
 
     fn on_pointer_axis<B: InputBackend>(&mut self, evt: B::PointerAxisEvent) {

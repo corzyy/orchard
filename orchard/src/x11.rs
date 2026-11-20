@@ -351,10 +351,9 @@ pub fn run_x11() {
                     states
                         .data_map
                         .get::<Mutex<CursorImageAttributes>>()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .hotspot
+                        .and_then(|a| a.lock().ok())
+                        .map(|a| a.hotspot)
+                        .unwrap_or_default()
                 })
             } else {
                 (0, 0).into()

@@ -554,11 +554,10 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
 
                     let Some(surface) = self.window.wl_surface() else { return };
                     with_states(&surface, |states| {
-                        let mut data = states
-                            .data_map
-                            .get::<RefCell<SurfaceData>>()
-                            .unwrap()
-                            .borrow_mut();
+                        let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() else {
+                            return;
+                        };
+                        let mut data = data.borrow_mut();
                         if let ResizeState::Resizing(resize_data) = data.resize_state {
                             data.resize_state = ResizeState::WaitingForFinalAck(resize_data, event.serial);
                         } else {
@@ -593,11 +592,10 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerRes
                         return;
                     };
                     with_states(&surface, |states| {
-                        let mut data = states
-                            .data_map
-                            .get::<RefCell<SurfaceData>>()
-                            .unwrap()
-                            .borrow_mut();
+                        let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() else {
+                            return;
+                        };
+                        let mut data = data.borrow_mut();
                         if let ResizeState::Resizing(resize_data) = data.resize_state {
                             data.resize_state = ResizeState::WaitingForCommit(resize_data);
                         } else {
@@ -776,16 +774,15 @@ impl<BackendData: Backend> TouchGrab<OrchardState<BackendData>> for TouchResizeS
 
                 let Some(surface) = self.window.wl_surface() else { return };
                 with_states(&surface, |states| {
-                    let mut data = states
-                        .data_map
-                        .get::<RefCell<SurfaceData>>()
-                        .unwrap()
-                        .borrow_mut();
+                    let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() else {
+                        return;
+                    };
+                    let mut data = data.borrow_mut();
                     if let ResizeState::Resizing(resize_data) = data.resize_state {
                         data.resize_state = ResizeState::WaitingForFinalAck(resize_data, event.serial);
                     } else {
                         tracing::warn!("resize ended in unexpected state {:?}", data.resize_state);
-                            data.resize_state = ResizeState::NotResizing;
+                        data.resize_state = ResizeState::NotResizing;
                     }
                 });
             }
@@ -815,16 +812,15 @@ impl<BackendData: Backend> TouchGrab<OrchardState<BackendData>> for TouchResizeS
                     return;
                 };
                 with_states(&surface, |states| {
-                    let mut data = states
-                        .data_map
-                        .get::<RefCell<SurfaceData>>()
-                        .unwrap()
-                        .borrow_mut();
+                    let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() else {
+                        return;
+                    };
+                    let mut data = data.borrow_mut();
                     if let ResizeState::Resizing(resize_data) = data.resize_state {
                         data.resize_state = ResizeState::WaitingForCommit(resize_data);
                     } else {
                         tracing::warn!("resize ended in unexpected state {:?}", data.resize_state);
-                            data.resize_state = ResizeState::NotResizing;
+                        data.resize_state = ResizeState::NotResizing;
                     }
                 });
             }

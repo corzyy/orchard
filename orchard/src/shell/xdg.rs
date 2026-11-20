@@ -126,7 +126,9 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
-        let seat: Seat<OrchardState<BackendData>> = Seat::from_resource(&seat).unwrap();
+        let Some(seat): Option<Seat<OrchardState<BackendData>>> = Seat::from_resource(&seat) else {
+            return;
+        };
         self.move_request_xdg(&surface, &seat, serial)
     }
 
@@ -137,11 +139,15 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
-        let seat: Seat<OrchardState<BackendData>> = Seat::from_resource(&seat).unwrap();
+        let Some(seat): Option<Seat<OrchardState<BackendData>>> = Seat::from_resource(&seat) else {
+            return;
+        };
 
         if let Some(touch) = seat.get_touch() {
             if touch.has_grab(serial) {
-                let start_data = touch.grab_start_data().unwrap();
+                let Some(start_data) = touch.grab_start_data() else {
+                    return;
+                };
                 tracing::info!(?start_data);
 
                 // If the client disconnects after requesting a move
@@ -164,20 +170,20 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
                     return;
                 }
                 let geometry = window.client_geometry();
-                let loc = self.space.element_location(&window).unwrap();
+                let Some(loc) = self.space.element_location(&window) else {
+                    return;
+                };
                 let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
                 with_states(surface.wl_surface(), move |states| {
-                    states
-                        .data_map
-                        .get::<RefCell<SurfaceData>>()
-                        .unwrap()
-                        .borrow_mut()
-                        .resize_state = ResizeState::Resizing(ResizeData {
-                        edges: edges.into(),
-                        initial_window_location,
-                        initial_window_size,
-                    });
+                    states.data_map.insert_if_missing(RefCell::<SurfaceData>::default);
+                    if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                        data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
+                            edges: edges.into(),
+                            initial_window_location,
+                            initial_window_size,
+                        });
+                    }
                 });
 
                 let grab = TouchResizeSurfaceGrab {
@@ -194,7 +200,9 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
             }
         }
 
-        let pointer = seat.get_pointer().unwrap();
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
 
         // Check that this surface has a click grab.
         if !pointer.has_grab(serial) {
@@ -223,16 +231,14 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
         let (initial_window_location, initial_window_size) = (loc, geometry.size);
 
         with_states(surface.wl_surface(), move |states| {
-            states
-                .data_map
-                .get::<RefCell<SurfaceData>>()
-                .unwrap()
-                .borrow_mut()
-                .resize_state = ResizeState::Resizing(ResizeData {
-                edges: edges.into(),
-                initial_window_location,
-                initial_window_size,
-            });
+            states.data_map.insert_if_missing(RefCell::<SurfaceData>::default);
+            if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                data.borrow_mut().resize_state = ResizeState::Resizing(ResizeData {
+                    edges: edges.into(),
+                    initial_window_location,
+                    initial_window_size,
+                });
+            }
         });
 
         // a manual resize ends tiling
@@ -274,25 +280,18 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
                     states
                         .data_map
                         .get::<XdgToplevelSurfaceData>()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .current
-                        .states
-                        .contains(xdg_toplevel::State::Resizing)
+                        .and_then(|d| d.lock().ok())
+                        .map(|d| d.current.states.contains(xdg_toplevel::State::Resizing))
+                        .unwrap_or(false)
                 });
 
                 if configure.serial >= serial && is_resizing {
                     with_states(&surface, |states| {
-                        let mut data = states
-                            .data_map
-                            .get::<RefCell<SurfaceData>>()
-                            .unwrap()
-                            .borrow_mut();
-                        if let ResizeState::WaitingForFinalAck(resize_data, _) = data.resize_state {
-                            data.resize_state = ResizeState::WaitingForCommit(resize_data);
-                        } else {
-                            unreachable!()
+                        if let Some(data) = states.data_map.get::<RefCell<SurfaceData>>() {
+                            let mut data = data.borrow_mut();
+                            if let ResizeState::WaitingForFinalAck(resize_data, _) = data.resize_state {
+                                data.resize_state = ResizeState::WaitingForCommit(resize_data);
+                            }
                         }
                     });
                 }
@@ -433,7 +432,9 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
-        let seat: Seat<OrchardState<BackendData>> = Seat::from_resource(&seat).unwrap();
+        let Some(seat): Option<Seat<OrchardState<BackendData>>> = Seat::from_resource(&seat) else {
+            return;
+        };
         let kind = PopupKind::Xdg(surface);
         if let Some(root) = find_popup_root_surface(&kind).ok().and_then(|root| {
             self.space
@@ -488,7 +489,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     pub fn move_request_xdg(&mut self, surface: &ToplevelSurface, seat: &Seat<Self>, serial: Serial) {
         if let Some(touch) = seat.get_touch() {
             if touch.has_grab(serial) {
-                let start_data = touch.grab_start_data().unwrap();
+                let Some(start_data) = touch.grab_start_data() else {
+                    return;
+                };
 
                 // If the client disconnects after requesting a move
                 // we can just ignore the request
@@ -508,7 +511,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                     return;
                 }
 
-                let mut initial_window_location = self.space.element_location(&window).unwrap();
+                let Some(mut initial_window_location) = self.space.element_location(&window) else {
+                    return;
+                };
 
                 // If surface is maximized then unmaximize it
                 let current_state = surface.current_state();
@@ -545,7 +550,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             }
         }
 
-        let pointer = seat.get_pointer().unwrap();
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
 
         // Check that this surface has a click grab.
         if !pointer.has_grab(serial) {
@@ -588,21 +595,19 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             return;
         };
 
-        let mut outputs_for_window = self.space.outputs_for_element(&window);
-        if outputs_for_window.is_empty() {
-            return;
-        }
-
-        // Get a union of all outputs' geometries.
-        let mut outputs_geo = self
+        let Some(outputs_geo) = self
             .space
-            .output_geometry(&outputs_for_window.pop().unwrap())
-            .unwrap();
-        for output in outputs_for_window {
-            outputs_geo = outputs_geo.merge(self.space.output_geometry(&output).unwrap());
-        }
+            .outputs_for_element(&window)
+            .into_iter()
+            .filter_map(|output| self.space.output_geometry(&output))
+            .reduce(|acc, geo| acc.merge(geo))
+        else {
+            return;
+        };
 
-        let window_geo = self.space.element_geometry(&window).unwrap();
+        let Some(window_geo) = self.space.element_geometry(&window) else {
+            return;
+        };
 
         // The target geometry for the positioner should be relative to its parent's geometry, so
         // we will compute that here.

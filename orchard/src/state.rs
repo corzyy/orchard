@@ -243,10 +243,9 @@ impl<BackendData: Backend> ClientDndGrabHandler for OrchardState<BackendData> {
                 let hotspot = states
                     .data_map
                     .get::<CursorImageSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .hotspot;
+                    .and_then(|a| a.lock().ok())
+                    .map(|a| a.hotspot)
+                    .unwrap_or_default();
                 Point::from((-hotspot.x, -hotspot.y))
             })
         } else {

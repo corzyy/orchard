@@ -1539,7 +1539,13 @@ impl OrchardState<UdevData> {
                             ..
                         })) if source.kind() == io::ErrorKind::PermissionDenied
                     ),
-                    SwapBuffersError::ContextLost(err) => panic!("Rendering loop lost: {}", err),
+                    SwapBuffersError::ContextLost(err) => {
+                        error!("rendering loop lost: {err}; resetting the DRM state");
+                        if let Err(err) = device_backend.drm_output_manager.device_mut().reset_state() {
+                            error!("failed to reset the DRM device: {err}");
+                        }
+                        true
+                    }
                 }
             }
         };
@@ -1913,10 +1919,9 @@ fn render_surface(
                 states
                     .data_map
                     .get::<Mutex<CursorImageAttributes>>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .hotspot
+                    .and_then(|a| a.lock().ok())
+                    .map(|a| a.hotspot)
+                    .unwrap_or_default()
             })
             .to_f64()
             .upscale(pointer_element.zoom())
