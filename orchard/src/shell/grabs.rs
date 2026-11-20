@@ -110,12 +110,14 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
             if data.is_tiling_mode() {
                 if self.dragged {
                     let window = self.window.clone();
-                    let pointer = data.pointer.current_location();
+                    // `handle`, not `data.pointer`: the pointer mutex is held for the
+                    // whole grab callback, so locking it again deadlocks the compositor
+                    let pointer = handle.current_location();
                     data.dwindle_drop_drag(&window, pointer);
                 }
             } else {
                 let window = self.window.clone();
-                let pointer = data.pointer.current_location();
+                let pointer = handle.current_location();
                 let peeled = self.dragged && data.stage_on_live_drag_end(&window, pointer);
                 if !peeled {
                     if let Some((tile, area)) = self.tile.take() {

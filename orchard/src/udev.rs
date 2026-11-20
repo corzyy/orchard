@@ -654,7 +654,9 @@ pub fn run_udev() {
      */
 
     crate::session::install_signal_handlers();
+    crate::watchdog::start();
     while state.running.load(Ordering::SeqCst) {
+        crate::watchdog::tick();
         let result = event_loop.dispatch(Some(Duration::from_millis(500)), &mut state);
         if crate::session::shutdown_requested() {
             tracing::info!("termination signal: quitting");

@@ -124,13 +124,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// Usable area of the output a window is (mostly) on: excludes menu bar & dock.
     pub fn usable_area_for(&self, window: &WindowElement) -> Option<Rectangle<i32, Logical>> {
+        // No pointer lookup here: this runs from pointer-grab callbacks (drag
+        // end -> tile -> zoom), where locking `self.pointer` again deadlocks.
         let output = self.window_output(window)
-            .or_else(|| {
-                self.space
-                    .output_under(self.pointer.current_location())
-                    .next()
-                    .cloned()
-            })
+            .or_else(|| self.space.outputs_for_element(window).into_iter().next())
             .or_else(|| self.primary_output())?;
         let geo = self.space.output_geometry(&output)?;
         let zone = layer_map_for_output(&output).non_exclusive_zone();
