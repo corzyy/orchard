@@ -1171,7 +1171,15 @@ impl OrchardState<UdevData> {
                 }
             };
 
-            // Using an overlay plane on a nvidia card breaks
+            // Using an overlay plane on a nvidia card breaks.
+            //
+            // The cursor plane too: smithay's DrmCompositor allocates a fresh GBM
+            // buffer of the plane's size (256x256 on NVIDIA) every time the cursor
+            // image changes and copies only the cursor image into its top-left
+            // corner. The rest is never cleared, and on NVIDIA freshly allocated
+            // memory is uninitialized VRAM, so white dots flash around the pointer
+            // on every cursor change (and every frame of an animated cursor).
+            // Without a cursor plane the cursor is composited on the primary plane.
             if driver.name().to_string_lossy().to_lowercase().contains("nvidia")
                 || driver
                     .description()
@@ -1180,6 +1188,9 @@ impl OrchardState<UdevData> {
                     .contains("nvidia")
             {
                 planes.overlay = vec![];
+                if std::env::var("ORCHARD_NVIDIA_CURSOR_PLANE").is_err() {
+                    planes.cursor = vec![];
+                }
             }
 
             let drm_output = match device
