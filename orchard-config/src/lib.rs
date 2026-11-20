@@ -149,13 +149,52 @@ pub struct DockSettings {
     pub magnification: bool,
     /// Size of the tile under the pointer when magnification is on.
     pub magnified_size: f32,
-    /// Hide the Dock until the pointer touches the bottom edge.
-    pub autohide: bool,
+    /// When the Dock hides itself.
+    pub autohide: DockAutohide,
     pub show_indicators: bool,
     pub animate_launch: bool,
     pub minimize_effect: MinimizeEffect,
     /// Screen edge the Dock sits on.
     pub position: DockPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DockAutohide {
+    /// Always visible (reserves an exclusive zone).
+    #[default]
+    Never,
+    /// Hide whenever a window overlaps the Dock; reveal on edge hover.
+    AvoidWindows,
+    /// Always hide until the pointer touches the screen edge.
+    Always,
+}
+
+impl<'de> Deserialize<'de> for DockAutohide {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DockAutohide;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a dock hide mode (\"never\", \"avoid_windows\", \"always\") or boolean")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(if v { DockAutohide::Always } else { DockAutohide::Never })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "never" => Ok(DockAutohide::Never),
+                    "avoid_windows" => Ok(DockAutohide::AvoidWindows),
+                    "always" => Ok(DockAutohide::Always),
+                    _ => Err(E::unknown_variant(v, &["never", "avoid_windows", "always"])),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -173,7 +212,7 @@ impl Default for DockSettings {
             icon_size: 52.0,
             magnification: true,
             magnified_size: 84.0,
-            autohide: false,
+            autohide: DockAutohide::Never,
             show_indicators: true,
             animate_launch: true,
             minimize_effect: MinimizeEffect::Genie,
@@ -610,5 +649,23 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(loaded.desktop.wallpaper, s.desktop.wallpaper);
         assert_eq!(loaded.desktop.wallpapers, s.desktop.wallpapers);
+    }
+
+    #[test]
+    fn dock_autohide_round_trips_and_migrates_bools() {
+        for mode in [DockAutohide::Never, DockAutohide::AvoidWindows, DockAutohide::Always] {
+            let mut s = Settings::default();
+            s.dock.autohide = mode;
+            let json = serde_json::to_string(&s).unwrap();
+            let (loaded, problems) = Settings::from_json_lenient(&json);
+            assert!(problems.is_empty(), "{problems:?}");
+            assert_eq!(loaded.dock.autohide, mode);
+        }
+        let (s_true, p1) = Settings::from_json_lenient(r#"{"dock":{"autohide":true}}"#);
+        assert!(p1.is_empty(), "{p1:?}");
+        assert_eq!(s_true.dock.autohide, DockAutohide::Always);
+        let (s_false, p2) = Settings::from_json_lenient(r#"{"dock":{"autohide":false}}"#);
+        assert!(p2.is_empty(), "{p2:?}");
+        assert_eq!(s_false.dock.autohide, DockAutohide::Never);
     }
 }

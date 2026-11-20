@@ -8,7 +8,7 @@ use std::{
 };
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, ColorImage, CornerRadius, Rect, Sense, Stroke, StrokeKind, TextureHandle, Ui};
-use orchard_config::{Accent, CornerAction, DockPosition, MinimizeEffect, ThemeMode, TitlebarDoubleClick};
+use orchard_config::{Accent, CornerAction, DockAutohide, DockPosition, MinimizeEffect, ThemeMode, TitlebarDoubleClick};
 
 use super::{hero, Cx};
 use crate::{
@@ -454,8 +454,20 @@ pub fn desktop_dock(ui: &mut Ui, cx: &mut Cx) {
                 d.minimize_effect = eff;
             }
         });
-        g.row("Automatically hide and show the Dock", |ui| {
-            toggle(ui, &mut d.autohide);
+        let mut hide = d.autohide;
+        g.row("Hide the Dock", |ui| {
+            if popup(
+                ui,
+                "dock-hide",
+                &mut hide,
+                &[
+                    (DockAutohide::Never, "Never".into()),
+                    (DockAutohide::AvoidWindows, "Avoid windows".into()),
+                    (DockAutohide::Always, "Always".into()),
+                ],
+            ) {
+                d.autohide = hide;
+            }
         });
         g.row("Animate opening applications", |ui| {
             toggle(ui, &mut d.animate_launch);

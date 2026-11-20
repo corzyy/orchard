@@ -13,7 +13,7 @@ use crate::{
     theme::Theme,
 };
 
-use orchard_config::{DockPosition, DockSettings};
+use orchard_config::{DockAutohide, DockPosition, DockSettings};
 
 const GAP: f32 = 6.0;
 const PAD_X: f32 = 8.0;
@@ -142,10 +142,12 @@ pub struct Dock {
     pub mag: f32,
     /// Settings ▸ Desktop & Dock
     pub cfg: DockSettings,
-    /// 0 = shown, 1 = hidden (animated; only with autohide)
+    /// 0 = shown, 1 = hidden (animated; with autohide / avoid-windows)
     pub hidden: f32,
     /// keep an auto-hidden Dock visible (pointer on it, menu open)
     pub reveal: bool,
+    /// a visible window overlaps the Dock's resting rect (for AvoidWindows)
+    pub obstructed: bool,
     /// minimized-window pictures by path
     thumbs: HashMap<String, Rc<Pixmap>>,
     /// the first rebuild shows everything at once (no grow-in)
@@ -227,6 +229,7 @@ impl Dock {
             cfg: DockSettings::default(),
             hidden: 0.0,
             reveal: false,
+            obstructed: false,
             thumbs: HashMap::new(),
             built: false,
             drag: None,
@@ -314,14 +317,22 @@ impl Dock {
         self.map_rect(bg, sw, sh)
     }
 
+    /// Settled (unhidden, unmagnified) Dock rect extended to the screen edge,
+    /// in surface coordinates (used for "avoid windows" overlap detection).
+    pub fn resting_rect(&self, sw: f32, sh: f32) -> RectF {
+        let tmp = self.settled(false);
+        let (_, bg) = tmp.layout(sw, sh);
+        self.map_rect((bg.0, bg.1, bg.2, bg.3 + MARGIN_BOTTOM), sw, sh)
+    }
+
     /// Icon square of a placed item in surface coordinates.
     pub fn tile_rect(&self, p: &Placed, sw: f32, sh: f32) -> RectF {
         self.map_rect((p.x, p.bottom - p.size, p.size, p.size), sw, sh)
     }
 
-    /// Exclusive zone (what windows must not cover); none when auto-hiding.
+    /// Exclusive zone (what windows must not cover); none when auto-hiding or avoiding windows.
     pub fn exclusive_zone(&self) -> f32 {
-        if self.cfg.autohide {
+        if self.cfg.autohide != DockAutohide::Never {
             0.0
         } else {
             MARGIN_BOTTOM + self.bar_height() + 4.0
@@ -329,7 +340,12 @@ impl Dock {
     }
 
     fn hidden_target(&self) -> f32 {
-        if self.cfg.autohide && !self.reveal && self.hover_x.is_none() {
+        let should_hide = match self.cfg.autohide {
+            DockAutohide::Never => false,
+            DockAutohide::Always => true,
+            DockAutohide::AvoidWindows => self.obstructed,
+        };
+        if should_hide && !self.reveal && self.hover_x.is_none() {
             1.0
         } else {
             0.0
@@ -338,7 +354,7 @@ impl Dock {
 
     /// Fully hidden (input only on the reveal strip).
     pub fn is_hidden(&self) -> bool {
-        self.cfg.autohide && self.hidden > 0.99
+        self.cfg.autohide != DockAutohide::Never && self.hidden > 0.99
     }
 
     /// Rebuild items from pinned apps + the compositor's window list.
@@ -704,6 +720,7 @@ impl Dock {
             cfg: self.cfg.clone(),
             hidden: 0.0,
             reveal: false,
+            obstructed: false,
             thumbs: HashMap::new(),
             built: true,
             drag: None,
@@ -1233,11 +1250,24 @@ mod tests {
         assert_eq!(d.icon_max(), 40.0);
         let (p, _) = d.layout(800.0, 200.0);
         assert!(p.iter().all(|p| (p.size - 40.0).abs() < 1e-3));
-        d.cfg.autohide = true;
+        d.cfg.autohide = DockAutohide::Always;
         assert_eq!(d.exclusive_zone(), 0.0);
         d.step(1.0);
         assert!(d.is_hidden());
         let (_, bg) = d.layout(800.0, d.surface_height());
         assert!(bg.1 >= d.surface_height(), "hidden dock is below the edge");
+
+        // AvoidWindows: no exclusive zone, hides only when obstructed (and reveals on hover)
+        d.cfg.autohide = DockAutohide::AvoidWindows;
+        assert_eq!(d.exclusive_zone(), 0.0);
+        d.obstructed = false;
+        d.step(1.0);
+        assert!(!d.is_hidden());
+        d.obstructed = true;
+        d.step(1.0);
+        assert!(d.is_hidden());
+        d.hover_x = Some(400.0);
+        d.step(1.0);
+        assert!(!d.is_hidden());
     }
 }

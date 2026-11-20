@@ -23,7 +23,7 @@ mod switcher;
 mod text;
 mod theme;
 
-use orchard_config::DockPosition;
+use orchard_config::{DockAutohide, DockPosition};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -640,6 +640,13 @@ impl App {
                     Some("launcher_toggle") => self.toggle_launcher(),
                     Some("launchpad_toggle") => self.toggle_launchpad(),
                     Some("settings_changed") => self.reload_settings(),
+                    Some("dock_obstructed") => {
+                        let obstructed = v["obstructed"].as_bool().unwrap_or(false);
+                        if self.dock.obstructed != obstructed {
+                            self.dock.obstructed = obstructed;
+                            self.redraw(Which::Dock);
+                        }
+                    }
                     Some("media_key") => {
                         let key = v["key"].as_str().unwrap_or_default().to_string();
                         let fine = v["fine"].as_bool().unwrap_or(false);
@@ -681,7 +688,7 @@ impl App {
         let old_zone = self.dock.exclusive_zone();
         let old_edge = self.dock.edge();
         self.dock.cfg = s.dock.clone();
-        if !self.dock.cfg.autohide {
+        if self.dock.cfg.autohide == DockAutohide::Never {
             self.dock.hidden = 0.0;
         }
         let (h, zone) = (self.dock.surface_height(), self.dock.exclusive_zone());
@@ -831,7 +838,13 @@ impl App {
             DockPosition::Bottom => "bottom",
             DockPosition::Right => "right",
         };
-        let msg = json!({"output": self.output_name, "edge": edge, "tiles": tiles});
+        let (rx, ry, rw, rh) = self.dock.resting_rect(sw, sh);
+        let msg = json!({
+            "output": self.output_name,
+            "edge": edge,
+            "tiles": tiles,
+            "dock_rect": {"x": ox + rx, "y": oy + ry, "w": rw, "h": rh},
+        });
         let key = msg.to_string();
         if key != self.last_tiles {
             self.last_tiles = key;

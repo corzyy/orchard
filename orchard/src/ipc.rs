@@ -71,8 +71,14 @@ pub enum Request {
     QuitApp { app_id: String },
     /// Run a named WM action on the focused window (close, minimize, zoom, …).
     Action { name: String },
-    /// Dock tile positions (output-relative logical px) for genie targets.
-    SetDockTiles { output: String, tiles: Vec<DockTile> },
+    /// Dock tile positions (output-relative logical px) for genie targets,
+    /// plus the settled Dock rect for "avoid windows".
+    SetDockTiles {
+        output: String,
+        tiles: Vec<DockTile>,
+        #[serde(default)]
+        dock_rect: Option<Rect>,
+    },
     /// Frosted-glass regions for a layer surface namespace (surface-relative).
     SetBackdrop { namespace: String, rects: Vec<Rect> },
     Spawn { command: String },
@@ -150,6 +156,8 @@ pub enum Event<'a> {
     SettingsChanged,
     /// volume / brightness / media key pressed (orchard-shell runs it and shows the HUD)
     MediaKey { key: &'static str, fine: bool },
+    /// whether any visible window currently overlaps the Dock's resting rect
+    DockObstructed { obstructed: bool },
 }
 
 /// State of the Cmd+Tab app switcher (drawn by orchard-shell).
@@ -190,6 +198,10 @@ pub struct IpcState {
     pub dock_window_tiles: HashMap<u64, Rectangle<f64, Logical>>,
     /// the tile a window minimized now would get
     pub dock_next_minimized: Option<Rectangle<f64, Logical>>,
+    /// global logical rect of the Dock pill when visible (for "avoid windows")
+    pub dock_rect: Option<Rectangle<f64, Logical>>,
+    /// last broadcast `dock_obstructed` state
+    last_dock_obstructed: bool,
     /// layer namespace -> surface-relative rects
     pub backdrops: HashMap<String, Vec<Rect>>,
     /// the running orchard-shell, restarted if it exits
@@ -368,6 +380,9 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 }
                 let windows = self.window_infos();
                 let _ = send_line(stream, &Event::Windows { windows: &windows });
+                let obstructed = self.is_dock_obstructed();
+                self.ipc.last_dock_obstructed = obstructed;
+                let _ = send_line(stream, &Event::DockObstructed { obstructed });
                 None
             }
             Request::Windows => {
@@ -416,7 +431,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 self.run_named_action(&name);
                 Some(Event::Ok)
             }
-            Request::SetDockTiles { output, tiles } => {
+            Request::SetDockTiles { output, tiles, dock_rect } => {
                 let origin = self
                     .space
                     .outputs()
@@ -427,6 +442,12 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 self.ipc.dock_tiles.clear();
                 self.ipc.dock_window_tiles.clear();
                 self.ipc.dock_next_minimized = None;
+                self.ipc.dock_rect = dock_rect.map(|r| {
+                    Rectangle::new(
+                        (origin.x as f64 + r.x, origin.y as f64 + r.y).into(),
+                        (r.w, r.h).into(),
+                    )
+                });
                 for t in tiles {
                     let r = Rectangle::new(
                         (origin.x as f64 + t.rect.x, origin.y as f64 + t.rect.y).into(),
@@ -654,20 +675,64 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
     }
 
-    /// Push a `windows` event to subscribers if anything changed.
+    /// Whether any visible window (or fullscreen surface) overlaps the Dock's resting rect.
+    fn is_dock_obstructed(&self) -> bool {
+        let Some(dock) = self.ipc.dock_rect else {
+            return false;
+        };
+        if dock.size.w <= 0.0 || dock.size.h <= 0.0 {
+            return false;
+        }
+        let overlaps = |a: Rectangle<f64, Logical>, b: Rectangle<f64, Logical>| {
+            a.loc.x < b.loc.x + b.size.w
+                && a.loc.x + a.size.w > b.loc.x
+                && a.loc.y < b.loc.y + b.size.h
+                && a.loc.y + a.size.h > b.loc.y
+        };
+        for output in self.space.outputs() {
+            let has_fs = output
+                .user_data()
+                .get::<crate::shell::FullscreenSurface>()
+                .and_then(|f| f.get())
+                .is_some();
+            if has_fs {
+                if let Some(geo) = self.space.output_geometry(output) {
+                    if overlaps(geo.to_f64(), dock) {
+                        return true;
+                    }
+                }
+            }
+        }
+        self.space.elements().any(|w| {
+            w.alive()
+                && self
+                    .window_global_rect(w)
+                    .map(|r| overlaps(r.to_f64(), dock))
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Push a `windows` or `dock_obstructed` event to subscribers if anything changed.
     pub fn ipc_broadcast_if_changed(&mut self) {
         if self.ipc.subscribers.is_empty() {
             return;
         }
         let windows = self.window_infos();
-        if windows == self.ipc.last_windows {
-            return;
+        if windows != self.ipc.last_windows {
+            let ev = Event::Windows { windows: &windows };
+            self.ipc
+                .subscribers
+                .retain(|_, stream| send_line(stream, &ev).is_ok());
+            self.ipc.last_windows = windows;
         }
-        let ev = Event::Windows { windows: &windows };
-        self.ipc
-            .subscribers
-            .retain(|_, stream| send_line(stream, &ev).is_ok());
-        self.ipc.last_windows = windows;
+        let obstructed = self.is_dock_obstructed();
+        if obstructed != self.ipc.last_dock_obstructed {
+            let ev = Event::DockObstructed { obstructed };
+            self.ipc
+                .subscribers
+                .retain(|_, stream| send_line(stream, &ev).is_ok());
+            self.ipc.last_dock_obstructed = obstructed;
+        }
     }
 
     /// Frosted-glass rects for a layer surface namespace, if the shell set any.
