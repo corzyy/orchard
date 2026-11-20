@@ -225,14 +225,16 @@ impl MenuBar {
             x -= 22.0;
             crate::panel::moon(pm, (x + 11.0) * s, HEIGHT / 2.0 * s, 6.0 * s, theme.bar_text);
         }
-        if let Some(b) = &self.battery {
-            x -= 30.0;
-            draw_battery(pm, x * s, HEIGHT / 2.0 * s, s, b, theme.bar_text);
-            if self.cfg.battery_percentage {
-                let label = format!("{}%", b.percent);
-                let lw = fonts.measure(&label, 12.0 * s, Weight::Regular) / s;
-                x -= lw + 6.0;
-                fonts.draw(pm, &label, x * s, baseline, 12.0 * s, Weight::Regular, theme.bar_text);
+        if self.cfg.show_battery {
+            if let Some(b) = &self.battery {
+                x -= 30.0;
+                draw_battery(pm, x * s, HEIGHT / 2.0 * s, s, b, theme.bar_text);
+                if self.cfg.battery_percentage {
+                    let label = format!("{}%", b.percent);
+                    let lw = fonts.measure(&label, 12.0 * s, Weight::Regular) / s;
+                    x -= lw + 6.0;
+                    fonts.draw(pm, &label, x * s, baseline, 12.0 * s, Weight::Regular, theme.bar_text);
+                }
             }
         }
     }

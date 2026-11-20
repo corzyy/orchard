@@ -312,6 +312,21 @@ pub fn menu_bar(ui: &mut Ui, cx: &mut Cx) {
                 }
             },
         );
+        let mut bat = cx.s.menu_bar.show_battery;
+        g.row_with(
+            "Battery",
+            RowOpts {
+                sub: Some("Show Battery in Menu Bar"),
+                icon: Some(Page::Battery.icon()),
+                ..Default::default()
+            },
+            Some(cx.icons),
+            |ui| {
+                if toggle(ui, &mut bat).changed() {
+                    cx.s.menu_bar.show_battery = bat;
+                }
+            },
+        );
     });
     header(ui, "Clock");
     group(ui, |g| {

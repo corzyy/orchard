@@ -193,6 +193,7 @@ pub struct MenuBarSettings {
     pub battery_percentage: bool,
     pub show_network: bool,
     pub show_volume: bool,
+    pub show_battery: bool,
 }
 
 impl Default for MenuBarSettings {
@@ -205,6 +206,7 @@ impl Default for MenuBarSettings {
             battery_percentage: false,
             show_network: true,
             show_volume: true,
+            show_battery: true,
         }
     }
 }
