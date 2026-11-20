@@ -29,7 +29,7 @@ use smithay::{
         PopupKind, PopupManager, Space,
     },
     input::{
-        keyboard::{Keysym, LedState, XkbConfig},
+        keyboard::{LedState, XkbConfig},
         pointer::{CursorImageStatus, CursorImageSurfaceData, PointerHandle},
         Seat, SeatHandler, SeatState,
     },
