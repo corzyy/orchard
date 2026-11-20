@@ -266,6 +266,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             .map(|inhibitor| inhibitor.is_active())
             .unwrap_or(false);
 
+        let mut switcher_commit = false;
         let action = keyboard
             .input(self, keycode, state, serial, time, |st, modifiers, handle| {
                 let keysym = handle.modified_sym();
@@ -331,7 +332,11 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                         FilterResult::Forward
                     }
                 } else if st.switcher.is_some() && (keysym == Keysym::Super_L || keysym == Keysym::Super_R) {
-                    FilterResult::Intercept(KeyAction::SwitcherCommit)
+                    // commit the switcher, but still forward the release: Super's
+                    // press reached the client, so swallowing it would leave the
+                    // client with Super held down
+                    switcher_commit = true;
+                    FilterResult::Forward
                 } else {
                     let suppressed = suppressed_keys.contains(&keycode);
                     if suppressed {
@@ -345,6 +350,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             .unwrap_or(KeyAction::None);
 
         self.suppressed_keys = suppressed_keys;
+        if switcher_commit {
+            return KeyAction::SwitcherCommit;
+        }
         action
     }
 
