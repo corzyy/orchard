@@ -127,9 +127,6 @@ pub fn desktop_dock(s: &Settings) -> El {
         form::toggle_row("Show indicators for open applications", None, d.show_indicators, |v| {
             edit(move |s| s.dock.show_indicators = v)
         }),
-        form::toggle_row("Show items on desktop", None, s.windows.show_desktop_icons, |v| {
-            edit(move |s| s.windows.show_desktop_icons = v)
-        }),
     ]);
 
     let cur_dbl = match s.windows.double_click_titlebar {
@@ -186,6 +183,10 @@ pub fn desktop_dock(s: &Settings) -> El {
     column![
         form::section("Dock"),
         form::group(dock_rows),
+        form::section("Desktop"),
+        form::group([form::toggle_row("Show items on desktop", None, s.windows.show_desktop_icons, |v| {
+            edit(move |s| s.windows.show_desktop_icons = v)
+        })]),
         form::section("Windows"),
         windows,
         form::section("Mission Control"),
@@ -324,7 +325,10 @@ pub fn displays(s: &Settings, st: &mut DesktopState, wake: &Wake) -> El {
         .iter()
         .map(|o| art::Screen { name: o.name.clone(), w: o.w, h: o.h, primary: o.primary })
         .collect();
-    let mut col = column![form::group([form::custom_row(art::arrangement(screens))])];
+    let mut col = column![
+        form::section("Arrangement"),
+        form::group([form::custom_row(art::arrangement(screens))]),
+    ];
 
     let multi = outputs.len() > 1;
     for o in &outputs {

@@ -162,7 +162,7 @@ pub fn appearance(s: &Settings, st: &mut AppearanceState, wake: &Wake) -> El {
         );
     }
     let mode_row = form::custom_row(
-        row![text("Appearance").size(13).color(p.text).width(Length::Fill), thumbs].align_y(Alignment::Center),
+        row![text("Mode").size(13).color(p.text).width(Length::Fill), thumbs].align_y(Alignment::Center),
     );
 
     // Accent swatches, a separator, then the "from wallpaper" palette.
@@ -195,6 +195,7 @@ pub fn appearance(s: &Settings, st: &mut AppearanceState, wake: &Wake) -> El {
     let cur_icon = s.appearance.icon_theme.clone().unwrap_or_default();
 
     column![
+        form::section("Theme"),
         form::group([mode_row, accent_row]),
         form::section("Windows & Icons"),
         form::group([
@@ -227,7 +228,7 @@ pub fn accessibility(s: &Settings, st: &mut AppearanceState, wake: &Wake) -> El 
     let sizes = [24u32, 32, 36, 48, 64].map(|n| (n.to_string(), format!("{n} px")));
 
     column![
-        form::section("Display"),
+        form::section("Motion & Transparency"),
         form::group([
             form::toggle_row(
                 "Reduce motion",
@@ -563,6 +564,7 @@ pub fn wallpaper(s: &Settings, st: &mut AppearanceState, wake: &Wake) -> El {
     }
 
     column![
+        form::section("Current Wallpaper"),
         preview,
         form::error(st.wp_err.clone()),
         form::section("Your Wallpapers"),

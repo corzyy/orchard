@@ -153,6 +153,7 @@ pub fn keyboard(s: &Settings, st: &mut InputState, wake: &Wake) -> El {
     ]);
 
     column![
+        form::section("Key Repeat"),
         repeat,
         form::section("Text Input"),
         form::group(layout_rows),
@@ -170,27 +171,31 @@ fn step20(v: f64) -> f64 {
 pub fn mouse(s: &Settings) -> El {
     let p = &s.pointer;
     let cur = if p.mouse_left_handed { "right" } else { "left" };
-    form::group([
-        form::slider_row("Tracking speed", None, -1.0..=1.0, p.mouse_speed, 0.05, Some(("Slow", "Fast")), |v| {
-            edit(move |s| s.pointer.mouse_speed = step20(v))
-        }),
-        form::slider_row("Scrolling speed", None, 0.25..=3.0, p.scroll_factor, 0.05, Some(("Slow", "Fast")), |v| {
-            edit(move |s| s.pointer.scroll_factor = step20(v))
-        }),
-        form::toggle_row("Natural scrolling", some("Content tracks finger movement"), p.mouse_natural_scroll, |v| {
-            edit(move |s| s.pointer.mouse_natural_scroll = v)
-        }),
-        form::toggle_row("Pointer acceleration", None, p.mouse_acceleration, |v| {
-            edit(move |s| s.pointer.mouse_acceleration = v)
-        }),
-        form::popup_row(
-            "Primary mouse button",
-            None,
-            choices([("left", "Left"), ("right", "Right")]),
-            cur,
-            |v| edit(move |s| s.pointer.mouse_left_handed = v == "right"),
-        ),
-    ])
+    column![
+        form::section("Mouse"),
+        form::group([
+            form::slider_row("Tracking speed", None, -1.0..=1.0, p.mouse_speed, 0.05, Some(("Slow", "Fast")), |v| {
+                edit(move |s| s.pointer.mouse_speed = step20(v))
+            }),
+            form::slider_row("Scrolling speed", None, 0.25..=3.0, p.scroll_factor, 0.05, Some(("Slow", "Fast")), |v| {
+                edit(move |s| s.pointer.scroll_factor = step20(v))
+            }),
+            form::toggle_row("Natural scrolling", some("Content tracks finger movement"), p.mouse_natural_scroll, |v| {
+                edit(move |s| s.pointer.mouse_natural_scroll = v)
+            }),
+            form::toggle_row("Pointer acceleration", None, p.mouse_acceleration, |v| {
+                edit(move |s| s.pointer.mouse_acceleration = v)
+            }),
+            form::popup_row(
+                "Primary mouse button",
+                None,
+                choices([("left", "Left"), ("right", "Right")]),
+                cur,
+                |v| edit(move |s| s.pointer.mouse_left_handed = v == "right"),
+            ),
+        ]),
+    ]
+    .into()
 }
 
 pub fn trackpad(s: &Settings) -> El {

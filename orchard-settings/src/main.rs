@@ -253,7 +253,7 @@ impl App {
 
         let mut body = Column::new();
         if self.compositor_live == Some(false) {
-            body = body.push(form::note("Saved. Restart Orchard for changes to take effect.", p.danger));
+            body = body.push(form::note("Saved. Restart Orchard for changes to take effect.", p.warning));
         }
         body = body.push(page);
 
@@ -278,7 +278,7 @@ impl App {
 
     fn sidebar(&self) -> Element<'_, Message> {
         let p = palette();
-        let search = controls::search_field(search_id(), "Search", &self.search, Message::Search, None);
+        let search = controls::search_field(search_id(), "Search Settings", &self.search, Message::Search, None);
 
         let item = |pg: Page, selected: bool| {
             let (icon, color) = pg.icon();
@@ -303,7 +303,7 @@ impl App {
                 list = list.push(
                     container(text("No Results").size(13).color(p.text_secondary))
                         .center_x(Length::Fill)
-                        .padding([metrics::space::XL + 2.0, 0.0]),
+                        .padding([metrics::space::XL + 4.0, 0.0]),
                 );
             }
             for pg in hits {
@@ -312,10 +312,8 @@ impl App {
         } else {
             list = list.push(self.account_card());
             let active = self.page.sidebar_item();
-            for (i, section) in SIDEBAR.iter().enumerate() {
-                if i > 0 {
-                    list = list.push(chrome::sidebar_gap());
-                }
+            for (heading, section) in SIDEBAR.iter() {
+                list = list.push(chrome::sidebar_heading(*heading));
                 for &pg in *section {
                     list = list.push(item(pg, active == pg));
                 }
@@ -336,13 +334,13 @@ impl App {
             .take(2)
             .flat_map(char::to_uppercase)
             .collect();
-        let avatar = container(text(initials).size(13.5).font(fonts::bold()).color(iced::Color::WHITE))
+        let avatar = container(text(initials).size(13).font(fonts::semibold()).color(iced::Color::WHITE))
             .center(34)
-            .style(|_| container::Style {
+            .style(move |_| container::Style {
                 background: Some(iced::Background::Gradient(iced::Gradient::Linear(
                     iced::gradient::Linear::new(iced::Radians(std::f32::consts::PI))
-                        .add_stop(0.0, iced::Color::from_rgb8(0xA8, 0xA8, 0xAE))
-                        .add_stop(1.0, iced::Color::from_rgb8(0x7C, 0x7C, 0x82)),
+                        .add_stop(0.0, orchard_ui::palette::mix(p.accent, iced::Color::WHITE, 0.28))
+                        .add_stop(1.0, p.accent),
                 ))),
                 border: style::no_border(17.0),
                 ..Default::default()
@@ -351,18 +349,20 @@ impl App {
             row![
                 avatar,
                 column![
-                    text(self.user.0.clone()).size(13).font(fonts::bold()).color(p.text),
+                    text(self.user.0.clone()).size(13).font(fonts::semibold()).color(p.text),
                     text(self.user.1.clone()).size(11).color(p.text_secondary),
                 ]
                 .spacing(1)
+                .width(Length::Fill),
+                orchard_ui::icons::symbol(orchard_ui::icons::Symbol::ChevronRight, 11.0, p.text_tertiary),
             ]
             .spacing(10)
             .align_y(Alignment::Center),
         )
         .on_press(Message::Go(Page::About))
-        .padding([9, 8])
+        .padding([8, 8])
         .width(Length::Fill)
-        .style(style::row(8.0))
+        .style(style::row(9.0))
         .into()
     }
 }
@@ -407,6 +407,6 @@ fn main() -> iced::Result {
         .antialiasing(true)
         .subscription(App::subscription)
         .exit_on_close_request(false)
-        .window(orchard_ui::window_settings("org.orchard.settings", (880.0, 660.0), Some((720.0, 500.0))))
+        .window(orchard_ui::window_settings("org.orchard.settings", (940.0, 720.0), Some((760.0, 520.0))))
         .run_with(move || App::new(start_page))
 }

@@ -91,13 +91,13 @@ pub enum Page {
 
 use Page::*;
 
-/// Top-level sidebar sections, mirroring macOS System Settings.
-pub const SIDEBAR: &[&[Page]] = &[
-    &[Wifi, Bluetooth, Network],
-    &[Sound],
-    &[General, Accessibility, Appearance, MenuBar, DesktopDock, Tiling, Displays, Wallpaper],
-    &[LockScreen, Battery],
-    &[Keyboard, Mouse, Trackpad],
+/// Top-level sidebar groups. macOS uses broad, labelled groups rather than
+/// one long list; keeping them small makes the app feel calmer.
+pub const SIDEBAR: &[(&str, &[Page])] = &[
+    ("Network", &[Wifi, Bluetooth, Network]),
+    ("Devices", &[Sound, Displays, Keyboard, Mouse, Trackpad]),
+    ("System", &[General, Accessibility, LockScreen, Battery]),
+    ("Appearance & Desktop", &[Appearance, Wallpaper, MenuBar, DesktopDock, Tiling]),
 ];
 
 /// Every searchable page (including subpages under General).

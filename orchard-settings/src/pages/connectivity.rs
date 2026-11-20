@@ -299,7 +299,7 @@ pub fn network(st: &mut ConnState, wake: &Wake) -> El {
         } else {
             "Not Connected".to_string()
         };
-        col = col.push(form::group([form::nav_row(
+        col = col.push(form::section("Interfaces")).push(form::group([form::nav_row(
             tile("network-wireless", from_rgb(BLUE), 22.0),
             "Wi‑Fi",
             Some(wifi_status),
@@ -624,54 +624,56 @@ fn sound_section(st: &mut ConnState, is_output: bool) -> El {
             }),
         ));
     }
-    let mut col = column![
+
+    if let Some(cur) = current {
+        let held = if is_output { &mut st.out_vol } else { &mut st.in_vol };
+        if held.map(|(_, t)| t.elapsed().as_secs_f32() > 1.5).unwrap_or(false) {
+            *held = None;
+        }
+        let vol = held.map(|(v, _)| v).unwrap_or(cur.volume).min(1.0);
+        let (n1, n2) = (cur.name.clone(), cur.name.clone());
+        let p = palette();
+        dev_rows.push(form::row(
+            if is_output { "Output volume" } else { "Input volume" },
+            None,
+            row![
+                text(format!("{:.0}%", vol * 100.0)).size(12).color(p.text_secondary),
+                controls::slider(0.0..=1.0, vol, 0.01, move |v| {
+                    let name = n1.clone();
+                    act(move |_, st, _| {
+                        let held = if is_output { &mut st.conn.out_vol } else { &mut st.conn.in_vol };
+                        *held = Some((v, Instant::now()));
+                        pactl_async(vec![format!("set-{kind}-volume"), name.clone(), format!("{}%", (v * 100.0).round())]);
+                    })
+                })
+                .width(180),
+                controls::switch(!cur.mute, move |enabled| {
+                    let name = n2.clone();
+                    act(move |_, st, _| {
+                        pactl_async(vec![
+                            format!("set-{kind}-mute"),
+                            name.clone(),
+                            if enabled { "0".into() } else { "1".into() },
+                        ]);
+                        if let Some(v) = st.conn.sound.value.as_mut() {
+                            let list = if is_output { &mut v.sinks } else { &mut v.sources };
+                            if let Some(d) = list.iter_mut().find(|d| d.name == name) {
+                                d.mute = !enabled;
+                            }
+                        }
+                    })
+                }),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        ));
+    }
+
+    column![
         form::section(if is_output { "Output" } else { "Input" }),
         form::group(dev_rows),
-    ];
-
-    let Some(cur) = current else { return col.into() };
-    let held = if is_output { &mut st.out_vol } else { &mut st.in_vol };
-    if held.map(|(_, t)| t.elapsed().as_secs_f32() > 1.5).unwrap_or(false) {
-        *held = None;
-    }
-    let vol = held.map(|(v, _)| v).unwrap_or(cur.volume).min(1.0);
-    let (n1, n2) = (cur.name.clone(), cur.name.clone());
-    let p = palette();
-    col = col.push(form::group([form::row(
-        if is_output { "Output volume" } else { "Input volume" },
-        None,
-        row![
-            text(format!("{:.0}%", vol * 100.0)).size(12).color(p.text_secondary),
-            controls::slider(0.0..=1.0, vol, 0.01, move |v| {
-                let name = n1.clone();
-                act(move |_, st, _| {
-                    let held = if is_output { &mut st.conn.out_vol } else { &mut st.conn.in_vol };
-                    *held = Some((v, Instant::now()));
-                    pactl_async(vec![format!("set-{kind}-volume"), name.clone(), format!("{}%", (v * 100.0).round())]);
-                })
-            })
-            .width(180),
-            controls::switch(!cur.mute, move |enabled| {
-                let name = n2.clone();
-                act(move |_, st, _| {
-                    pactl_async(vec![
-                        format!("set-{kind}-mute"),
-                        name.clone(),
-                        if enabled { "0".into() } else { "1".into() },
-                    ]);
-                    if let Some(v) = st.conn.sound.value.as_mut() {
-                        let list = if is_output { &mut v.sinks } else { &mut v.sources };
-                        if let Some(d) = list.iter_mut().find(|d| d.name == name) {
-                            d.mute = !enabled;
-                        }
-                    }
-                })
-            }),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
-    )]));
-    col.into()
+    ]
+    .into()
 }
 
 pub fn sound(st: &mut ConnState, wake: &Wake) -> El {

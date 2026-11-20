@@ -113,6 +113,7 @@ pub fn lock_screen(s: &Settings, st: &SystemState) -> El {
         (m.to_string(), lbl)
     }));
     column![
+        form::section("Lock Screen"),
         form::group([
             form::popup_row(
                 "Lock screen when inactive for",
@@ -188,14 +189,18 @@ pub fn battery(s: &Settings, st: &mut SystemState, wake: &Wake) -> El {
             };
             rows.push(form::value_row(b.name.clone(), val));
         }
-        rows.push(form::toggle_row(
-            "Show battery percentage in Menu Bar",
-            None,
-            s.menu_bar.battery_percentage,
-            |v| edit(move |s| s.menu_bar.battery_percentage = v),
-        ));
-        col = col.push(form::group(rows)).push(form::error(st.power_job.error()));
+        col = col
+            .push(form::section("Power"))
+            .push(form::group(rows))
+            .push(form::error(st.power_job.error()));
     }
+
+    col = col.push(form::section("Menu Bar")).push(form::group([form::toggle_row(
+        "Show battery percentage",
+        some("Display the charge level next to the battery icon"),
+        s.menu_bar.battery_percentage,
+        |v| edit(move |s| s.menu_bar.battery_percentage = v),
+    )]));
 
     let perf = &s.performance;
     let cur_preset = match perf.preset {
@@ -465,7 +470,9 @@ pub fn general() -> El {
     let (icon, color) = Page::General.icon();
     column![
         form::hero(tile(icon, color, 54.0), Page::General.title(), Page::General.description()),
+        form::section("System"),
         form::group([nav(Page::About), nav(Page::SoftwareUpdate)]),
+        form::section("Preferences"),
         form::group([nav(Page::DateTime), nav(Page::LoginItems), nav(Page::DefaultApps)]),
     ]
     .into()
@@ -476,20 +483,29 @@ pub fn about(st: &mut SystemState, wake: &Wake) -> El {
     let Some(a) = &st.about.value else {
         return loading("Hardware");
     };
-    let mut rows = vec![form::value_row("Name", a.hostname.clone())];
+    let mut hardware = vec![form::value_row("Name", a.hostname.clone())];
+    let mut software = Vec::new();
     let mut add = |label: &'static str, v: &str| {
         if !v.is_empty() {
-            rows.push(form::value_row(label, v.to_string()));
+            software.push(form::value_row(label, v.to_string()));
         }
     };
-    add("Model", &a.model);
-    add("Processor", &crate::about::clean_cpu(&a.cpu));
-    add("Graphics", a.gpus.first().map(String::as_str).unwrap_or(""));
-    add("Memory", &a.memory);
+    if !a.model.is_empty() {
+        hardware.push(form::value_row("Model", a.model.clone()));
+    }
+    hardware.push(form::value_row("Processor", crate::about::clean_cpu(&a.cpu)));
+    hardware.push(form::value_row("Graphics", a.gpus.first().cloned().unwrap_or_else(|| "—".into())));
+    hardware.push(form::value_row("Memory", a.memory.clone()));
     add("OS", &a.os);
     add("Kernel", &a.kernel);
-    rows.push(form::value_row("Desktop", format!("Orchard {}", env!("CARGO_PKG_VERSION"))));
-    form::group(rows)
+    software.push(form::value_row("Desktop", format!("Orchard {}", env!("CARGO_PKG_VERSION"))));
+    column![
+        form::section("Hardware"),
+        form::group(hardware),
+        form::section("Software"),
+        form::group(software),
+    ]
+    .into()
 }
 
 pub fn date_time(st: &mut SystemState, wake: &Wake) -> El {
@@ -523,7 +539,7 @@ pub fn date_time(st: &mut SystemState, wake: &Wake) -> El {
     } else {
         rows.push(form::value_row("Time zone", t.timezone.clone()));
     }
-    column![form::group(rows), form::error(st.time_job.error())].into()
+    column![form::section("Date & Time"), form::group(rows), form::error(st.time_job.error())].into()
 }
 
 pub fn default_apps(s: &Settings, st: &mut SystemState, wake: &Wake) -> El {
@@ -546,9 +562,10 @@ pub fn default_apps(s: &Settings, st: &mut SystemState, wake: &Wake) -> El {
     if !topts.iter().any(|o| o.0 == cur_term) {
         topts.insert(0, (cur_term.clone(), cur_term.clone()));
     }
-    let mut rows = vec![form::popup_row("Terminal", some("Opened with ⌘Return"), choices(topts), &cur_term, |v| {
+    let term_row = form::popup_row("Terminal", some("Opened with ⌘Return"), choices(topts), &cur_term, |v| {
         edit(move |s| s.apps.terminal = v.clone())
-    })];
+    });
+    let mut rows: Vec<El> = Vec::new();
 
     if let Some(defs) = st.defaults.value.clone() {
         for (label, mimes) in DEFAULT_KINDS {
@@ -583,7 +600,11 @@ pub fn default_apps(s: &Settings, st: &mut SystemState, wake: &Wake) -> El {
             }));
         }
     }
-    column![form::group(rows), form::error(st.apps_job.error())].into()
+    let mut col = column![form::section("Terminal"), form::group([term_row])];
+    if !rows.is_empty() {
+        col = col.push(form::section("Default Applications")).push(form::group(rows));
+    }
+    col.push(form::error(st.apps_job.error())).into()
 }
 
 pub fn login_items(s: &Settings, st: &mut SystemState, wake: &Wake) -> El {
