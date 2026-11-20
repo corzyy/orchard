@@ -1,512 +1,610 @@
-//! orchard-settings: System Settings for the Orchard desktop.
+//! orchard-settings: fast, native Wayland System Settings for Orchard.
 //!
-//! Orchard's own options are stored in `~/.config/orchard/settings.json` and
-//! applied live (the compositor is told to reload over IPC). System options
-//! (Wi‑Fi, Bluetooth, sound, time, …) go through the usual Linux tools:
-//! nmcli, bluetoothctl, pactl, timedatectl, xdg-mime.
+//! Pure Wayland SHM + tiny-skia + fontdue (no OpenGL/EGL), event-driven via
+//! calloop with zero idle CPU usage and instant startup.
 
-mod about_window;
+mod about;
 mod icons;
 mod pages;
-mod style;
 mod sys;
-mod widgets;
+mod theme;
+mod ui;
 
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Margin, Rect, Sense, Stroke};
 use orchard_config::Settings;
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm, delegate_xdg_shell, delegate_xdg_window,
+    output::{OutputHandler, OutputState},
+    reexports::{
+        calloop::{
+            channel,
+            timer::{TimeoutAction, Timer},
+            EventLoop, LoopHandle, RegistrationToken,
+        },
+        calloop_wayland_source::WaylandSource,
+        client::{
+            globals::registry_queue_init,
+            protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+            Connection, QueueHandle,
+        },
+    },
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        pointer::{AxisScroll, PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT},
+        Capability, SeatHandler, SeatState,
+    },
+    shell::{
+        xdg::{
+            window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
+            XdgShell,
+        },
+        WaylandSurface,
+    },
+    shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use tiny_skia::Pixmap;
 
-use crate::{icons::Icons, style::pal, widgets::rgb};
+use crate::{
+    icons::Icons,
+    pages::{Page, PageState, ALL_PAGES, SIDEBAR},
+    sys::Wake,
+    theme::{resolve_dark, skia_color, Fonts, Palette, Weight},
+    ui::{hash_id, Rect, TextEvent, Ui, UiState},
+};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum Page {
-    Wifi,
-    Bluetooth,
-    Network,
-    Sound,
-    General,
-    About,
-    DateTime,
-    Language,
-    LoginItems,
-    DefaultApps,
-    Storage,
-    Appearance,
-    Accessibility,
-    MenuBar,
-    DesktopDock,
-    Displays,
-    Wallpaper,
-    LockScreen,
-    Battery,
-    Users,
-    Keyboard,
-    Mouse,
-    Trackpad,
-}
-
-use Page::*;
-
-const SIDEBAR: &[&[Page]] = &[
-    &[Wifi, Bluetooth, Network],
-    &[Sound],
-    &[General, Appearance, Accessibility, MenuBar, DesktopDock, Displays, Wallpaper],
-    &[LockScreen, Battery, Users],
-    &[Keyboard, Mouse, Trackpad],
-];
-
-const ALL_PAGES: &[Page] = &[
-    Wifi, Bluetooth, Network, Sound, General, About, DateTime, Language, LoginItems, DefaultApps, Storage,
-    Appearance, Accessibility, MenuBar, DesktopDock, Displays, Wallpaper, LockScreen, Battery, Users, Keyboard,
-    Mouse, Trackpad,
-];
-
-impl Page {
-    pub fn title(self) -> &'static str {
-        match self {
-            Wifi => "Wi‑Fi",
-            Bluetooth => "Bluetooth",
-            Network => "Network",
-            Sound => "Sound",
-            General => "General",
-            About => "About",
-            DateTime => "Date & Time",
-            Language => "Language & Region",
-            LoginItems => "Login Items",
-            DefaultApps => "Default Apps",
-            Storage => "Storage",
-            Appearance => "Appearance",
-            Accessibility => "Accessibility",
-            MenuBar => "Menu Bar",
-            DesktopDock => "Desktop & Dock",
-            Displays => "Displays",
-            Wallpaper => "Wallpaper",
-            LockScreen => "Lock Screen",
-            Battery => "Battery",
-            Users => "Users & Groups",
-            Keyboard => "Keyboard",
-            Mouse => "Mouse",
-            Trackpad => "Trackpad",
-        }
-    }
-
-    pub fn icon(self) -> (&'static str, Color32) {
-        let blue = rgb([0x0A, 0x84, 0xFF]);
-        let gray = rgb([0x8E, 0x8E, 0x93]);
-        let black = rgb([0x2C, 0x2C, 0x2E]);
-        match self {
-            Wifi => ("network-wireless", blue),
-            Bluetooth => ("bluetooth", blue),
-            Network => ("network-workgroup", blue),
-            Sound => ("audio-volume-high", rgb([0xFF, 0x37, 0x5F])),
-            General => ("emblem-system", gray),
-            About => ("computer", gray),
-            DateTime => ("preferences-system-time", blue),
-            Language => ("preferences-desktop-locale", blue),
-            LoginItems => ("system-run", gray),
-            DefaultApps => ("view-app-grid", rgb([0xAF, 0x52, 0xDE])),
-            Storage => ("drive-harddisk", gray),
-            Appearance => ("preferences-desktop-appearance", black),
-            Accessibility => ("preferences-desktop-accessibility", blue),
-            MenuBar => ("open-menu", gray),
-            DesktopDock => ("view-app-grid", black),
-            Displays => ("video-display", blue),
-            Wallpaper => ("preferences-desktop-wallpaper", rgb([0x32, 0xAD, 0xE6])),
-            LockScreen => ("system-lock-screen", black),
-            Battery => ("battery-full", rgb([0x30, 0xD1, 0x58])),
-            Users => ("system-users", blue),
-            Keyboard => ("input-keyboard", gray),
-            Mouse => ("input-mouse", gray),
-            Trackpad => ("input-touchpad", gray),
-        }
-    }
-
-    fn keywords(self) -> &'static str {
-        match self {
-            Wifi => "wireless wlan internet network ssid",
-            Bluetooth => "devices headphones pair",
-            Network => "ethernet vpn ip proxy wired lan",
-            Sound => "volume audio output input microphone speakers mute",
-            General => "about software system",
-            About => "system hardware cpu memory version hostname name computer",
-            DateTime => "clock time zone ntp 24-hour",
-            Language => "locale region format",
-            LoginItems => "autostart startup",
-            DefaultApps => "browser mail web terminal file manager open with",
-            Storage => "disk space drive",
-            Appearance => "dark light mode accent colour color theme",
-            Accessibility => "reduce motion transparency animation",
-            MenuBar => "clock control center battery percentage date seconds",
-            DesktopDock => "dock magnification minimize hot corners mission control windows title bar focus",
-            Displays => "screen monitor resolution scale hidpi",
-            Wallpaper => "background desktop picture",
-            LockScreen => "lock idle screensaver password",
-            Battery => "power energy profile performance",
-            Users => "account password user group",
-            Keyboard => "layout repeat shortcuts keys caps",
-            Mouse => "pointer speed scroll natural acceleration",
-            Trackpad => "touchpad tap click gestures swipe",
-        }
-    }
-
-    /// Sub pages of General show it highlighted in the sidebar.
-    fn sidebar_parent(self) -> Page {
-        match self {
-            About | DateTime | Language | LoginItems | DefaultApps | Storage => General,
-            p => p,
-        }
-    }
-}
+const INIT_W: u32 = 860;
+const INIT_H: u32 = 640;
+const MIN_W: u32 = 700;
+const MIN_H: u32 = 460;
+const SIDEBAR_W: f32 = 216.0;
+const TOOLBAR_H: f32 = 46.0;
 
 struct App {
+    loop_handle: LoopHandle<'static, App>,
+    registry: RegistryState,
+    output: OutputState,
+    shm: Shm,
+    seat: SeatState,
+    window: Window,
+    pool: SlotPool,
+
+    fonts: Fonts,
+    icons: Icons,
+    pal: Palette,
+    styled_key: (bool, [u8; 3]),
+
     settings: Settings,
     saved: Settings,
-    dirty_at: Option<Instant>,
-    page: Page,
-    back: Vec<Page>,
-    forward: Vec<Page>,
-    search: String,
-    icons: Icons,
-    styled: Option<(bool, [u8; 3])>,
-    last_dark_check: Instant,
-    st: pages::State,
-    /// None = unknown yet, Some(false) = compositor didn't accept reload
+    save_timer: Option<RegistrationToken>,
     compositor_live: Option<bool>,
+
+    page: Page,
+    search: String,
+    page_state: PageState,
+    ui_state: UiState,
+    wake: Wake,
+
+    width: u32,
+    height: u32,
+    scale: i32,
+    configured: bool,
+    exit: bool,
+    mods: Modifiers,
+    last_frame: Instant,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext) -> App {
-        style::install_fonts(&cc.egui_ctx);
-        let settings = Settings::load();
-        let norm = |s: &str| s.to_lowercase().replace([' ', '\u{2011}', '-'], "");
-        let start = std::env::args()
-            .nth(1)
-            .and_then(|a| {
-                let want = norm(&a);
-                ALL_PAGES.iter().copied().find(|p| norm(p.title()) == want)
-            })
-            .unwrap_or(Appearance);
-        let mut app = App {
-            saved: settings.clone(),
-            settings,
-            dirty_at: None,
-            page: start,
-            back: Vec::new(),
-            forward: Vec::new(),
-            search: String::new(),
-            icons: Icons::default(),
-            styled: None,
-            last_dark_check: Instant::now() - Duration::from_secs(10),
-            st: pages::State::default(),
-            compositor_live: None,
-        };
-        app.restyle(&cc.egui_ctx);
-        app
-    }
-
-    fn go(&mut self, page: Page) {
-        if page != self.page {
-            self.back.push(self.page);
-            self.forward.clear();
-            self.page = page;
+    fn update_theme(&mut self) {
+        let dark = resolve_dark(self.settings.appearance.mode);
+        let accent = self.settings.appearance.accent.rgb();
+        if self.styled_key != (dark, accent) {
+            self.pal = Palette::new(dark, accent);
+            self.styled_key = (dark, accent);
         }
     }
 
-    fn restyle(&mut self, ctx: &egui::Context) {
-        // Auto mode follows gsettings; re-check every few seconds
-        let need_check = self.styled.is_none() || self.last_dark_check.elapsed() > Duration::from_secs(3);
-        if !need_check {
+    fn schedule_save(&mut self) {
+        if self.settings == self.saved {
             return;
         }
-        self.last_dark_check = Instant::now();
-        let dark = style::resolve_dark(self.settings.appearance.mode);
-        let key = (dark, self.settings.appearance.accent.rgb());
-        if self.styled != Some(key) {
-            style::apply(ctx, key.0, key.1);
-            self.styled = Some(key);
+        if let Some(tok) = self.save_timer.take() {
+            self.loop_handle.remove(tok);
+        }
+        let timer = Timer::from_duration(Duration::from_millis(180));
+        if let Ok(tok) = self.loop_handle.insert_source(timer, |_, _, app: &mut App| {
+            app.save_timer = None;
+            app.save_now();
+            TimeoutAction::Drop
+        }) {
+            self.save_timer = Some(tok);
         }
     }
 
-    fn save(&mut self) {
+    fn save_now(&mut self) {
+        if self.settings == self.saved {
+            return;
+        }
         if let Err(e) = self.settings.save() {
-            eprintln!("orchard-settings: saving failed: {e}");
+            eprintln!("orchard-settings: save failed: {e}");
             return;
         }
-        // apps follow along through the compositor (session::sync_app_appearance),
-        // which writes Orchard's own dconf database, never another desktop's
         self.saved = self.settings.clone();
         let reply = orchard_config::ipc_request(&serde_json::json!({"request": "reload_settings"}));
         self.compositor_live = Some(matches!(reply, Ok(ref v) if v["event"] == "ok"));
-        self.styled = None; // re-evaluate appearance
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let p = pal();
-        ui.add_space(6.0);
-        // search field
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
-        ui.painter().rect_filled(rect, 7, if p.dark { Color32::from_white_alpha(16) } else { Color32::from_black_alpha(14) });
-        self.icons
-            .paint(ui, "system-search", Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(13.0, 13.0)), p.text2);
-        let edit_rect = Rect::from_min_max(pos2(rect.left() + 26.0, rect.top() + 4.0), pos2(rect.right() - 6.0, rect.bottom() - 4.0));
-        ui.put(
-            edit_rect,
-            egui::TextEdit::singleline(&mut self.search)
-                .frame(false)
-                .hint_text(egui::RichText::new("Search").color(p.text2))
-                .margin(Margin::symmetric(0, 1)),
-        );
-        ui.add_space(10.0);
-
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            let q = self.search.trim().to_lowercase();
-            if !q.is_empty() {
-                let hits: Vec<Page> = ALL_PAGES
-                    .iter()
-                    .copied()
-                    .filter(|pg| pg.title().to_lowercase().contains(&q) || pg.keywords().contains(&q))
-                    .collect();
-                if hits.is_empty() {
-                    ui.add_space(20.0);
-                    ui.vertical_centered(|ui| widgets::secondary(ui, "No Results"));
-                }
-                for pg in hits {
-                    self.sidebar_item(ui, pg);
-                }
-                return;
-            }
-            // account card
-            let name = self.st.user_name();
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
-            if self.page == Users {
-                ui.painter().rect_filled(rect, 7, p.hover);
-            }
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(6.0, 4.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-            let tex = self.st.avatar(ui.ctx());
-            widgets::avatar(&mut child, 34.0, &name, tex.as_ref());
-            child.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(egui::RichText::new(&name).font(style::bold(13.0)));
-                ui.label(egui::RichText::new("Orchard Account").size(11.0).color(p.text2));
-            });
-            if resp.clicked() {
-                self.go(Users);
-            }
-            ui.add_space(8.0);
-            for section in SIDEBAR {
-                for &pg in *section {
-                    self.sidebar_item(ui, pg);
-                }
-                ui.add_space(12.0);
-            }
-        });
-    }
-
-    fn sidebar_item(&mut self, ui: &mut egui::Ui, pg: Page) {
-        let p = pal();
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
-        let selected = self.page.sidebar_parent() == pg || self.page == pg;
-        if selected {
-            ui.painter().rect_filled(rect, 6, p.accent);
-        } else if resp.hovered() {
-            ui.painter().rect_filled(rect, 6, p.hover);
-        }
-        let (icon, color) = pg.icon();
-        let tile = Rect::from_min_size(pos2(rect.left() + 6.0, rect.center().y - 10.0), vec2(20.0, 20.0));
-        widgets::tile(ui, &mut self.icons, tile, color, icon);
-        ui.painter().text(
-            pos2(rect.left() + 34.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            pg.title(),
-            FontId::proportional(13.0),
-            if selected { Color32::WHITE } else { p.text },
-        );
-        if resp.clicked() {
-            self.go(pg);
-        }
-    }
-
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let p = pal();
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
-        let mut x = rect.left() + 14.0;
-        for (i, enabled) in [(0, !self.back.is_empty()), (1, !self.forward.is_empty())] {
-            let r = Rect::from_center_size(pos2(x + 11.0, rect.center().y), vec2(24.0, 24.0));
-            let resp = ui.interact(r, ui.id().with(("nav", i)), if enabled { Sense::click() } else { Sense::hover() });
-            if enabled && resp.hovered() {
-                ui.painter().rect_filled(r, 6, p.hover);
-            }
-            let color = if enabled { p.text2 } else { p.text3 };
-            if i == 0 {
-                widgets::chevron_left(ui, r.center(), color);
-            } else {
-                widgets::chevron_right(ui, r.center(), color);
-            }
-            if resp.clicked() {
-                if i == 0 {
-                    if let Some(prev) = self.back.pop() {
-                        self.forward.push(self.page);
-                        self.page = prev;
-                    }
-                } else if let Some(next) = self.forward.pop() {
-                    self.back.push(self.page);
-                    self.page = next;
-                }
-            }
-            x += 26.0;
-        }
-        ui.painter().text(
-            pos2(x + 10.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            self.page.title(),
-            style::bold(15.0),
-            p.text,
-        );
-    }
-}
-
-impl App {
-    fn update_ui(&mut self, ctx: &egui::Context) {
-        self.restyle(ctx);
-        let p = pal();
-        let start_page = self.page;
-
-        // keyboard: ⌘F / Ctrl+F focuses search, ⌘[ / ⌘] navigate
-        if ctx.input(|i| (i.modifiers.command || i.modifiers.mac_cmd) && i.key_pressed(egui::Key::W)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-
-        egui::SidePanel::left("sidebar")
-            .exact_width(232.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(p.sidebar).inner_margin(Margin::symmetric(10, 8)))
-            .show(ctx, |ui| self.sidebar(ui));
-
-        if self.page != start_page {
-            // Re-run this frame immediately so sidebar highlight, toolbar, and
-            // content all render the new page atomically without a 1-frame mismatch.
-            ctx.request_discard("page changed");
+    fn render(&mut self) {
+        if !self.configured || self.width == 0 || self.height == 0 {
             return;
         }
+        self.update_theme();
+        let s = self.scale.max(1) as f32;
+        let pw = (self.width as i32 * self.scale.max(1)) as u32;
+        let ph = (self.height as i32 * self.scale.max(1)) as u32;
+        let Some(mut pm) = Pixmap::new(pw, ph) else {
+            return;
+        };
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.content))
-            .show(ctx, |ui| {
-                // hairline between sidebar and content
-                let r = ui.max_rect();
-                ui.painter().vline(r.left(), r.y_range(), Stroke::new(1.0_f32, p.group_border));
-                self.toolbar(ui);
-                if self.page != start_page {
-                    ctx.request_discard("page changed");
-                    return;
-                }
+        let mut pass = 0;
+        loop {
+            let dry_run = false;
+            pm.fill(skia_color(self.pal.content));
+            self.ui_state.hovered_pointer = false;
+
+            let win_w = self.width as f32;
+            let win_h = self.height as f32;
+            let prev_page = self.page;
+
+            let needs_relayout = {
+                let mut ui = Ui::new(
+                    &mut pm,
+                    &self.fonts,
+                    &mut self.icons,
+                    self.pal,
+                    &mut self.ui_state,
+                    s,
+                    win_w,
+                    win_h,
+                    dry_run,
+                );
+
+                // 1. Main scrollable content area (drawn first so toolbar/sidebar cleanly mask edges)
+                let content_x = SIDEBAR_W;
+                let content_w = (win_w - SIDEBAR_W).max(200.0);
+                let inner_w = (content_w - 48.0).min(640.0);
+                let pad_x = content_x + ((content_w - inner_w) * 0.5).max(16.0);
+
+                ui.clip = Some(Rect::new(content_x, TOOLBAR_H, content_w, (win_h - TOOLBAR_H).max(0.0)));
+                ui.x = pad_x;
+                ui.w = inner_w;
+                let start_y = TOOLBAR_H + 12.0 - ui.st.scroll_y;
+                ui.y = start_y;
+
                 if self.compositor_live == Some(false) {
-                    ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        ui.label(
-                            egui::RichText::new(
-                                "Saved. The running Orchard is too old to apply changes live; they take effect at next login.",
-                            )
-                            .size(11.5)
-                            .color(p.text2),
-                        );
-                    });
+                    ui.error_line(Some("Saved. Restart Orchard for changes to take effect."));
                 }
-                let page = self.page;
-                let mut nav = None;
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .id_salt(page)
-                    .show(ui, |ui| {
-                        // ScrollArea's id_salt only scopes the scroll state, not its
-                        // content Ui; push_id gives each page its own widget IDs so
-                        // toggles/popups don't inherit state/animations from the
-                        // previous page.
-                        ui.push_id(page, |ui| {
-                            let avail = ui.available_width();
-                            let w = (avail - 48.0).min(640.0);
-                            let pad = ((avail - w) / 2.0).max(0.0);
-                            ui.horizontal_top(|ui| {
-                                ui.add_space(pad);
-                                ui.vertical(|ui| {
-                                    ui.set_width(w);
-                                    ui.add_space(4.0);
-                                    let mut cx = pages::Cx {
-                                        s: &mut self.settings,
-                                        icons: &mut self.icons,
-                                        st: &mut self.st,
-                                        nav: &mut nav,
-                                    };
-                                    pages::show(ui, page, &mut cx);
-                                    ui.add_space(24.0);
-                                });
-                            });
-                        });
-                    });
-                if let Some(n) = nav {
-                    self.go(n);
-                    if self.page != start_page {
-                        ctx.request_discard("page changed");
+
+                pages::show(&mut ui, self.page, &mut self.settings, &mut self.page_state, &self.wake);
+
+                let total_h = (ui.y - start_y) + 28.0;
+                let view_h = (win_h - TOOLBAR_H).max(1.0);
+                let max_scroll = (total_h - view_h).max(0.0);
+                ui.st.max_scroll = max_scroll;
+                if ui.st.scroll_y > max_scroll {
+                    ui.st.scroll_y = max_scroll;
+                }
+
+                // Subtle scrollbar
+                if max_scroll > 1.0 {
+                    let frac = (view_h / total_h).clamp(0.08, 1.0);
+                    let bar_h = (view_h * frac).max(28.0);
+                    let bar_y = TOOLBAR_H + (ui.st.scroll_y / max_scroll) * (view_h - bar_h);
+                    let bar_r = Rect::new(win_w - 8.0, bar_y + 2.0, 4.0, (bar_h - 4.0).max(12.0));
+                    ui.fill_rect(bar_r, 2.0, ui.pal.text3);
+                }
+
+                // 2. Top toolbar over content area
+                ui.clip = None;
+                let tb = Rect::new(SIDEBAR_W, 0.0, content_w, TOOLBAR_H);
+                ui.fill_rect(tb, 0.0, self.pal.content);
+                ui.line(SIDEBAR_W, TOOLBAR_H, win_w, TOOLBAR_H, 1.0, self.pal.group_border);
+                ui.text(self.page.title(), SIDEBAR_W + 20.0, TOOLBAR_H * 0.5, 15.0, Weight::Bold, self.pal.text);
+
+                // 3. Left sidebar
+                let sb = Rect::new(0.0, 0.0, SIDEBAR_W, win_h);
+                ui.fill_rect(sb, 0.0, self.pal.sidebar);
+                ui.line(SIDEBAR_W, 0.0, SIDEBAR_W, win_h, 1.0, self.pal.group_border);
+
+                // Search input
+                let search_r = Rect::new(12.0, 12.0, SIDEBAR_W - 24.0, 28.0);
+                let _ = ui.text_input_at(hash_id("sidebar-search"), search_r, &mut self.search, "Search", false);
+
+                // Sidebar items
+                let mut sy = 52.0;
+                let q = self.search.trim().to_lowercase();
+                if !q.is_empty() {
+                    let mut any = false;
+                    for &pg in ALL_PAGES {
+                        if pg.title().to_lowercase().contains(&q) || pg.keywords().contains(&q) {
+                            any = true;
+                            if draw_sidebar_item(&mut ui, pg, self.page == pg, sy) {
+                                self.page = pg;
+                            }
+                            sy += 30.0;
+                        }
+                    }
+                    if !any {
+                        ui.text_center("No Results", SIDEBAR_W * 0.5, sy + 24.0, 12.5, Weight::Regular, self.pal.text2);
+                    }
+                } else {
+                    for section in SIDEBAR {
+                        for &pg in *section {
+                            if draw_sidebar_item(&mut ui, pg, self.page == pg, sy) {
+                                self.page = pg;
+                            }
+                            sy += 30.0;
+                        }
+                        sy += 12.0;
                     }
                 }
-            });
 
-        // debounce saving so sliders don't hammer the compositor
-        if self.settings != self.saved {
-            let since = *self.dirty_at.get_or_insert_with(Instant::now);
-            if since.elapsed() > Duration::from_millis(220) {
-                self.save();
-                self.dirty_at = None;
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(60));
+                // 4. Open popup menu overlay (always on top!)
+                ui.render_popup_overlay();
+
+                ui.needs_relayout
+            };
+
+            // Clear one-shot click/press/text events after first real pass
+            self.ui_state.clicked = false;
+            self.ui_state.just_pressed = false;
+            self.ui_state.text_events.clear();
+
+            if self.page != prev_page {
+                self.ui_state.reset_page();
+                self.ui_state.group_heights.clear();
+                pass += 1;
+                if pass < 3 {
+                    continue;
+                }
             }
-        } else {
-            self.dirty_at = None;
-        }
-        if self.settings.appearance != self.saved.appearance || self.styled.is_none() {
-            let dark = style::resolve_dark(self.settings.appearance.mode);
-            let key = (dark, self.settings.appearance.accent.rgb());
-            if self.styled != Some(key) {
-                style::apply(ctx, key.0, key.1);
-                self.styled = Some(key);
+            if self.ui_state.popup_result.is_some() && pass < 3 {
+                pass += 1;
+                continue;
             }
+            if needs_relayout && pass < 2 {
+                pass += 1;
+                continue;
+            }
+            if self.settings != self.saved {
+                self.update_theme();
+                self.schedule_save();
+                if pass < 2 {
+                    pass += 1;
+                    continue;
+                }
+            }
+            break;
         }
+
+        // Blit Pixmap (RGBA premultiplied) -> Wayland SHM (ARGB8888 / BGRA premultiplied)
+        let stride = pw as i32 * 4;
+        let Ok((buf, canvas)) = self
+            .pool
+            .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Argb8888)
+        else {
+            return;
+        };
+        let src = pm.data();
+        for (d, c) in canvas.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            d[0] = c[2];
+            d[1] = c[1];
+            d[2] = c[0];
+            d[3] = c[3];
+        }
+        let surf = self.window.wl_surface();
+        surf.set_buffer_scale(self.scale.max(1));
+        let _ = buf.attach_to(surf);
+        surf.damage_buffer(0, 0, pw as i32, ph as i32);
+        surf.commit();
+        self.last_frame = Instant::now();
     }
 }
 
-impl eframe::App for App {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        pal().content.to_normalized_gamma_f32()
+fn draw_sidebar_item(ui: &mut Ui, pg: Page, selected: bool, y: f32) -> bool {
+    let r = Rect::new(10.0, y, SIDEBAR_W - 20.0, 28.0);
+    if selected {
+        ui.fill_rect(r, 6.0, ui.pal.accent);
+    } else if ui.hovered(r) {
+        ui.fill_rect(r, 6.0, ui.pal.hover);
     }
-
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.update_ui(ctx);
-    }
-
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if self.settings != self.saved {
-            self.save();
-        }
-    }
+    let (icon, col) = pg.icon();
+    let tile = Rect::new(r.x + 6.0, r.cy() - 10.0, 20.0, 20.0);
+    ui.icon_tile(tile, col, icon);
+    let fg = if selected { [255, 255, 255, 255] } else { ui.pal.text };
+    ui.text_elided(pg.title(), r.x + 34.0, r.cy(), r.w - 40.0, 13.0, Weight::Regular, fg);
+    ui.clicked(r)
 }
 
-fn main() -> eframe::Result<()> {
-    if matches!(
-        std::env::args().nth(1).as_deref(),
-        Some("--about-device" | "--about" | "about-device")
-    ) {
-        return about_window::run();
+fn main() {
+    let arg1 = std::env::args().nth(1);
+    if matches!(arg1.as_deref(), Some("--about-device" | "--about" | "about-device")) {
+        about::run();
+        return;
     }
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("System Settings")
-            .with_app_id("org.orchard.settings")
-            .with_inner_size([900.0, 660.0])
-            .with_min_inner_size([760.0, 480.0]),
-        ..Default::default()
+    let start_page = arg1
+        .as_deref()
+        .and_then(Page::from_arg)
+        .unwrap_or(Page::Appearance);
+
+    let conn = Connection::connect_to_env().expect("connect to Wayland");
+    let (globals, event_queue) = registry_queue_init(&conn).expect("registry");
+    let qh = event_queue.handle();
+
+    let registry = RegistryState::new(&globals);
+    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor");
+    let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_wm_base");
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm");
+    let seat = SeatState::new(&globals, &qh);
+    let output = OutputState::new(&globals, &qh);
+
+    let surface = compositor.create_surface(&qh);
+    let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, &qh);
+    window.set_title("System Settings");
+    window.set_app_id("org.orchard.settings");
+    window.set_min_size(Some((MIN_W, MIN_H)));
+    window.commit();
+
+    let settings = Settings::load();
+    let dark = resolve_dark(settings.appearance.mode);
+    let accent = settings.appearance.accent.rgb();
+    let pal = Palette::new(dark, accent);
+
+    let pool = SlotPool::new((INIT_W * INIT_H * 4 * 4) as usize, &shm).expect("shm pool");
+    let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("event loop");
+    let loop_handle = event_loop.handle();
+
+    let (wake_tx, wake_rx) = channel::channel::<()>();
+    loop_handle
+        .insert_source(wake_rx, |_, _, app: &mut App| {
+            app.render();
+        })
+        .expect("wake channel");
+
+    WaylandSource::new(conn, event_queue)
+        .insert(loop_handle.clone())
+        .expect("wayland source");
+
+    let mut app = App {
+        loop_handle,
+        registry,
+        output,
+        shm,
+        seat,
+        window,
+        pool,
+        fonts: Fonts::load(),
+        icons: Icons::default(),
+        pal,
+        styled_key: (dark, accent),
+        saved: settings.clone(),
+        settings,
+        save_timer: None,
+        compositor_live: None,
+        page: start_page,
+        search: String::new(),
+        page_state: PageState::default(),
+        ui_state: UiState::default(),
+        wake: Wake(wake_tx),
+        width: INIT_W,
+        height: INIT_H,
+        scale: 1,
+        configured: false,
+        exit: false,
+        mods: Modifiers::default(),
+        last_frame: Instant::now(),
     };
-    eframe::run_native("System Settings", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+
+    while !app.exit {
+        if event_loop.dispatch(None, &mut app).is_err() {
+            break;
+        }
+    }
+    app.save_now();
 }
+
+impl CompositorHandler for App {
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, f: i32) {
+        let f = f.max(1);
+        if self.scale != f {
+            self.scale = f;
+            self.render();
+        }
+    }
+    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+}
+
+impl OutputHandler for App {
+    fn output_state(&mut self) -> &mut OutputState { &mut self.output }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+}
+
+impl WindowHandler for App {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
+        self.exit = true;
+    }
+
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window, cfg: WindowConfigure, _: u32) {
+        let nw = cfg.new_size.0.map(|n| n.get()).unwrap_or(self.width).max(MIN_W);
+        let nh = cfg.new_size.1.map(|n| n.get()).unwrap_or(self.height).max(MIN_H);
+        let resized = !self.configured || nw != self.width || nh != self.height;
+        self.width = nw;
+        self.height = nh;
+        self.configured = true;
+        if resized {
+            self.ui_state.group_heights.clear();
+            self.render();
+        }
+    }
+}
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState { &mut self.seat }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        if cap == Capability::Keyboard {
+            let _ = self.seat.get_keyboard(qh, &seat, None);
+        } else if cap == Capability::Pointer {
+            let _ = self.seat.get_pointer(qh, &seat);
+        }
+    }
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, _: Capability) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl KeyboardHandler for App {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: &wl_surface::WlSurface, _: u32) {}
+
+    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
+        let cmd = self.mods.logo || self.mods.ctrl;
+        if cmd && (ev.keysym == Keysym::w || ev.keysym == Keysym::W) {
+            self.exit = true;
+            return;
+        }
+        if cmd && (ev.keysym == Keysym::f || ev.keysym == Keysym::F) {
+            self.ui_state.focused_input = Some(hash_id("sidebar-search"));
+            self.render();
+            return;
+        }
+        if ev.keysym == Keysym::Escape {
+            if self.ui_state.open_popup.is_some() {
+                self.ui_state.open_popup = None;
+                self.render();
+                return;
+            }
+            if self.ui_state.focused_input.is_some() {
+                self.ui_state.text_events.push(TextEvent::Escape);
+                self.render();
+                return;
+            }
+        }
+        if self.ui_state.focused_input.is_some() {
+            match ev.keysym {
+                Keysym::BackSpace => self.ui_state.text_events.push(TextEvent::Backspace),
+                Keysym::Return | Keysym::KP_Enter => self.ui_state.text_events.push(TextEvent::Enter),
+                _ => {
+                    if let Some(txt) = ev.utf8 {
+                        for c in txt.chars() {
+                            if !c.is_control() {
+                                self.ui_state.text_events.push(TextEvent::Char(c));
+                            }
+                        }
+                    }
+                }
+            }
+            self.render();
+        }
+    }
+
+    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, _: KeyEvent) {}
+
+    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, mods: Modifiers, _: u32) {
+        self.mods = mods;
+    }
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        let mut redraw = false;
+        for ev in events {
+            match ev.kind {
+                PointerEventKind::Enter { .. } => {
+                    self.ui_state.pointer_in = true;
+                    self.ui_state.pointer = (ev.position.0 as f32, ev.position.1 as f32);
+                    redraw = true;
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.ui_state.pointer_in = false;
+                    self.ui_state.pointer_down = false;
+                    self.ui_state.active_slider = None;
+                    redraw = true;
+                }
+                PointerEventKind::Motion { .. } => {
+                    self.ui_state.pointer = (ev.position.0 as f32, ev.position.1 as f32);
+                    redraw = true;
+                }
+                PointerEventKind::Press { button: BTN_LEFT, .. } => {
+                    self.ui_state.pointer = (ev.position.0 as f32, ev.position.1 as f32);
+                    self.ui_state.pointer_down = true;
+                    self.ui_state.just_pressed = true;
+                    self.ui_state.pressed_at = Some(self.ui_state.pointer);
+                    // Unfocus text input if clicking elsewhere (input widget re-focuses itself if clicked)
+                    self.ui_state.focused_input = None;
+                    redraw = true;
+                }
+                PointerEventKind::Release { button: BTN_LEFT, .. } => {
+                    self.ui_state.pointer = (ev.position.0 as f32, ev.position.1 as f32);
+                    self.ui_state.pointer_down = false;
+                    self.ui_state.clicked = self.ui_state.active_slider.is_none();
+                    self.ui_state.active_slider = None;
+                    redraw = true;
+                }
+                PointerEventKind::Axis { vertical, .. } => {
+                    let dy = scroll_delta(vertical);
+                    if dy.abs() > 0.01 {
+                        if let Some(p) = self.ui_state.open_popup.as_mut() {
+                            p.scroll = (p.scroll + dy).max(0.0);
+                        } else if self.ui_state.pointer.0 >= SIDEBAR_W {
+                            self.ui_state.scroll_y = (self.ui_state.scroll_y + dy)
+                                .clamp(0.0, self.ui_state.max_scroll);
+                        }
+                        redraw = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if redraw {
+            self.render();
+        }
+    }
+}
+
+fn scroll_delta(axis: AxisScroll) -> f32 {
+    if axis.absolute.abs() > 0.01 {
+        axis.absolute as f32 * 1.4
+    } else if axis.discrete != 0 {
+        axis.discrete as f32 * 36.0
+    } else {
+        0.0
+    }
+}
+
+impl ShmHandler for App {
+    fn shm_state(&mut self) -> &mut Shm { &mut self.shm }
+}
+
+impl ProvidesRegistryState for App {
+    fn registry(&mut self) -> &mut RegistryState { &mut self.registry }
+    registry_handlers![OutputState, SeatState];
+}
+
+delegate_compositor!(App);
+delegate_output!(App);
+delegate_shm!(App);
+delegate_seat!(App);
+delegate_keyboard!(App);
+delegate_pointer!(App);
+delegate_xdg_shell!(App);
+delegate_xdg_window!(App);
+delegate_registry!(App);

@@ -1,136 +1,182 @@
-//! The individual settings panes.
+//! Settings pages registry and CLI argument mapping.
 
-mod apps;
-mod desktop;
-mod general;
-mod input;
-mod network;
-mod power;
-mod sound;
+pub mod appearance;
+pub mod connectivity;
+pub mod desktop;
+pub mod input;
+pub mod system;
 
-pub use general::{load_about, AboutInfo};
-
-use eframe::egui::{self, vec2, Sense, TextureHandle, Ui};
 use orchard_config::Settings;
 
 use crate::{
-    icons::Icons,
-    style::{bold, pal},
-    sys::Bg,
-    widgets::{self, group},
-    Page,
+    sys::Wake,
+    theme::{rgb, Rgba},
+    ui::Ui,
 };
 
-pub struct Cx<'a> {
-    pub s: &'a mut Settings,
-    pub icons: &'a mut Icons,
-    pub st: &'a mut State,
-    pub nav: &'a mut Option<Page>,
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Page {
+    Wifi,
+    Bluetooth,
+    Sound,
+    Appearance,
+    Wallpaper,
+    DesktopDock,
+    MenuBar,
+    Displays,
+    Keyboard,
+    Pointer,
+    LockPower,
+    System,
+}
+
+use Page::*;
+
+pub const SIDEBAR: &[&[Page]] = &[
+    &[Wifi, Bluetooth, Sound],
+    &[Appearance, Wallpaper, DesktopDock, MenuBar, Displays],
+    &[Keyboard, Pointer],
+    &[LockPower, System],
+];
+
+pub const ALL_PAGES: &[Page] = &[
+    Wifi,
+    Bluetooth,
+    Sound,
+    Appearance,
+    Wallpaper,
+    DesktopDock,
+    MenuBar,
+    Displays,
+    Keyboard,
+    Pointer,
+    LockPower,
+    System,
+];
+
+impl Page {
+    pub fn title(self) -> &'static str {
+        match self {
+            Wifi => "Wi‑Fi & Network",
+            Bluetooth => "Bluetooth",
+            Sound => "Sound",
+            Appearance => "Appearance",
+            Wallpaper => "Wallpaper",
+            DesktopDock => "Desktop & Dock",
+            MenuBar => "Menu Bar",
+            Displays => "Displays",
+            Keyboard => "Keyboard",
+            Pointer => "Mouse & Trackpad",
+            LockPower => "Lock & Power",
+            System => "System",
+        }
+    }
+
+    pub fn icon(self) -> (&'static str, Rgba) {
+        let blue = rgb([0x0A, 0x84, 0xFF]);
+        let gray = rgb([0x8E, 0x8E, 0x93]);
+        let dark = rgb([0x3A, 0x3A, 0x3E]);
+        match self {
+            Wifi => ("network-wireless", blue),
+            Bluetooth => ("bluetooth", blue),
+            Sound => ("audio-volume-high", rgb([0xFF, 0x37, 0x5F])),
+            Appearance => ("preferences-desktop-appearance", dark),
+            Wallpaper => ("preferences-desktop-wallpaper", rgb([0x32, 0xAD, 0xE6])),
+            DesktopDock => ("view-app-grid", dark),
+            MenuBar => ("open-menu", gray),
+            Displays => ("video-display", blue),
+            Keyboard => ("input-keyboard", gray),
+            Pointer => ("input-mouse", gray),
+            LockPower => ("battery-full", rgb([0x30, 0xD1, 0x58])),
+            System => ("emblem-system", gray),
+        }
+    }
+
+    pub fn keywords(self) -> &'static str {
+        match self {
+            Wifi => "wifi wireless wlan internet network ssid ethernet vpn",
+            Bluetooth => "bluetooth devices headphones pair",
+            Sound => "sound volume audio output input microphone speakers mute",
+            Appearance => "appearance dark light mode accent color theme corner radius transparency motion icon cursor pointer",
+            Wallpaper => "wallpaper background desktop picture",
+            DesktopDock => "desktop dock magnification minimize hot corners mission control windows title bar focus",
+            MenuBar => "menu bar clock control center battery percentage date seconds",
+            Displays => "displays screen monitor resolution scale refresh hidpi",
+            Keyboard => "keyboard layout repeat modifier caps numlock",
+            Pointer => "mouse trackpad touchpad pointer speed scroll natural acceleration tap click gestures",
+            LockPower => "lock screen idle password battery power energy profile performance",
+            System => "system general about hardware cpu memory hostname date time timezone ntp default apps browser terminal login items autostart",
+        }
+    }
+
+    /// Parse a CLI argument (supports both new and all legacy Orchard page names).
+    pub fn from_arg(arg: &str) -> Option<Page> {
+        let k: String = arg
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        match k.as_str() {
+            "wifi" | "wifinetwork" | "network" | "wlan" => Some(Wifi),
+            "bluetooth" | "bt" => Some(Bluetooth),
+            "sound" | "audio" | "volume" => Some(Sound),
+            "appearance" | "accessibility" | "theme" => Some(Appearance),
+            "wallpaper" | "background" => Some(Wallpaper),
+            "desktopdock" | "dock" | "desktop" | "windows" => Some(DesktopDock),
+            "menubar" | "panel" | "clock" => Some(MenuBar),
+            "displays" | "display" | "monitor" | "screen" => Some(Displays),
+            "keyboard" | "keys" => Some(Keyboard),
+            "mouse" | "trackpad" | "touchpad" | "pointer" | "mousetrackpad" => Some(Pointer),
+            "lockscreen" | "lock" | "battery" | "power" | "lockpower" => Some(LockPower),
+            "system" | "general" | "about" | "datetime" | "language" | "languageregion"
+            | "loginitems" | "autostart" | "defaultapps" | "storage" | "users"
+            | "usersgroups" => Some(System),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
-pub struct State {
-    user: Bg<general::UserInfo>,
-    avatar: Option<Option<TextureHandle>>,
-    pub net: network::NetState,
-    pub sound: sound::SoundState,
-    pub general: general::GeneralState,
-    pub apps: apps::AppsState,
+pub struct PageState {
+    pub appearance: appearance::AppearanceState,
     pub desktop: desktop::DesktopState,
-    pub power: power::PowerState,
     pub input: input::InputState,
+    pub conn: connectivity::ConnState,
+    pub system: system::SystemState,
 }
 
-impl State {
-    pub fn user_name(&mut self) -> String {
-        self.user.poll();
-        if self.user.value.is_none() && !self.user.busy() {
-            // cheap enough to do synchronously once
-            self.user.value = Some(general::UserInfo::load());
-        }
-        self.user.value.as_ref().map(|u| u.display_name()).unwrap_or_default()
-    }
-
-    pub fn avatar(&mut self, ctx: &egui::Context) -> Option<TextureHandle> {
-        self.avatar
-            .get_or_insert_with(|| {
-                let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
-                let user = std::env::var("USER").unwrap_or_default();
-                let candidates = [
-                    home.join(".face.icon"),
-                    home.join(".face"),
-                    std::path::PathBuf::from(format!("/var/lib/AccountsService/icons/{user}")),
-                ];
-                let img = candidates.iter().find_map(|p| image::open(p).ok())?;
-                let img = img.thumbnail_exact(128, 128).to_rgba8();
-                let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img);
-                Some(ctx.load_texture("avatar", ci, egui::TextureOptions::LINEAR))
-            })
-            .clone()
-    }
-
-    pub fn user(&mut self) -> general::UserInfo {
-        self.user_name();
-        self.user.value.clone().unwrap_or_default()
-    }
-}
-
-/// The big icon + title + description card at the top of a pane.
-pub fn hero(ui: &mut Ui, cx: &mut Cx, page: Page, desc: &str) {
-    group(ui, |g| {
-        g.custom(|ui| {
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::hover());
-                let (icon, color) = page.icon();
-                widgets::tile(ui, cx.icons, r, color, icon);
-                ui.add_space(6.0);
-                ui.vertical(|ui| {
-                    ui.add_space(6.0);
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.label(egui::RichText::new(page.title()).font(bold(15.0)));
-                    ui.label(egui::RichText::new(desc).size(12.0).color(pal().text2));
-                });
-            });
-        });
-    });
-}
-
-pub fn show(ui: &mut Ui, page: Page, cx: &mut Cx) {
+pub fn show(ui: &mut Ui, page: Page, s: &mut Settings, st: &mut PageState, wake: &Wake) {
     match page {
-        Page::Wifi => network::wifi(ui, cx),
-        Page::Bluetooth => network::bluetooth(ui, cx),
-        Page::Network => network::network(ui, cx),
-        Page::Sound => sound::sound(ui, cx),
-        Page::General => general::general(ui, cx),
-        Page::About => general::about(ui, cx),
-        Page::DateTime => general::date_time(ui, cx),
-        Page::Language => general::language(ui, cx),
-        Page::LoginItems => apps::login_items(ui, cx),
-        Page::DefaultApps => apps::default_apps(ui, cx),
-        Page::Storage => general::storage(ui, cx),
-        Page::Users => general::users(ui, cx),
-        Page::Appearance => desktop::appearance(ui, cx),
-        Page::Accessibility => desktop::accessibility(ui, cx),
-        Page::MenuBar => desktop::menu_bar(ui, cx),
-        Page::DesktopDock => desktop::desktop_dock(ui, cx),
-        Page::Displays => desktop::displays(ui, cx),
-        Page::Wallpaper => desktop::wallpaper(ui, cx),
-        Page::LockScreen => desktop::lock_screen(ui, cx),
-        Page::Battery => power::battery(ui, cx),
-        Page::Keyboard => input::keyboard(ui, cx),
-        Page::Mouse => input::mouse(ui, cx),
-        Page::Trackpad => input::trackpad(ui, cx),
+        Wifi => connectivity::wifi(ui, &mut st.conn, wake),
+        Bluetooth => connectivity::bluetooth(ui, &mut st.conn, wake),
+        Sound => connectivity::sound(ui, &mut st.conn, wake),
+        Appearance => appearance::appearance(ui, s, &mut st.appearance, wake),
+        Wallpaper => appearance::wallpaper(ui, s, &mut st.appearance, wake),
+        DesktopDock => desktop::desktop_dock(ui, s),
+        MenuBar => desktop::menu_bar(ui, s),
+        Displays => desktop::displays(ui, s, &mut st.desktop, wake),
+        Keyboard => input::keyboard(ui, s, &mut st.input, wake),
+        Pointer => input::pointer(ui, s),
+        LockPower => system::lock_power(ui, s, &mut st.system, wake),
+        System => system::system(ui, s, &mut st.system, wake),
     }
 }
 
-/// Red error text under a group, if any.
-pub fn error_line(ui: &mut Ui, err: Option<String>) {
-    if let Some(e) = err {
-        ui.add_space(-6.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(e).size(11.5).color(egui::Color32::from_rgb(0xFF, 0x45, 0x3A)));
-        });
-        ui.add_space(10.0);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_args_map_legacy_and_current_pages() {
+        assert_eq!(Page::from_arg("Wi‑Fi"), Some(Page::Wifi));
+        assert_eq!(Page::from_arg("wifi"), Some(Page::Wifi));
+        assert_eq!(Page::from_arg("Network"), Some(Page::Wifi));
+        assert_eq!(Page::from_arg("Accessibility"), Some(Page::Appearance));
+        assert_eq!(Page::from_arg("Desktop & Dock"), Some(Page::DesktopDock));
+        assert_eq!(Page::from_arg("Trackpad"), Some(Page::Pointer));
+        assert_eq!(Page::from_arg("Battery"), Some(Page::LockPower));
+        assert_eq!(Page::from_arg("Login Items"), Some(Page::System));
+        assert_eq!(Page::from_arg("Date & Time"), Some(Page::System));
+        assert_eq!(Page::from_arg("unknown-xyz"), None);
     }
 }
