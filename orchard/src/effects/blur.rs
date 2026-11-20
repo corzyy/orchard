@@ -116,8 +116,19 @@ impl std::fmt::Debug for LiveBlur {
     }
 }
 
+/// A new offscreen texture, cleared: freshly allocated GPU memory is
+/// undefined (on NVIDIA it shows up as bright speckles), and bilinear
+/// sampling at the edge of the used area reads one texel beyond it.
 fn texture(renderer: &mut GlesRenderer, size: Size<i32, Buffer>) -> Result<GlesTexture, GlesError> {
-    renderer.create_buffer(Fourcc::Abgr8888, size)
+    let mut tex: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size)?;
+    {
+        let mut target = renderer.bind(&mut tex)?;
+        let phys: Size<i32, Physical> = (size.w, size.h).into();
+        let mut frame = renderer.render(&mut target, phys, Transform::Normal)?;
+        frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(phys)])?;
+        let _ = frame.finish()?;
+    }
+    Ok(tex)
 }
 
 fn half(s: Size<i32, Buffer>) -> Size<i32, Buffer> {

@@ -235,7 +235,13 @@ impl Backend for UdevData {
         if let Some(id) = output.user_data().get::<UdevOutputId>() {
             if let Some(gpu) = self.backends.get_mut(&id.device_id) {
                 if let Some(surface) = gpu.surfaces.get_mut(&id.crtc) {
-                    surface.drm_output.reset_buffers();
+                    // Force a full repaint by damaging the whole output instead of
+                    // `DrmOutput::reset_buffers()`: that drops the swapchain and
+                    // allocates fresh GBM buffers, and on NVIDIA freshly allocated
+                    // scanout buffers flash uninitialized VRAM (white dots over the
+                    // whole screen) — and this runs on every Space switch, lock,
+                    // full-screen reveal, scale change, ...
+                    surface.full_damage.request();
                 }
             }
         }
@@ -756,6 +762,52 @@ struct SurfaceData {
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     last_presentation_time: Option<Time<Monotonic>>,
     vblank_throttle_timer: Option<RegistrationToken>,
+    /// pending forced full repaints (see `reset_buffers`)
+    full_damage: FullDamage,
+}
+
+/// Damages the whole output for the next few frames by placing an invisible
+/// (fully transparent), full-output element on top whose commit changes every
+/// frame. Unlike resetting the swapchain this keeps the existing scanout buffers.
+struct FullDamage {
+    frames: u8,
+    id: smithay::backend::renderer::element::Id,
+    commit: smithay::backend::renderer::utils::CommitCounter,
+}
+
+impl Default for FullDamage {
+    fn default() -> Self {
+        Self {
+            frames: 0,
+            id: smithay::backend::renderer::element::Id::new(),
+            commit: Default::default(),
+        }
+    }
+}
+
+impl FullDamage {
+    /// Enough frames to cover every buffer of the swapchain, even if one of
+    /// them gets skipped (the damage history makes one usually suffice).
+    fn request(&mut self) {
+        self.frames = 4;
+    }
+
+    fn element(&mut self, output_size: smithay::utils::Size<i32, smithay::utils::Physical>) -> Option<OutputRenderElements> {
+        if self.frames == 0 {
+            return None;
+        }
+        self.frames -= 1;
+        self.commit.increment();
+        Some(OutputRenderElements::Solid(
+            smithay::backend::renderer::element::solid::SolidColorRenderElement::new(
+                self.id.clone(),
+                smithay::utils::Rectangle::from_size(output_size),
+                self.commit,
+                smithay::backend::renderer::Color32F::TRANSPARENT,
+                smithay::backend::renderer::element::Kind::Unspecified,
+            ),
+        ))
+    }
 }
 
 impl Drop for SurfaceData {
@@ -1177,6 +1229,7 @@ impl OrchardState<UdevData> {
                 dmabuf_feedback,
                 last_presentation_time: None,
                 vblank_throttle_timer: None,
+                full_damage: FullDamage::default(),
             };
 
             device.surfaces.insert(crtc, surface);
@@ -1810,7 +1863,15 @@ fn render_surface(
         custom_elements.push(CustomRenderElements::Fps(element.clone()));
     }
 
-    let (elements, clear_color) = output_elements(output, space, ctx, custom_elements, renderer, now);
+    let (mut elements, clear_color) = output_elements(output, space, ctx, custom_elements, renderer, now);
+    // topmost, so no opaque element above can hide its damage
+    let output_size = output
+        .current_mode()
+        .map(|m| output.current_transform().transform_size(m.size))
+        .unwrap_or_default();
+    if let Some(el) = surface.full_damage.element(output_size) {
+        elements.insert(0, el);
+    }
 
     let frame_mode = if surface.disable_direct_scanout {
         FrameFlags::empty()
