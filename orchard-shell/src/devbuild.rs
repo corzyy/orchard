@@ -161,7 +161,24 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// Any in-repo source listed in `<bin>.d` is newer than `<bin>` (or it was never built).
+/// A source the user edits: in the repo (not its build output) or in a local
+/// path dependency such as `../orchard-ui`, but not a registry/git crate,
+/// the toolchain or a system file.
+fn own_source(root: &Path, p: &Path) -> bool {
+    if p.starts_with(root) {
+        return !p.starts_with(root.join("target"));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".cargo"));
+    let rustup_home = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".rustup"));
+    !home.as_os_str().is_empty()
+        && p.starts_with(&home)
+        && !p.starts_with(&cargo_home)
+        && !p.starts_with(&rustup_home)
+        && !p.components().any(|c| c.as_os_str() == "target")
+}
+
+/// Any of the user's own sources listed in `<bin>.d` is newer than `<bin>` (or it was never built).
 /// Caches parsed `.d` dependency lists by the `.d` file's mtime so we don't re-read and
 /// re-parse them on every poll.
 fn sources_newer(root: &Path, release: &Path, bin: &str) -> bool {
@@ -179,13 +196,13 @@ fn sources_newer(root: &Path, release: &Path, bin: &str) -> bool {
                 cached_srcs.clone()
             } else {
                 let Ok(dep) = std::fs::read_to_string(&dep_path) else { return true };
-                let srcs: Vec<PathBuf> = dep_info_sources(&dep).into_iter().filter(|p| p.starts_with(root)).collect();
+                let srcs: Vec<PathBuf> = dep_info_sources(&dep).into_iter().filter(|p| own_source(root, p)).collect();
                 cache.insert(dep_path, (dep_mtime, srcs.clone()));
                 srcs
             }
         } else {
             let Ok(dep) = std::fs::read_to_string(&dep_path) else { return true };
-            let srcs: Vec<PathBuf> = dep_info_sources(&dep).into_iter().filter(|p| p.starts_with(root)).collect();
+            let srcs: Vec<PathBuf> = dep_info_sources(&dep).into_iter().filter(|p| own_source(root, p)).collect();
             cache.insert(dep_path, (dep_mtime, srcs.clone()));
             srcs
         }
@@ -269,6 +286,17 @@ mod tests {
             dep_info_sources(d),
             vec![PathBuf::from("/r/a.rs"), PathBuf::from("/r/my dir/b.rs"), PathBuf::from("/r/c.frag")]
         );
+    }
+
+    #[test]
+    fn own_sources_include_path_deps_only() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let root = home.join("projects/orchard");
+        assert!(own_source(&root, &root.join("orchard/src/main.rs")));
+        assert!(!own_source(&root, &root.join("target/release/build/x/out/gen.rs")));
+        assert!(own_source(&root, &home.join("projects/orchard-ui/src/lib.rs")));
+        assert!(!own_source(&root, &home.join(".cargo/registry/src/iced/lib.rs")));
+        assert!(!own_source(&root, Path::new("/usr/include/stdio.h")));
     }
 
     #[test]
