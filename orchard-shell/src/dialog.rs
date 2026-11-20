@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use tiny_skia::{FillRule, LineCap, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::{
-    draw::{fill_circle, fill_rounded, paint, stroke_rounded},
+    anim::{self, ease_out_cubic},
+    draw::{composite, fill_circle, fill_rounded, paint, stroke_rounded},
     text::{Fonts, Rgba, Weight},
     theme::Theme,
 };
@@ -14,6 +15,7 @@ const WIDTH: f32 = 340.0;
 const HEIGHT: f32 = 216.0;
 const RADIUS: f32 = 16.0;
 const COUNTDOWN_SECS: u64 = 60;
+const OPEN_ANIM: Duration = Duration::from_millis(180);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogKind {
@@ -75,17 +77,61 @@ impl ConfirmDialog {
         x >= r.0 && x <= r.0 + r.2 && y >= r.1 && y <= r.1 + r.3
     }
 
+    pub fn is_animating(&self) -> bool {
+        !anim::reduced() && self.opened.elapsed() < OPEN_ANIM
+    }
+
+    pub fn open_progress(&self) -> f32 {
+        if anim::reduced() {
+            return 1.0;
+        }
+        ease_out_cubic((self.opened.elapsed().as_secs_f32() / OPEN_ANIM.as_secs_f32()).clamp(0.0, 1.0))
+    }
+
     pub fn paint(&mut self, pm: &mut Pixmap, scale: f32, fonts: &Fonts, theme: &Theme, german: bool) {
         let s = scale;
         let sw = pm.width() as f32 / s;
         let sh = pm.height() as f32 / s;
+        let prog = self.open_progress();
 
-        // Subtle screen dim behind the sheet
-        fill_rounded(pm, 0.0, 0.0, pm.width() as f32, pm.height() as f32, 0.0, [0, 0, 0, 56]);
+        // Subtle screen dim behind the sheet (fades in smoothly)
+        let dim_a = (56.0 * prog).round() as u8;
+        fill_rounded(pm, 0.0, 0.0, pm.width() as f32, pm.height() as f32, 0.0, [0, 0, 0, dim_a]);
 
         let x0 = ((sw - WIDTH) * 0.5).round();
         let y0 = ((sh - HEIGHT) * 0.44).round();
         self.rect = (x0, y0, WIDTH, HEIGHT);
+
+        // During the brief macOS pop-in, render the sheet to an offscreen buffer
+        // so it scales smoothly from 0.94 -> 1.0 with matching opacity.
+        if prog < 0.999 {
+            let pad = 20.0;
+            let bw = ((WIDTH + pad * 2.0) * s).ceil().max(1.0) as u32;
+            let bh = ((HEIGHT + pad * 2.0) * s).ceil().max(1.0) as u32;
+            if let Some(mut buf) = Pixmap::new(bw, bh) {
+                self.paint_sheet(&mut buf, s, pad, pad, fonts, theme, german);
+                let k = 0.94 + 0.06 * prog;
+                let cx = (x0 + WIDTH * 0.5) * s;
+                let cy = (y0 + HEIGHT * 0.5) * s;
+                let ox = cx - (WIDTH * 0.5 + pad) * s * k;
+                let oy = cy - (HEIGHT * 0.5 + pad) * s * k;
+                composite(pm, &buf, ox, oy, k, prog);
+                // Recompute hit rects in final coordinates
+                let btn_h = 30.0;
+                let btn_gap = 10.0;
+                let btn_w = (WIDTH - 40.0 - btn_gap) * 0.5;
+                let btn_y = y0 + HEIGHT - 18.0 - btn_h;
+                let cancel_x = x0 + 20.0;
+                let confirm_x = cancel_x + btn_w + btn_gap;
+                self.cancel_rect = (cancel_x, btn_y, btn_w, btn_h);
+                self.confirm_rect = (confirm_x, btn_y, btn_w, btn_h);
+                return;
+            }
+        }
+        self.paint_sheet(pm, s, x0, y0, fonts, theme, german);
+    }
+
+    fn paint_sheet(&mut self, pm: &mut Pixmap, s: f32, x0: f32, y0: f32, fonts: &Fonts, theme: &Theme, german: bool) {
 
         let dark = theme.menu_text[0] > 128;
         let bg: Rgba = if dark { [40, 40, 44, 224] } else { [248, 248, 252, 232] };

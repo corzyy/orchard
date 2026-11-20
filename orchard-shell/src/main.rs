@@ -4,6 +4,7 @@
 //! Talks to the compositor over Orchard's JSON IPC for the window list,
 //! activation and frosted-glass backdrops.
 
+mod anim;
 mod apps;
 mod ddc;
 mod desktop;
@@ -276,6 +277,7 @@ fn main() {
     let shm = Shm::bind(&globals, &qh).expect("wl_shm");
 
     let settings = orchard_config::Settings::load();
+    anim::set_reduced(settings.appearance.reduce_motion);
     let apps = Apps::load(settings.appearance.icon_theme.clone());
     tracing::info!("{} desktop entries", apps.entries.len());
     let pinned = dock::load_pinned(&apps);
@@ -1274,6 +1276,7 @@ impl App {
     /// orchard-settings saved: re-read settings.json and re-apply it.
     fn reload_settings(&mut self) {
         let s = orchard_config::Settings::load();
+        anim::set_reduced(s.appearance.reduce_motion);
         tracing::info!("settings changed");
         if self.primary != s.displays.primary {
             self.primary = s.displays.primary.clone();
@@ -1672,11 +1675,17 @@ impl App {
             Which::Menu => {
                 if let Some(menu) = &self.menu {
                     menu.paint(&mut pm, fscale, &self.fonts, &self.theme);
+                    animating = menu.is_animating();
                 }
+                self.send_menu_backdrop();
             }
             Which::Switcher => {
-                if let Some(sw) = &self.switcher {
+                if let Some(sw) = self.switcher.as_mut() {
                     sw.paint(&mut pm, fscale, &self.apps, &self.fonts, &self.theme);
+                    animating = sw.is_animating();
+                    let (sw_w, sw_h) = sw.size();
+                    let a = sw.open_progress();
+                    self.set_backdrop_alpha("orchard-switcher", Some((0.0, 0.0, sw_w as f32, sw_h as f32, 22.0, a)));
                 }
             }
             Which::Launcher => match self.paint_launcher(&mut pm, fscale) {
@@ -1719,6 +1728,10 @@ impl App {
                 }
             }
             Which::Panel => {
+                if self.panel.as_ref().is_some_and(|p| p.is_closed()) {
+                    self.drop_panel_now();
+                    return;
+                }
                 if let Some(p) = self.panel.as_mut() {
                     p.paint(&mut pm, fscale, w as f32, h as f32, &self.notes, &self.apps, &self.fonts, &self.theme, self.german);
                     p.remember_cards();
@@ -1735,8 +1748,10 @@ impl App {
             Which::Dialog => {
                 if let Some(d) = self.dialog.as_mut() {
                     d.paint(&mut pm, fscale, &self.fonts, &self.theme, self.german);
+                    animating = d.is_animating();
                     let (x, y, dw, dh) = d.rect;
-                    self.set_backdrop("orchard-dialog", Some((x, y, dw, dh, 16.0)));
+                    let a = d.open_progress();
+                    self.set_backdrop_alpha("orchard-dialog", Some((x, y, dw, dh, 16.0, a)));
                 }
             }
             Which::Polkit => {
@@ -1872,9 +1887,13 @@ impl App {
     }
 
     fn set_backdrop(&mut self, namespace: &str, rect: Option<(f32, f32, f32, f32, f32)>) {
+        self.set_backdrop_alpha(namespace, rect.map(|(x, y, w, h, r)| (x, y, w, h, r, 1.0)));
+    }
+
+    fn set_backdrop_alpha(&mut self, namespace: &str, rect: Option<(f32, f32, f32, f32, f32, f32)>) {
         if let Some(ipc) = self.ipc.as_mut() {
             let rects: Vec<serde_json::Value> = rect
-                .map(|(x, y, w, h, r)| vec![json!({"x": x, "y": y, "w": w, "h": h, "radius": r})])
+                .map(|(x, y, w, h, r, a)| vec![json!({"x": x, "y": y, "w": w, "h": h, "radius": r, "alpha": a})])
                 .unwrap_or_default();
             ipc.request("set_backdrop", json!({"namespace": namespace, "rects": rects}));
         }
@@ -2031,16 +2050,24 @@ impl App {
     // ---- switcher / launcher ---------------------------------------------
 
     fn show_switcher(&mut self, apps: Vec<String>, selected: usize) {
-        let sw = switcher::Switcher { apps, selected };
-        let (w, h) = sw.size();
-        self.switcher = Some(sw);
+        let (w, h, alpha) = if let Some(sw) = self.switcher.as_mut() {
+            sw.update(apps, selected);
+            let (w, h) = sw.size();
+            (w, h, sw.open_progress())
+        } else {
+            let sw = switcher::Switcher::new(apps, selected);
+            let (w, h) = sw.size();
+            let a = sw.open_progress();
+            self.switcher = Some(sw);
+            (w, h, a)
+        };
         match self.switcher_surf.as_mut() {
             Some(s) => {
                 if s.width != w || s.height != h {
                     s.layer.set_size(w, h);
                     s.layer.commit();
                 } else {
-                    self.draw(Which::Switcher);
+                    self.redraw(Which::Switcher);
                 }
             }
             None => {
@@ -2058,7 +2085,7 @@ impl App {
                 self.switcher_surf = Some(Surf::new(layer));
             }
         }
-        self.set_backdrop("orchard-switcher", Some((0.0, 0.0, w as f32, h as f32, 22.0)));
+        self.set_backdrop_alpha("orchard-switcher", Some((0.0, 0.0, w as f32, h as f32, 22.0, alpha)));
     }
 
     /// Reload desktop entries and app icons if any application directory changed.
@@ -2308,10 +2335,10 @@ impl App {
         let rects: Vec<serde_json::Value> = self
             .menu
             .as_ref()
-            .map(|m| m.rects(&self.fonts))
+            .map(|m| m.backdrop_rects(&self.fonts))
             .unwrap_or_default()
             .into_iter()
-            .map(|(x, y, w, h)| json!({"x": x, "y": y, "w": w, "h": h, "radius": 8.0}))
+            .map(|(x, y, w, h, a)| json!({"x": x, "y": y, "w": w, "h": h, "radius": 8.0, "alpha": a}))
             .collect();
         if let Some(ipc) = self.ipc.as_mut() {
             ipc.request("set_backdrop", json!({"namespace": "orchard-menu", "rects": rects}));

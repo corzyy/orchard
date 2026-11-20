@@ -1,12 +1,17 @@
 //! Drop-down menus (menu bar menus, Dock context menus).
 
+use std::time::{Duration, Instant};
+
 use tiny_skia::{BlendMode, FillRule, Pixmap, Transform};
 
 use crate::{
+    anim::{self, ease_out_cubic, scale_alpha},
     draw::{fill_rounded, paint, rounded_rect, stroke_rounded},
     text::{Fonts, Weight},
     theme::Theme,
 };
+
+const OPEN_ANIM: Duration = Duration::from_millis(85);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -103,6 +108,7 @@ pub struct Menu {
     /// open submenu (of item `child_of`)
     pub child: Option<Box<Menu>>,
     pub child_of: Option<usize>,
+    pub opened: Instant,
 }
 
 impl Menu {
@@ -114,7 +120,23 @@ impl Menu {
             hovered: None,
             child: None,
             child_of: None,
+            opened: Instant::now(),
         }
+    }
+
+    pub fn open_progress(&self) -> f32 {
+        if anim::reduced() {
+            return 1.0;
+        }
+        let t = (self.opened.elapsed().as_secs_f32() / OPEN_ANIM.as_secs_f32()).clamp(0.0, 1.0);
+        ease_out_cubic(t)
+    }
+
+    pub fn is_animating(&self) -> bool {
+        if anim::reduced() {
+            return false;
+        }
+        self.opened.elapsed() < OPEN_ANIM || self.child.as_ref().map(|c| c.is_animating()).unwrap_or(false)
     }
 
     fn hoverable(it: &MenuItem) -> bool {
@@ -188,12 +210,14 @@ impl Menu {
         self.contains(fonts, x, y) || self.child.as_ref().map(|c| c.contains_any(fonts, x, y)).unwrap_or(false)
     }
 
-    /// Rects of this menu and its open submenus (for the frosted backdrop).
-    pub fn rects(&self, fonts: &Fonts) -> Vec<(f32, f32, f32, f32)> {
+    /// Rects of this menu and its open submenus with fade alpha (for the frosted backdrop).
+    pub fn backdrop_rects(&self, fonts: &Fonts) -> Vec<(f32, f32, f32, f32, f32)> {
         let (w, h) = self.size(fonts);
-        let mut v = vec![(self.x, self.y, w, h)];
+        let p = self.open_progress();
+        let dy = -(1.0 - p) * 3.0;
+        let mut v = vec![(self.x, self.y + dy, w, h, p)];
         if let Some(c) = &self.child {
-            v.extend(c.rects(fonts));
+            v.extend(c.backdrop_rects(fonts));
         }
         v
     }
@@ -246,37 +270,44 @@ impl Menu {
     pub fn paint(&self, pm: &mut Pixmap, scale: f32, fonts: &Fonts, theme: &Theme) {
         let s = scale;
         let (w, h) = self.size(fonts);
+        let prog = self.open_progress();
+        let y_off = -(1.0 - prog) * 3.0;
+        let my = self.y + y_off;
         // soft shadow
         for (i, a) in [(6.0, 12u8), (3.0, 20), (1.0, 30)] {
-            fill_rounded(pm, (self.x - i) * s, (self.y - i + 3.0) * s, (w + 2.0 * i) * s, (h + 2.0 * i) * s, (8.0 + i) * s, [0, 0, 0, a]);
+            let sa = (a as f32 * prog).round() as u8;
+            fill_rounded(pm, (self.x - i) * s, (my - i + 3.0) * s, (w + 2.0 * i) * s, (h + 2.0 * i) * s, (8.0 + i) * s, [0, 0, 0, sa]);
         }
         // Replace the interior rather than blending over the shadow so the
         // compositor's frosted-glass blur stays clear behind the menu tint.
-        if let Some(p) = rounded_rect(self.x * s, self.y * s, w * s, h * s, 8.0 * s) {
-            let mut bg = paint(theme.menu_bg);
+        if let Some(p) = rounded_rect(self.x * s, my * s, w * s, h * s, 8.0 * s) {
+            let mut bg = paint(scale_alpha(theme.menu_bg, prog));
             bg.blend_mode = BlendMode::Source;
             pm.fill_path(&p, &bg, FillRule::Winding, Transform::identity(), None);
         }
-        stroke_rounded(pm, self.x * s + 0.5, self.y * s + 0.5, w * s - 1.0, h * s - 1.0, 8.0 * s, 1.0, theme.menu_border);
-        let mut top = self.y + PAD;
+        stroke_rounded(pm, self.x * s + 0.5, my * s + 0.5, w * s - 1.0, h * s - 1.0, 8.0 * s, 1.0, scale_alpha(theme.menu_border, prog));
+        let mut top = my + PAD;
         let px = FONT * s;
         for (i, it) in self.items.iter().enumerate() {
             if it.separator {
-                fill_rounded(pm, (self.x + 10.0) * s, (top + SEP_H / 2.0) * s, (w - 20.0) * s, 1.0 * s, 0.0, theme.menu_separator);
+                fill_rounded(pm, (self.x + 10.0) * s, (top + SEP_H / 2.0) * s, (w - 20.0) * s, 1.0 * s, 0.0, scale_alpha(theme.menu_separator, prog));
                 top += SEP_H;
                 continue;
             }
             let selected = (self.hovered == Some(i) && Self::hoverable(it)) || self.child_of == Some(i);
             if selected {
-                fill_rounded(pm, (self.x + PAD) * s, top * s, (w - 2.0 * PAD) * s, ITEM_H * s, 5.0 * s, theme.menu_selection);
+                fill_rounded(pm, (self.x + PAD) * s, top * s, (w - 2.0 * PAD) * s, ITEM_H * s, 5.0 * s, scale_alpha(theme.menu_selection, prog));
             }
-            let color = if !Self::hoverable(it) {
-                theme.menu_text_disabled
-            } else if selected {
-                theme.menu_selection_text
-            } else {
-                theme.menu_text
-            };
+            let color = scale_alpha(
+                if !Self::hoverable(it) {
+                    theme.menu_text_disabled
+                } else if selected {
+                    theme.menu_selection_text
+                } else {
+                    theme.menu_text
+                },
+                prog,
+            );
             let baseline = fonts.baseline_centered(top * s, ITEM_H * s, px, Weight::Regular);
             if it.checked == Some(true) {
                 fonts.draw(pm, "✓", (self.x + 6.0) * s, baseline, px, Weight::Regular, color);

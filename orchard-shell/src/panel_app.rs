@@ -21,11 +21,12 @@ use crate::{
 impl App {
     /// Clock / Control Center / Volume / Network icon clicked.
     pub(crate) fn toggle_panel(&mut self, item: BarItem, kind: Kind, submenu: Option<Submenu>) {
-        let same = self.panel.is_some() && self.menubar.open == Some(item);
-        self.close_panel();
-        if same {
+        let same_open = self.panel.as_ref().is_some_and(|p| p.closing.is_none()) && self.menubar.open == Some(item);
+        if same_open {
+            self.close_panel();
             return;
         }
+        self.drop_panel_now();
         if self.menu.is_some() {
             self.close_menu();
         }
@@ -81,7 +82,42 @@ impl App {
         self.panel_surf = Some(Surf::new(layer));
     }
 
+    /// Smoothly closes the panel with its macOS exit animation before tearing
+    /// down the layer surface.
     pub(crate) fn close_panel(&mut self) {
+        if self.panel.is_none() && self.panel_surf.is_none() {
+            return;
+        }
+        if matches!(
+            self.menubar.open,
+            Some(BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network)
+        ) {
+            self.menubar.open = None;
+            self.redraw(Which::Bar);
+        }
+        if crate::anim::reduced() || self.panel_surf.is_none() {
+            self.drop_panel_now();
+            return;
+        }
+        if let Some(p) = self.panel.as_mut() {
+            if p.closing.is_none() {
+                p.start_close();
+                // Let clicks pass straight through the fading-out overlay surface.
+                if let (Some(surf), Ok(region)) = (
+                    self.panel_surf.as_ref(),
+                    smithay_client_toolkit::compositor::Region::new(&self.compositor),
+                ) {
+                    surf.layer.wl_surface().set_input_region(Some(region.wl_region()));
+                }
+                self.redraw(Which::Panel);
+            }
+        } else {
+            self.drop_panel_now();
+        }
+    }
+
+    /// Immediately tears down the panel surface without playing a close animation.
+    pub(crate) fn drop_panel_now(&mut self) {
         if self.panel.take().is_none() && self.panel_surf.is_none() {
             return;
         }
@@ -192,6 +228,9 @@ impl App {
         self.notes.do_not_disturb = !self.notes.do_not_disturb;
         save_dnd(self.notes.do_not_disturb);
         self.menubar.dnd = self.notes.do_not_disturb;
+        if let Some(p) = self.panel.as_mut() {
+            p.pulse(panel::PULSE_DND);
+        }
         self.redraw(Which::Bar);
         self.redraw(Which::Panel);
     }
@@ -207,6 +246,7 @@ impl App {
         }
         if let Some(p) = self.panel.as_mut() {
             p.night_shift = on;
+            p.pulse(panel::PULSE_NIGHT);
         }
         if let Some(ipc) = self.ipc.as_mut() {
             ipc.request("reload_settings", serde_json::json!({}));
@@ -230,6 +270,7 @@ impl App {
         }
         if let Some(p) = self.panel.as_mut() {
             p.stage_manager = on;
+            p.pulse(panel::PULSE_STAGE);
         }
         if let Some(ipc) = self.ipc.as_mut() {
             ipc.request("reload_settings", serde_json::json!({}));
@@ -250,6 +291,7 @@ impl App {
         }
         if let Some(p) = self.panel.as_mut() {
             p.game_mode_enabled = s.game_mode.enabled;
+            p.pulse(panel::PULSE_GAME);
         }
         if let Some(ipc) = self.ipc.as_mut() {
             ipc.request("reload_settings", serde_json::json!({}));
@@ -278,7 +320,7 @@ impl App {
     pub(crate) fn send_panel_backdrop(&mut self) {
         let Some(p) = self.panel.as_ref() else { return };
         let (x, y, w, h) = p.rect();
-        self.set_backdrop("orchard-panel", Some((x, y, w, h, 18.0)));
+        self.set_backdrop_alpha("orchard-panel", Some((x, y, w, h, 18.0, p.backdrop_alpha())));
     }
 
     fn set_slider(&mut self, target: &Target, x: f32) {
@@ -361,6 +403,9 @@ impl App {
             }
             PointerEventKind::Press { button: BTN_LEFT, .. } => {
                 let Some(p) = self.panel.as_ref() else { return };
+                if p.closing.is_some() {
+                    return;
+                }
                 let Some(target) = p.hit(x, y) else {
                     // outside the panel
                     self.close_panel();
@@ -475,6 +520,7 @@ impl App {
                                     if let Some(w) = p.control.wifi.as_mut() {
                                         w.0 = !w.0;
                                     }
+                                    p.pulse(panel::PULSE_WIFI);
                                 }
                                 Target::EthernetToggle => {
                                     let any_connected = p.control.ethernet.iter().any(|e| e.managed && e.connected);
@@ -487,8 +533,12 @@ impl App {
                                     } else if let Some(e) = p.control.ethernet.iter_mut().find(|e| e.managed && e.plugged) {
                                         e.connected = true;
                                     }
+                                    p.pulse(panel::PULSE_WIFI);
                                 }
-                                Target::BluetoothToggle => p.control.bluetooth = p.control.bluetooth.map(|b| !b),
+                                Target::BluetoothToggle => {
+                                    p.control.bluetooth = p.control.bluetooth.map(|b| !b);
+                                    p.pulse(panel::PULSE_BT);
+                                }
                                 Target::MediaPlay => {
                                     if let Some(m) = p.control.media.as_mut() {
                                         m.playing = !m.playing;

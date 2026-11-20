@@ -12,7 +12,7 @@ use iced::{event, keyboard, mouse, window, Alignment, Element, Event, Length, Su
 use orchard_config::{Settings, ThemeMode};
 use orchard_ui::appearance::{resolve_dark, Mode};
 use orchard_ui::style::Selection;
-use orchard_ui::{controls, fonts, form, metrics, palette, style, window as chrome, Appearance};
+use orchard_ui::{controls, fonts, form, metrics, motion, palette, style, window as chrome, Appearance, TransitionDir};
 
 use crate::pages::{Action, Page, PageState, ALL_PAGES, SIDEBAR};
 use crate::sys::Wake;
@@ -48,6 +48,8 @@ struct App {
     page: Page,
     back: Vec<Page>,
     forward: Vec<Page>,
+    transition_seq: u64,
+    transition_dir: TransitionDir,
     search: String,
     user: (String, String),
     scrolled: bool,
@@ -78,6 +80,7 @@ impl App {
         let settings = Settings::load();
         let key = (settings.appearance.mode, settings.appearance.accent_rgb());
         orchard_ui::set_appearance(Appearance::new(resolve_dark(theme_mode(key.0)), key.1));
+        motion::set_reduced(settings.appearance.reduce_motion);
         let app = Self {
             saved: settings.clone(),
             settings,
@@ -87,6 +90,8 @@ impl App {
             page,
             back: Vec::new(),
             forward: Vec::new(),
+            transition_seq: 0,
+            transition_dir: TransitionDir::Fade,
             search: String::new(),
             user: current_user(),
             scrolled: false,
@@ -99,6 +104,7 @@ impl App {
     /// Restyle when the appearance settings change. Keyed on the *mode*, not
     /// the resolved value: resolving `Auto` spawns gsettings.
     fn update_theme(&mut self) {
+        motion::set_reduced(self.settings.appearance.reduce_motion);
         let key = (self.settings.appearance.mode, self.settings.appearance.accent_rgb());
         if self.styled_key != key {
             self.styled_key = key;
@@ -107,29 +113,38 @@ impl App {
     }
 
     fn navigate(&mut self, msg: &Message) -> Task<Message> {
-        let target = match *msg {
+        let (target, dir) = match *msg {
             Message::Go(p) if p != self.page => {
+                let dir = if p.sidebar_item() == self.page {
+                    TransitionDir::Forward
+                } else if self.page.sidebar_item() == p {
+                    TransitionDir::Back
+                } else {
+                    TransitionDir::Fade
+                };
                 self.back.push(self.page);
                 self.forward.clear();
-                p
+                (p, dir)
             }
             Message::Back => match self.back.pop() {
                 Some(p) => {
                     self.forward.push(self.page);
-                    p
+                    (p, TransitionDir::Back)
                 }
                 None => return Task::none(),
             },
             Message::Forward => match self.forward.pop() {
                 Some(p) => {
                     self.back.push(self.page);
-                    p
+                    (p, TransitionDir::Forward)
                 }
                 None => return Task::none(),
             },
             _ => return Task::none(),
         };
         self.page = target;
+        self.transition_seq = self.transition_seq.wrapping_add(1);
+        self.transition_dir = dir;
         self.scrolled = false;
         scrollable::snap_to(content_id(), scrollable::RelativeOffset::START)
     }
@@ -253,7 +268,11 @@ impl App {
                 None,
                 self.scrolled,
             ),
-            chrome::scroll(form::page(body), content_id(), Message::Scrolled),
+            chrome::page_transition(
+                self.transition_seq,
+                self.transition_dir,
+                chrome::scroll(form::page(body), content_id(), Message::Scrolled),
+            ),
         )
     }
 

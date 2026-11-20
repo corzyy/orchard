@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use tiny_skia::{FillRule, LineCap, LineJoin, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
 
 use crate::{
+    anim::{self, ease_in_cubic, ease_out_cubic, lerp, lerp_rgba, tap_scale, SpringFloat, SpringParams},
     apps::Apps,
-    draw::{fill_circle, fill_rounded, paint, stroke_rounded},
+    draw::{composite, fill_circle, fill_rounded, paint, stroke_rounded},
     notify::{self, CardHit, Center, Hit},
     status::Network,
     text::{Fonts, Rgba, Weight},
@@ -18,8 +19,74 @@ use crate::{
 pub const NC_WIDTH: f32 = 356.0;
 pub const CC_WIDTH: f32 = 320.0;
 const MARGIN: f32 = 10.0;
-const SLIDE: Duration = Duration::from_millis(260);
-const SUBMENU_ANIM: Duration = Duration::from_millis(160);
+const SLIDE_NC_OPEN: Duration = Duration::from_millis(240);
+const SLIDE_NC_CLOSE: Duration = Duration::from_millis(175);
+const CC_OPEN: Duration = Duration::from_millis(200);
+const CC_CLOSE: Duration = Duration::from_millis(130);
+const SUBMENU_ANIM: Duration = Duration::from_millis(190);
+
+pub const PULSE_WIFI: usize = 0;
+pub const PULSE_BT: usize = 1;
+pub const PULSE_DND: usize = 2;
+pub const PULSE_NIGHT: usize = 3;
+pub const PULSE_STAGE: usize = 4;
+pub const PULSE_GAME: usize = 5;
+
+struct PanelAnim {
+    initialized: bool,
+    dnd: SpringFloat,
+    night_shift: SpringFloat,
+    stage_manager: SpringFloat,
+    game_mode: SpringFloat,
+    wifi: SpringFloat,
+    ethernet: SpringFloat,
+    bluetooth: SpringFloat,
+    wifi_others: SpringFloat,
+    panel_h: SpringFloat,
+    panel_h_init: bool,
+    vol: SpringFloat,
+    displays: Vec<SpringFloat>,
+    streams: Vec<SpringFloat>,
+    pulses: [Option<Instant>; 6],
+}
+
+impl PanelAnim {
+    fn new() -> Self {
+        Self {
+            initialized: false,
+            dnd: SpringFloat::new(0.0, SpringParams::SWITCH),
+            night_shift: SpringFloat::new(0.0, SpringParams::SWITCH),
+            stage_manager: SpringFloat::new(0.0, SpringParams::SWITCH),
+            game_mode: SpringFloat::new(0.0, SpringParams::SWITCH),
+            wifi: SpringFloat::new(0.0, SpringParams::SWITCH),
+            ethernet: SpringFloat::new(0.0, SpringParams::SWITCH),
+            bluetooth: SpringFloat::new(0.0, SpringParams::SWITCH),
+            wifi_others: SpringFloat::new(1.0, SpringParams::CHEVRON),
+            panel_h: SpringFloat::new(0.0, SpringParams::PANEL_HEIGHT),
+            panel_h_init: false,
+            vol: SpringFloat::new(0.0, SpringParams::SLIDER),
+            displays: Vec::new(),
+            streams: Vec::new(),
+            pulses: [None; 6],
+        }
+    }
+
+    fn is_animating(&self, now: Instant) -> bool {
+        self.dnd.is_animating(now)
+            || self.night_shift.is_animating(now)
+            || self.stage_manager.is_animating(now)
+            || self.game_mode.is_animating(now)
+            || self.wifi.is_animating(now)
+            || self.ethernet.is_animating(now)
+            || self.bluetooth.is_animating(now)
+            || self.wifi_others.is_animating(now)
+            || self.panel_h.is_animating(now)
+            || self.vol.is_animating(now)
+            || self.displays.iter().any(|d| d.is_animating(now))
+            || self.streams.iter().any(|st| st.is_animating(now))
+            || self.pulses.iter().any(|p| tap_scale(*p, now).1)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -197,7 +264,11 @@ pub enum Target {
 pub struct Panel {
     pub kind: Kind,
     pub opened: Instant,
+    /// Set while the panel is playing its exit animation before surface teardown.
+    pub closing: Option<Instant>,
     pub submenu: Option<Submenu>,
+    /// True when returning from a submenu back to the main Control Center view.
+    submenu_returning: bool,
     /// True when opened directly from a menu bar icon (Sound / Network) rather than via Control Center.
     pub standalone: bool,
     /// True while a standalone Network submenu should align itself to the first fresh `ControlState`.
@@ -223,6 +294,7 @@ pub struct Panel {
     pub game_mode_enabled: bool,
     /// the game Game Mode is on for
     pub game_active: Option<String>,
+    anim: PanelAnim,
     // filled by paint, used for hit tests
     targets: Vec<((f32, f32, f32, f32), Target)>,
     cards: Vec<CardHit>,
@@ -235,7 +307,9 @@ impl Panel {
         Panel {
             kind,
             opened: now,
+            closing: None,
             submenu: None,
+            submenu_returning: false,
             standalone: false,
             auto_network_submenu: false,
             submenu_since: now - SUBMENU_ANIM,
@@ -251,14 +325,43 @@ impl Panel {
             stage_manager: false,
             game_mode_enabled: true,
             game_active: None,
+            anim: PanelAnim::new(),
             targets: Vec::new(),
             cards: Vec::new(),
             panel_rect: (0.0, 0.0, 0.0, 0.0),
         }
     }
 
+    /// Triggers a subtle macOS tap pulse on one of the circular toggle icons.
+    pub fn pulse(&mut self, slot: usize) {
+        if let Some(p) = self.anim.pulses.get_mut(slot) {
+            *p = Some(Instant::now());
+        }
+    }
+
+    pub fn start_close(&mut self) {
+        if self.closing.is_none() {
+            self.closing = Some(Instant::now());
+            self.dragging = None;
+            self.hover = None;
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        let Some(c) = self.closing else { return false };
+        if anim::reduced() {
+            return true;
+        }
+        let dur = match self.kind {
+            Kind::Notifications => SLIDE_NC_CLOSE,
+            Kind::Control => CC_CLOSE,
+        };
+        c.elapsed() >= dur
+    }
+
     pub fn open_submenu(&mut self, sub: Submenu) {
         self.submenu = Some(sub);
+        self.submenu_returning = false;
         self.submenu_since = Instant::now();
         self.scroll = 0.0;
         self.dragging = None;
@@ -267,28 +370,161 @@ impl Panel {
             let connected = self.control.wifi.as_ref().and_then(|(_, s)| s.as_ref()).is_some();
             let has_known = self.control.wifi_networks.iter().any(|n| n.known || n.active);
             self.wifi_others_open = !connected || !has_known;
+            self.anim.wifi_others.snap(if self.wifi_others_open { 1.0 } else { 0.0 });
         }
     }
 
     pub fn close_submenu(&mut self) {
         self.submenu = None;
+        self.submenu_returning = true;
         self.submenu_since = Instant::now();
         self.scroll = 0.0;
         self.dragging = None;
     }
 
     pub fn is_animating(&self) -> bool {
-        self.opened.elapsed() < SLIDE || self.submenu_since.elapsed() < SUBMENU_ANIM
+        let now = Instant::now();
+        if self.closing.is_some() {
+            return !self.is_closed();
+        }
+        let open_dur = match self.kind {
+            Kind::Notifications => SLIDE_NC_OPEN,
+            Kind::Control => CC_OPEN,
+        };
+        (!anim::reduced() && (self.opened.elapsed() < open_dur || self.submenu_since.elapsed() < SUBMENU_ANIM))
+            || self.anim.is_animating(now)
     }
 
-    fn progress(&self) -> f32 {
-        let t = (self.opened.elapsed().as_secs_f32() / SLIDE.as_secs_f32()).clamp(0.0, 1.0);
-        1.0 - (1.0 - t).powi(3)
+    /// 0 = hidden, 1 = fully visible (combines open and close animations).
+    fn open_factor(&self) -> f32 {
+        if anim::reduced() {
+            return if self.closing.is_some() { 0.0 } else { 1.0 };
+        }
+        let open_dur = match self.kind {
+            Kind::Notifications => SLIDE_NC_OPEN,
+            Kind::Control => CC_OPEN,
+        };
+        let open = ease_out_cubic((self.opened.elapsed().as_secs_f32() / open_dur.as_secs_f32()).clamp(0.0, 1.0));
+        if let Some(c) = self.closing {
+            let close_dur = match self.kind {
+                Kind::Notifications => SLIDE_NC_CLOSE,
+                Kind::Control => CC_CLOSE,
+            };
+            let close = 1.0 - ease_in_cubic((c.elapsed().as_secs_f32() / close_dur.as_secs_f32()).clamp(0.0, 1.0));
+            (open * close).clamp(0.0, 1.0)
+        } else {
+            open
+        }
+    }
+
+    /// Alpha for the compositor's frosted-glass backdrop behind this panel.
+    pub fn backdrop_alpha(&self) -> f32 {
+        match self.kind {
+            Kind::Notifications => 1.0,
+            Kind::Control => self.open_factor(),
+        }
     }
 
     fn sub_progress(&self) -> f32 {
+        if anim::reduced() {
+            return 1.0;
+        }
         let t = (self.submenu_since.elapsed().as_secs_f32() / SUBMENU_ANIM.as_secs_f32()).clamp(0.0, 1.0);
-        1.0 - (1.0 - t).powi(3)
+        ease_out_cubic(t)
+    }
+
+    fn sync_springs(&mut self, center: &Center, now: Instant) {
+        let dnd = if center.do_not_disturb { 1.0 } else { 0.0 };
+        let night = if self.night_shift { 1.0 } else { 0.0 };
+        let stage = if self.stage_manager { 1.0 } else { 0.0 };
+        let game = if self.game_mode_enabled || self.game_active.is_some() { 1.0 } else { 0.0 };
+        let wifi = if self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false) { 1.0 } else { 0.0 };
+        let eth = if self.control.ethernet_connected() || (self.control.ethernet.is_empty() && self.network_hint == Network::Wired) {
+            1.0
+        } else {
+            0.0
+        };
+        let bt = if self.control.bluetooth == Some(true) { 1.0 } else { 0.0 };
+        let others = if self.wifi_others_open { 1.0 } else { 0.0 };
+        let (vol_raw, muted) = self.control.volume.unwrap_or((0.0, true));
+        let vol = if muted { 0.0 } else { vol_raw.clamp(0.0, 1.0) };
+
+        if !self.anim.initialized {
+            self.anim.dnd.snap(dnd);
+            self.anim.night_shift.snap(night);
+            self.anim.stage_manager.snap(stage);
+            self.anim.game_mode.snap(game);
+            self.anim.wifi.snap(wifi);
+            self.anim.ethernet.snap(eth);
+            self.anim.bluetooth.snap(bt);
+            self.anim.wifi_others.snap(others);
+            self.anim.vol.snap(vol);
+            self.anim.displays = self
+                .control
+                .displays
+                .iter()
+                .map(|d| SpringFloat::new(d.value.clamp(0.0, 1.0), SpringParams::SLIDER))
+                .collect();
+            self.anim.streams = self
+                .control
+                .streams
+                .iter()
+                .map(|st| SpringFloat::new(if st.muted { 0.0 } else { st.volume.clamp(0.0, 1.0) }, SpringParams::SLIDER))
+                .collect();
+            self.anim.initialized = true;
+            return;
+        }
+
+        self.anim.dnd.set_target(dnd, now);
+        self.anim.night_shift.set_target(night, now);
+        self.anim.stage_manager.set_target(stage, now);
+        self.anim.game_mode.set_target(game, now);
+        self.anim.wifi.set_target(wifi, now);
+        self.anim.ethernet.set_target(eth, now);
+        self.anim.bluetooth.set_target(bt, now);
+        self.anim.wifi_others.set_target(others, now);
+
+        if matches!(self.dragging, Some(Target::Volume(..))) {
+            self.anim.vol.snap(vol);
+        } else {
+            self.anim.vol.set_target(vol, now);
+        }
+
+        if self.anim.displays.len() != self.control.displays.len() {
+            self.anim.displays = self
+                .control
+                .displays
+                .iter()
+                .map(|d| SpringFloat::new(d.value.clamp(0.0, 1.0), SpringParams::SLIDER))
+                .collect();
+        } else {
+            for (idx, (sp, d)) in self.anim.displays.iter_mut().zip(&self.control.displays).enumerate() {
+                let target = d.value.clamp(0.0, 1.0);
+                if matches!(self.dragging, Some(Target::Brightness(i, ..)) if i == idx) {
+                    sp.snap(target);
+                } else {
+                    sp.set_target(target, now);
+                }
+            }
+        }
+
+        if self.anim.streams.len() != self.control.streams.len() {
+            self.anim.streams = self
+                .control
+                .streams
+                .iter()
+                .map(|st| SpringFloat::new(if st.muted { 0.0 } else { st.volume.clamp(0.0, 1.0) }, SpringParams::SLIDER))
+                .collect();
+        } else {
+            for (idx, (sp, st)) in self.anim.streams.iter_mut().zip(&self.control.streams).enumerate() {
+                let target = if st.muted { 0.0 } else { st.volume.clamp(0.0, 1.0) };
+                if matches!(self.dragging, Some(Target::AppVolume(i, ..)) if i == idx) {
+                    sp.snap(target);
+                } else {
+                    sp.set_target(target, now);
+                }
+            }
+        }
     }
 
     fn hovered(&self, rx: f32, ry: f32, rw: f32, rh: f32) -> bool {
@@ -344,14 +580,78 @@ impl Panel {
         theme: &Theme,
         german: bool,
     ) {
+        let now = Instant::now();
         self.targets.clear();
         self.cards.clear();
+        self.sync_springs(center, now);
         match self.kind {
-            Kind::Notifications => self.paint_nc(pm, s, w, h, center, apps, fonts, theme, german),
-            Kind::Control => match self.submenu {
-                None => self.paint_cc(pm, s, w, center, fonts, theme, german),
-                Some(sub) => self.paint_cc_submenu(pm, s, w, h, sub, apps, fonts, theme, german),
-            },
+            Kind::Notifications => self.paint_nc(pm, s, w, h, center, apps, fonts, theme, german, now),
+            Kind::Control => self.paint_control_wrapped(pm, s, w, h, center, apps, fonts, theme, german, now),
+        }
+    }
+
+    /// Renders Control Center (main or submenu), applying the macOS top-right
+    /// popover scale + fade animation while opening or closing.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_control_wrapped(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        w: f32,
+        h: f32,
+        center: &Center,
+        apps: &Apps,
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+        now: Instant,
+    ) {
+        let factor = self.open_factor();
+        if factor <= 0.005 {
+            return;
+        }
+        let x0 = (self.anchor_right - CC_WIDTH).clamp(MARGIN, (w - CC_WIDTH - MARGIN).max(MARGIN));
+        let y0 = 6.0 - (1.0 - factor) * 8.0;
+
+        if factor < 0.999 {
+            let pop_scale = 0.955 + 0.045 * factor;
+            // Paint into a tight offscreen buffer at origin (0, 0) and composite anchored at top-right.
+            let max_h = (h - MARGIN).max(1.0);
+            let bw = (CC_WIDTH * s).ceil().max(1.0) as u32;
+            let bh = (max_h * s).ceil().max(1.0) as u32;
+            if let Some(mut buf) = Pixmap::new(bw, bh) {
+                match self.submenu {
+                    None => self.paint_cc(&mut buf, s, 0.0, 0.0, center, fonts, theme, german, now),
+                    Some(sub) => self.paint_cc_submenu(&mut buf, s, 0.0, 0.0, max_h, sub, apps, fonts, theme, german, now),
+                }
+                let card_h = self.panel_rect.3;
+                let scaled_w = CC_WIDTH * pop_scale;
+                let scaled_h = card_h * pop_scale;
+                // Top-right anchor matches the Control Center menu bar icon
+                let draw_x = x0 + (CC_WIDTH - scaled_w);
+                let draw_y = y0;
+                self.panel_rect = (draw_x, draw_y, scaled_w, scaled_h);
+                composite(pm, &buf, draw_x * s, draw_y * s, pop_scale, factor);
+                if self.closing.is_some() {
+                    self.targets.clear();
+                } else {
+                    for ((rx, ry, rw, rh), _) in &mut self.targets {
+                        *rx = draw_x + *rx * pop_scale;
+                        *ry = draw_y + *ry * pop_scale;
+                        *rw *= pop_scale;
+                        *rh *= pop_scale;
+                    }
+                }
+                return;
+            }
+        }
+
+        match self.submenu {
+            None => self.paint_cc(pm, s, x0, y0, center, fonts, theme, german, now),
+            Some(sub) => self.paint_cc_submenu(pm, s, x0, y0, h, sub, apps, fonts, theme, german, now),
+        }
+        if self.closing.is_some() {
+            self.targets.clear();
         }
     }
 
@@ -369,9 +669,10 @@ impl Panel {
         fonts: &Fonts,
         theme: &Theme,
         german: bool,
+        now: Instant,
     ) {
         let t = |en: &'static str, de: &'static str| if german { de } else { en };
-        let slide = (1.0 - self.progress()) * (NC_WIDTH + MARGIN);
+        let slide = (1.0 - self.open_factor()) * (NC_WIDTH + MARGIN);
         let x0 = w - NC_WIDTH - MARGIN + slide;
         let (top, bottom) = (MARGIN, h - MARGIN);
         self.panel_rect = (x0, top, NC_WIDTH, bottom - top);
@@ -391,12 +692,14 @@ impl Panel {
         let row_y = top + 50.0;
         fill_rounded(pm, inner_x * s, row_y * s, inner_w * s, 44.0 * s, 14.0 * s, card);
         let accent = theme.menu_selection;
-        let moon_bg = if center.do_not_disturb { [94, 92, 230, 255] } else { [128, 128, 128, 90] };
-        fill_circle(pm, (inner_x + 24.0) * s, (row_y + 22.0) * s, 14.0 * s, moon_bg);
-        moon(pm, (inner_x + 24.0) * s, (row_y + 22.0) * s, 7.0 * s, [255, 255, 255, 255]);
+        let dnd_t = self.anim.dnd.sample(now).clamp(0.0, 1.0);
+        let (dnd_scale, _) = tap_scale(self.anim.pulses[PULSE_DND], now);
+        let moon_bg = lerp_rgba([128, 128, 128, 90], [94, 92, 230, 255], dnd_t);
+        fill_circle(pm, (inner_x + 24.0) * s, (row_y + 22.0) * s, 14.0 * dnd_scale * s, moon_bg);
+        moon(pm, (inner_x + 24.0) * s, (row_y + 22.0) * s, 7.0 * dnd_scale * s, [255, 255, 255, 255]);
         let base = fonts.baseline_centered(row_y * s, 44.0 * s, 13.0 * s, Weight::Bold);
         fonts.draw(pm, t("Do Not Disturb", "Nicht stören"), (inner_x + 48.0) * s, base, 13.0 * s, Weight::Bold, theme.menu_text);
-        switch(pm, s, inner_x + inner_w - 52.0, row_y + 11.0, center.do_not_disturb, accent, dark);
+        switch_anim(pm, s, inner_x + inner_w - 52.0, row_y + 11.0, dnd_t, accent, dark);
         self.targets.push(((inner_x, row_y, inner_w, 44.0), Target::Dnd));
 
         // section header
@@ -498,7 +801,19 @@ impl Panel {
 
     // ---- Control Center (main view) ------------------------------------------
 
-    fn paint_cc(&mut self, pm: &mut Pixmap, s: f32, w: f32, center: &Center, fonts: &Fonts, theme: &Theme, german: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn paint_cc(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        x0: f32,
+        y0: f32,
+        center: &Center,
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+        now: Instant,
+    ) {
         let t = |en: &'static str, de: &'static str| if german { de } else { en };
         let dark = theme.bar_text[0] > 128;
         let tint: Rgba = if dark { [30, 30, 32, 160] } else { [242, 242, 245, 170] };
@@ -512,29 +827,44 @@ impl Panel {
         let sub: Rgba = if dark { [235, 235, 235, 130] } else { [20, 20, 20, 120] };
 
         let pad = 10.0;
-        let x0 = (self.anchor_right - CC_WIDTH).clamp(MARGIN, (w - CC_WIDTH - MARGIN).max(MARGIN));
-        let y0 = 6.0 - (1.0 - self.progress()) * 12.0;
-        let inner_x = x0 + pad;
+        let slide_x = if self.submenu_returning { -(1.0 - self.sub_progress()) * 10.0 } else { 0.0 };
+        let inner_x = x0 + pad + slide_x;
         let inner_w = CC_WIDTH - 2.0 * pad;
         let half = (inner_w - pad) / 2.0;
 
-        // compute height first
-        let mut height = pad + 110.0 + pad;
-        height += 50.0 + pad; // stage manager
-        height += GAME_CARD_H + pad;
+        // compute target height and morph container smoothly from previous view
+        let mut target_h = pad + 110.0 + pad;
+        target_h += 50.0 + pad; // stage manager
+        target_h += GAME_CARD_H + pad;
         let disp_count = self.control.displays.len();
         if disp_count == 1 {
-            height += 64.0 + pad;
+            target_h += 64.0 + pad;
         } else if disp_count > 1 {
-            height += 28.0 + disp_count as f32 * 44.0 + 6.0 + pad;
+            target_h += 28.0 + disp_count as f32 * 44.0 + 6.0 + pad;
         }
-        height += 64.0 + pad; // sound
+        target_h += 64.0 + pad; // sound
         if self.control.media.is_some() {
-            height += 64.0 + pad;
+            target_h += 64.0 + pad;
         }
+        if !self.anim.panel_h_init {
+            self.anim.panel_h.snap(target_h);
+            self.anim.panel_h_init = true;
+        } else {
+            self.anim.panel_h.set_target(target_h, now);
+        }
+        let height = self.anim.panel_h.sample(now).max(120.0);
         self.panel_rect = (x0, y0, CC_WIDTH, height);
         fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, tint);
         stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, 1.0 * s, border);
+
+        let wifi_t = self.anim.wifi.sample(now).clamp(0.0, 1.0);
+        let eth_t = self.anim.ethernet.sample(now).clamp(0.0, 1.0);
+        let bt_t = self.anim.bluetooth.sample(now).clamp(0.0, 1.0);
+        let dnd_t = self.anim.dnd.sample(now).clamp(0.0, 1.0);
+        let night_t = self.anim.night_shift.sample(now).clamp(0.0, 1.0);
+        let sm_t = self.anim.stage_manager.sample(now).clamp(0.0, 1.0);
+        let game_t = self.anim.game_mode.sample(now).clamp(0.0, 1.0);
+        let vol_val = self.anim.vol.sample(now).clamp(0.0, 1.0);
 
         // connectivity card: Wi-Fi / Ethernet (dynamic by active connection) + Bluetooth
         let y = y0 + pad;
@@ -584,15 +914,17 @@ impl Panel {
             (
                 can_toggle.then_some(Target::EthernetToggle),
                 Submenu::Ethernet,
+                PULSE_WIFI,
                 "Ethernet".to_string(),
                 status,
-                eth_connected,
+                eth_t,
                 true,
             )
         } else {
             (
                 self.control.wifi.is_some().then_some(Target::WifiToggle),
                 Submenu::Wifi,
+                PULSE_WIFI,
                 "Wi-Fi".to_string(),
                 if self.control.wifi.is_none() {
                     t("Unavailable", "Nicht verfügbar").to_string()
@@ -601,7 +933,7 @@ impl Panel {
                 } else {
                     ssid.unwrap_or_else(|| t("Not Connected", "Nicht verbunden").into())
                 },
-                wifi_on,
+                wifi_t,
                 self.control.wifi.is_some(),
             )
         };
@@ -611,14 +943,15 @@ impl Panel {
             (
                 self.control.bluetooth.is_some().then_some(Target::BluetoothToggle),
                 Submenu::Bluetooth,
+                PULSE_BT,
                 "Bluetooth".to_string(),
                 bt_status,
-                self.control.bluetooth == Some(true),
+                bt_t,
                 self.control.bluetooth.is_some(),
             ),
         ];
 
-        for (i, (toggle_target, submenu, title, status, on, available)) in rows.into_iter().enumerate() {
+        for (i, (toggle_target, submenu, pulse_slot, title, status, on_t, available)) in rows.into_iter().enumerate() {
             let ry = y + 9.0 + i as f32 * 48.0;
             let row_rect = (inner_x + 4.0, ry, half - 8.0, 44.0);
             let circle_rect = (inner_x + 8.0, ry + 5.0, 32.0, 32.0);
@@ -629,12 +962,13 @@ impl Panel {
                 fill_rounded(pm, row_rect.0 * s, row_rect.1 * s, row_rect.2 * s, row_rect.3 * s, 10.0 * s, hover_bg);
             }
             let (cx, cy) = (inner_x + 24.0, ry + 22.0);
-            fill_circle(pm, cx * s, cy * s, 15.0 * s, if on { accent } else { off });
-            let glyph = if on { [255, 255, 255, 255] } else { text };
+            let (ps, _) = tap_scale(self.anim.pulses[pulse_slot], now);
+            fill_circle(pm, cx * s, cy * s, 15.0 * ps * s, lerp_rgba(off, accent, on_t));
+            let glyph = lerp_rgba(text, [255, 255, 255, 255], on_t);
             match submenu {
-                Submenu::Wifi => crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.8, Network::Wifi(3), glyph),
-                Submenu::Ethernet => crate::menubar::draw_network(pm, cx * s, cy * s, s * 1.0, Network::Wired, glyph),
-                _ => bluetooth(pm, cx * s, cy * s, 7.0 * s, glyph),
+                Submenu::Wifi => crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.8 * ps, Network::Wifi(3), glyph),
+                Submenu::Ethernet => crate::menubar::draw_network(pm, cx * s, cy * s, s * 1.0 * ps, Network::Wired, glyph),
+                _ => bluetooth(pm, cx * s, cy * s, 7.0 * ps * s, glyph),
             }
             let tx = inner_x + 46.0;
             let maxw = half - 62.0;
@@ -660,21 +994,22 @@ impl Panel {
         let card_h = (110.0 - pad) / 2.0;
         let dnd = center.do_not_disturb;
         let night = self.night_shift;
-        let cards: [(Target, &str, bool, Rgba); 2] = [
-            (Target::Dnd, t("Do Not Disturb", "Nicht stören"), dnd, [94, 92, 230, 255]),
-            (Target::NightShift, "Night Shift", night, [255, 149, 0, 255]),
+        let cards: [(Target, usize, &str, bool, f32, Rgba); 2] = [
+            (Target::Dnd, PULSE_DND, t("Do Not Disturb", "Nicht stören"), dnd, dnd_t, [94, 92, 230, 255]),
+            (Target::NightShift, PULSE_NIGHT, "Night Shift", night, night_t, [255, 149, 0, 255]),
         ];
-        for (i, (target, title, on, on_col)) in cards.into_iter().enumerate() {
+        for (i, (target, pulse_slot, title, on, on_t, on_col)) in cards.into_iter().enumerate() {
             let cy0 = y + i as f32 * (card_h + pad);
             let hovered = self.hovered(fx, cy0, half, card_h);
             fill_rounded(pm, fx * s, cy0 * s, half * s, card_h * s, 14.0 * s, if hovered && !on { hover_bg } else { card });
             stroke_rounded(pm, fx * s, cy0 * s, half * s, card_h * s, 14.0 * s, 0.75 * s, card_border);
             let (cx, cy) = (fx + 22.0, cy0 + card_h / 2.0);
-            fill_circle(pm, cx * s, cy * s, 14.0 * s, if on { on_col } else { off });
-            let glyph = if on { [255, 255, 255, 255] } else { text };
+            let (ps, _) = tap_scale(self.anim.pulses[pulse_slot], now);
+            fill_circle(pm, cx * s, cy * s, 14.0 * ps * s, lerp_rgba(off, on_col, on_t));
+            let glyph = lerp_rgba(text, [255, 255, 255, 255], on_t);
             match target {
-                Target::Dnd => moon(pm, cx * s, cy * s, 6.5 * s, glyph),
-                _ => sun(pm, cx * s, cy * s, 6.5 * s, glyph),
+                Target::Dnd => moon(pm, cx * s, cy * s, 6.5 * ps * s, glyph),
+                _ => sun(pm, cx * s, cy * s, 6.5 * ps * s, glyph),
             }
             let tx = fx + 42.0;
             let maxw = half - 48.0;
@@ -694,15 +1029,16 @@ impl Panel {
             fill_rounded(pm, inner_x * s, sm_y * s, inner_w * s, sm_h * s, 14.0 * s, if hovered && !sm_on { hover_bg } else { card });
             stroke_rounded(pm, inner_x * s, sm_y * s, inner_w * s, sm_h * s, 14.0 * s, 0.75 * s, card_border);
             let (cx, cy) = (inner_x + 22.0, sm_y + sm_h / 2.0);
-            fill_circle(pm, cx * s, cy * s, 14.0 * s, if sm_on { accent } else { off });
-            stage_manager_glyph(pm, cx * s, cy * s, 6.8 * s, if sm_on { [255, 255, 255, 255] } else { text });
+            let (ps, _) = tap_scale(self.anim.pulses[PULSE_STAGE], now);
+            fill_circle(pm, cx * s, cy * s, 14.0 * ps * s, lerp_rgba(off, accent, sm_t));
+            stage_manager_glyph(pm, cx * s, cy * s, 6.8 * ps * s, lerp_rgba(text, [255, 255, 255, 255], sm_t));
             let tx = inner_x + 42.0;
             let maxw = inner_w - 104.0;
             let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
             fonts.draw(pm, &fonts.elide("Stage Manager", 12.0 * s, Weight::Bold, maxw * s), tx * s, b1, 12.0 * s, Weight::Bold, text);
             let b2 = fonts.baseline_centered((cy + 1.0) * s, 14.0 * s, 11.0 * s, Weight::Regular);
             fonts.draw(pm, if sm_on { t("On", "Ein") } else { t("Off", "Aus") }, tx * s, b2, 11.0 * s, Weight::Regular, sub);
-            switch(pm, s, inner_x + inner_w - 50.0, sm_y + (sm_h - 22.0) / 2.0, sm_on, accent, dark);
+            switch_anim(pm, s, inner_x + inner_w - 50.0, sm_y + (sm_h - 22.0) / 2.0, sm_t, accent, dark);
             self.targets.push(((inner_x, sm_y, inner_w, sm_h), Target::StageManager));
         }
 
@@ -715,9 +1051,10 @@ impl Panel {
             stroke_rounded(pm, inner_x * s, gy * s, inner_w * s, GAME_CARD_H * s, 14.0 * s, 0.75 * s, card_border);
             let (cx, cy) = (inner_x + 22.0, gy + GAME_CARD_H / 2.0);
             let active = self.game_active.is_some();
-            let circle = if active { [52, 199, 89, 255] } else if on { accent } else { off };
-            fill_circle(pm, cx * s, cy * s, 14.0 * s, circle);
-            controller(pm, cx * s, cy * s, 7.0 * s, if on { [255, 255, 255, 255] } else { text });
+            let (ps, _) = tap_scale(self.anim.pulses[PULSE_GAME], now);
+            let on_col = if active { [52, 199, 89, 255] } else { accent };
+            fill_circle(pm, cx * s, cy * s, 14.0 * ps * s, lerp_rgba(off, on_col, game_t));
+            controller(pm, cx * s, cy * s, 7.0 * ps * s, lerp_rgba(text, [255, 255, 255, 255], game_t));
             let tx = inner_x + 42.0;
             let maxw = inner_w - 50.0;
             let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
@@ -735,37 +1072,46 @@ impl Panel {
         // sliders
         let mut y = gy + GAME_CARD_H + pad;
         if self.control.displays.len() == 1 {
-            let d = &self.control.displays[0];
+            let d_bus = self.control.displays[0].bus;
+            let d_name = self.control.displays[0].name.clone();
+            let d_val = self.anim.displays.get_mut(0).map(|sp| sp.sample(now)).unwrap_or(self.control.displays[0].value);
             fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
             stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
             let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
             fonts.draw(pm, t("Display", "Display"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
-            if d.bus.is_some() {
-                let name = fonts.elide(&d.name, 11.0 * s, Weight::Regular, (inner_w - 86.0) * s);
+            if d_bus.is_some() {
+                let name = fonts.elide(&d_name, 11.0 * s, Weight::Regular, (inner_w - 86.0) * s);
                 let nw = fonts.measure(&name, 11.0 * s, Weight::Regular);
                 let nb = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 11.0 * s, Weight::Regular);
                 fonts.draw(pm, &name, (inner_x + inner_w - 12.0) * s - nw, nb, 11.0 * s, Weight::Regular, sub);
             }
-            draw_pill_slider(pm, s, inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0, d.value, 0, false, off);
             let (tx, ty, tw, th) = (inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0);
+            let hov = self.hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
+            let drag = matches!(self.dragging, Some(Target::Brightness(0, ..)));
+            draw_pill_slider(pm, s, tx, ty, tw, th, d_val, 0, false, off, hov, drag);
             self.targets.push((
                 (tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0),
                 Target::Brightness(0, tx + th / 2.0, tx + tw - th / 2.0),
             ));
             y += 64.0 + pad;
         } else if self.control.displays.len() > 1 {
-            let card_h = 28.0 + self.control.displays.len() as f32 * 44.0 + 6.0;
+            let count = self.control.displays.len();
+            let card_h = 28.0 + count as f32 * 44.0 + 6.0;
             fill_rounded(pm, inner_x * s, y * s, inner_w * s, card_h * s, 14.0 * s, card);
             stroke_rounded(pm, inner_x * s, y * s, inner_w * s, card_h * s, 14.0 * s, 0.75 * s, card_border);
             let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
             fonts.draw(pm, t("Displays", "Displays"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
-            for (idx, d) in self.control.displays.iter().enumerate() {
+            for idx in 0..count {
+                let d_name = self.control.displays[idx].name.clone();
+                let d_val = self.anim.displays.get_mut(idx).map(|sp| sp.sample(now)).unwrap_or(self.control.displays[idx].value);
                 let ry = y + 28.0 + idx as f32 * 44.0;
                 let lb = fonts.baseline_centered(ry * s, 14.0 * s, 11.0 * s, Weight::Regular);
-                let label = fonts.elide(&d.name, 11.0 * s, Weight::Regular, (inner_w - 24.0) * s);
+                let label = fonts.elide(&d_name, 11.0 * s, Weight::Regular, (inner_w - 24.0) * s);
                 fonts.draw(pm, &label, (inner_x + 12.0) * s, lb, 11.0 * s, Weight::Regular, sub);
                 let (tx, ty, tw, th) = (inner_x + 12.0, ry + 16.0, inner_w - 24.0, 22.0);
-                draw_pill_slider(pm, s, tx, ty, tw, th, d.value, 0, false, off);
+                let hov = self.hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
+                let drag = matches!(self.dragging, Some(Target::Brightness(i, ..)) if i == idx);
+                draw_pill_slider(pm, s, tx, ty, tw, th, d_val, 0, false, off, hov, drag);
                 self.targets.push((
                     (tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0),
                     Target::Brightness(idx, tx + th / 2.0, tx + tw - th / 2.0),
@@ -775,7 +1121,7 @@ impl Panel {
         }
 
         // Sound card (header opens Sound submenu, slider adjusts volume)
-        let (vol, muted) = self.control.volume.unwrap_or((0.0, true));
+        let (_, muted) = self.control.volume.unwrap_or((0.0, true));
         fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
         stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
         let sound_head_rect = (inner_x + 4.0, y + 2.0, inner_w - 8.0, 26.0);
@@ -789,7 +1135,9 @@ impl Panel {
         self.targets.push((sound_head_rect, Target::OpenSubmenu(Submenu::Sound)));
 
         let (tx, ty, tw, th) = (inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0);
-        draw_pill_slider(pm, s, tx, ty, tw, th, if muted { 0.0 } else { vol.min(1.0) }, 1, muted, off);
+        let vol_hov = self.hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
+        let vol_drag = matches!(self.dragging, Some(Target::Volume(..)));
+        draw_pill_slider(pm, s, tx, ty, tw, th, vol_val, 1, muted, off, vol_hov, vol_drag);
         self.targets
             .push(((tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0), Target::Volume(tx + th / 2.0, tx + tw - th / 2.0)));
         y += 64.0 + pad;
@@ -826,13 +1174,15 @@ impl Panel {
         &mut self,
         pm: &mut Pixmap,
         s: f32,
-        w: f32,
+        x0: f32,
+        y0: f32,
         h: f32,
         submenu: Submenu,
         apps: &Apps,
         fonts: &Fonts,
         theme: &Theme,
         german: bool,
+        now: Instant,
     ) {
         let t = |en: &'static str, de: &'static str| if german { de } else { en };
         let dark = theme.bar_text[0] > 128;
@@ -845,17 +1195,20 @@ impl Panel {
         let text = theme.menu_text;
         let sub_text: Rgba = if dark { [235, 235, 235, 138] } else { [20, 20, 20, 128] };
 
-        let x0 = (self.anchor_right - CC_WIDTH).clamp(MARGIN, (w - CC_WIDTH - MARGIN).max(MARGIN));
-        let y0 = 6.0 - (1.0 - self.progress()) * 12.0;
-        let slide_x = if self.standalone { 0.0 } else { (1.0 - self.sub_progress()) * 10.0 };
+        let slide_x = if self.standalone { 0.0 } else { (1.0 - self.sub_progress()) * 14.0 };
+        let wifi_t = self.anim.wifi.sample(now).clamp(0.0, 1.0);
+        let eth_t = self.anim.ethernet.sample(now).clamp(0.0, 1.0);
+        let bt_t = self.anim.bluetooth.sample(now).clamp(0.0, 1.0);
+        let others_t = self.anim.wifi_others.sample(now).clamp(0.0, 1.0);
+        let vol_val = self.anim.vol.sample(now).clamp(0.0, 1.0);
 
         // Pre-build the scrollable content items for each submenu
-        let (title, toggle_state, toggle_target, settings_label, settings_page) = match submenu {
+        let (title, toggle_t, toggle_target, settings_label, settings_page) = match submenu {
             Submenu::Wifi => {
                 if self.control.wifi.is_some() {
                     (
                         "Wi-Fi",
-                        Some(self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false)),
+                        Some(wifi_t),
                         Some(Target::WifiToggle),
                         t("Wi-Fi Settings…", "WLAN-Einstellungen …"),
                         "wifi",
@@ -874,7 +1227,7 @@ impl Panel {
                 let eth_toggleable = self.control.ethernet.iter().any(|e| e.managed && e.plugged);
                 (
                     "Ethernet",
-                    eth_toggleable.then(|| self.control.ethernet_connected()),
+                    eth_toggleable.then_some(eth_t),
                     eth_toggleable.then_some(Target::EthernetToggle),
                     t("Network Settings…", "Netzwerkeinstellungen …"),
                     "network",
@@ -882,7 +1235,7 @@ impl Panel {
             }
             Submenu::Bluetooth => (
                 "Bluetooth",
-                Some(self.control.bluetooth == Some(true)),
+                Some(bt_t),
                 Some(Target::BluetoothToggle),
                 t("Bluetooth Settings…", "Bluetooth-Einstellungen …"),
                 "bluetooth",
@@ -922,13 +1275,8 @@ impl Panel {
                         }
                         if other_count > 0 || known_count == 0 {
                             ch += 26.0; // "Other Networks" header row
-                            if self.wifi_others_open {
-                                if other_count == 0 {
-                                    ch += 34.0;
-                                } else {
-                                    ch += other_count as f32 * 38.0;
-                                }
-                            }
+                            let other_rows_h = if other_count == 0 { 34.0 } else { other_count as f32 * 38.0 };
+                            ch += other_rows_h * others_t;
                         }
                     }
                     if show_eth_link {
@@ -971,7 +1319,15 @@ impl Panel {
         let top_chrome = 4.0 + header_h + sound_slider_h + if content_h > 0.0 { 1.0 } else { 0.0 };
         let max_list_h = (h - y0 - MARGIN - top_chrome - footer_h).clamp(110.0, 380.0);
         let visible_list_h = content_h.min(max_list_h);
-        let total_h = top_chrome + visible_list_h + footer_h;
+        let target_h = top_chrome + visible_list_h + footer_h;
+        if !self.anim.panel_h_init {
+            self.anim.panel_h.snap(target_h);
+            self.anim.panel_h_init = true;
+        } else {
+            self.anim.panel_h.set_target(target_h, now);
+        }
+        let total_h = self.anim.panel_h.sample(now).max(top_chrome + footer_h);
+        let body_h = (total_h - top_chrome - footer_h).max(0.0);
 
         self.panel_rect = (x0, y0, CC_WIDTH, total_h);
         fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, total_h * s, 18.0 * s, tint);
@@ -983,7 +1339,7 @@ impl Panel {
         if self.standalone {
             fonts.draw(pm, title, (x0 + 14.0) * s, hb, 13.5 * s, Weight::Bold, text);
         } else {
-            let back_rect = (x0 + 6.0, hy + 4.0, if toggle_state.is_some() { CC_WIDTH - 68.0 } else { CC_WIDTH - 12.0 }, 36.0);
+            let back_rect = (x0 + 6.0, hy + 4.0, if toggle_t.is_some() { CC_WIDTH - 68.0 } else { CC_WIDTH - 12.0 }, 36.0);
             let back_hovered = self.hovered(back_rect.0, back_rect.1, back_rect.2, back_rect.3);
             if back_hovered {
                 fill_rounded(pm, back_rect.0 * s, back_rect.1 * s, back_rect.2 * s, back_rect.3 * s, 8.0 * s, hover_bg);
@@ -993,19 +1349,21 @@ impl Panel {
             self.targets.push((back_rect, Target::SubmenuBack));
         }
 
-        if let (Some(on), Some(t_target)) = (toggle_state, toggle_target) {
+        if let (Some(sw_t), Some(t_target)) = (toggle_t, toggle_target) {
             let sx = x0 + CC_WIDTH - 14.0 - 38.0;
             let sy = hy + 11.0;
-            switch(pm, s, sx, sy, on, accent, dark);
+            switch_anim(pm, s, sx, sy, sw_t, accent, dark);
             self.targets.push(((sx - 4.0, sy - 4.0, 46.0, 30.0), t_target));
         }
 
         // ---- Sound slider (directly under Sound header) ----
         let mut cur_y = hy + header_h;
         if submenu == Submenu::Sound {
-            let (vol, muted) = self.control.volume.unwrap_or((0.0, true));
+            let (_, muted) = self.control.volume.unwrap_or((0.0, true));
             let (tx, ty, tw, th) = (x0 + 14.0, cur_y + 2.0, CC_WIDTH - 28.0, 22.0);
-            draw_pill_slider(pm, s, tx, ty, tw, th, if muted { 0.0 } else { vol.min(1.0) }, 1, muted, off);
+            let vol_hov = self.hovered(tx - 2.0, ty - 4.0, tw + 4.0, th + 8.0);
+            let vol_drag = matches!(self.dragging, Some(Target::Volume(..)));
+            draw_pill_slider(pm, s, tx, ty, tw, th, vol_val, 1, muted, off, vol_hov, vol_drag);
             // Clicking the speaker icon toggles mute; dragging anywhere else sets volume
             self.targets.push(((tx - 2.0, ty - 4.0, 24.0, th + 8.0), Target::VolumeMute));
             self.targets
@@ -1014,18 +1372,18 @@ impl Panel {
         }
 
         // ---- Scrollable body ----
-        if content_h > 0.0 {
+        if content_h > 0.0 && body_h > 1.0 {
             draw_sep(pm, s, x0 + 14.0, cur_y, CC_WIDTH - 28.0, sep);
             cur_y += 1.0;
 
             let list_y = cur_y;
-            self.scroll = self.scroll.min((content_h - visible_list_h).max(0.0));
+            self.scroll = self.scroll.min((content_h - body_h).max(0.0));
             let scroll = self.scroll;
 
-            if let Some(mut sub_pm) = Pixmap::new((CC_WIDTH * s).ceil().max(1.0) as u32, (visible_list_h * s).ceil().max(1.0) as u32) {
+            if let Some(mut sub_pm) = Pixmap::new((CC_WIDTH * s).ceil().max(1.0) as u32, (body_h * s).ceil().max(1.0) as u32) {
                 let mut local_targets: Vec<((f32, f32, f32, f32), Target)> = Vec::new();
                 let hover_local = self.hover.and_then(|(hx, hy)| {
-                    if hy >= list_y && hy < list_y + visible_list_h && hx >= x0 && hx < x0 + CC_WIDTH {
+                    if hy >= list_y && hy < list_y + body_h && hx >= x0 && hx < x0 + CC_WIDTH {
                         Some((hx - x0, hy - list_y))
                     } else {
                         None
@@ -1109,19 +1467,22 @@ impl Panel {
                                     fill_rounded(&mut sub_pm, hdr_rect.0 * s, hdr_rect.1 * s, hdr_rect.2 * s, hdr_rect.3 * s, 6.0 * s, hover_bg);
                                 }
                                 draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly + 1.0, t("Other Networks", "Andere Netzwerke"), fonts, sub_text);
-                                if self.wifi_others_open {
-                                    chevron_down(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
-                                } else {
-                                    chevron_right(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
-                                }
+                                chevron_rotated(
+                                    &mut sub_pm,
+                                    (CC_WIDTH - 18.0) * s,
+                                    (ly + 13.0) * s,
+                                    4.0 * s,
+                                    others_t * std::f32::consts::FRAC_PI_2,
+                                    sub_text,
+                                );
                                 local_targets.push((hdr_rect, Target::WifiToggleOthers));
                                 ly += 26.0;
 
-                                if self.wifi_others_open {
+                                if others_t > 0.02 {
                                     if others.is_empty() {
                                         let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
                                         fonts.draw(&mut sub_pm, t("No Networks Found", "Keine Netzwerke gefunden"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
-                                        ly += 34.0;
+                                        ly += 34.0 * others_t;
                                     } else {
                                         for net in &others {
                                             let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
@@ -1142,14 +1503,16 @@ impl Panel {
                                                 sub_text,
                                                 german,
                                             );
-                                            local_targets.push((
-                                                row,
-                                                Target::WifiConnect {
-                                                    ssid: net.ssid.clone(),
-                                                    known: false,
-                                                    secure: net.secure,
-                                                },
-                                            ));
+                                            if self.wifi_others_open {
+                                                local_targets.push((
+                                                    row,
+                                                    Target::WifiConnect {
+                                                        ssid: net.ssid.clone(),
+                                                        known: false,
+                                                        secure: net.secure,
+                                                    },
+                                                ));
+                                            }
                                             ly += 38.0;
                                         }
                                     }
@@ -1316,20 +1679,31 @@ impl Panel {
                             ly += 9.0;
                             draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Apps", "Apps"), fonts, sub_text);
                             ly += 24.0;
-                            for (i, st) in self.control.streams.iter().enumerate() {
+                            let stream_count = self.control.streams.len();
+                            for i in 0..stream_count {
+                                let st_icon = self.control.streams[i].icon.clone();
+                                let st_name = self.control.streams[i].name.clone();
+                                let st_muted = self.control.streams[i].muted;
+                                let shown = self
+                                    .anim
+                                    .streams
+                                    .get_mut(i)
+                                    .map(|sp| sp.sample(now))
+                                    .unwrap_or(if st_muted { 0.0 } else { self.control.streams[i].volume.min(1.0) });
                                 let icon_px = (16.0 * s).round().max(1.0) as u32;
-                                let name_x = if let Some(icon) = apps.icon(&st.icon, icon_px) {
+                                let name_x = if let Some(icon) = apps.icon(&st_icon, icon_px) {
                                     pm_draw_icon(&mut sub_pm, &icon, (14.0 + slide_x) * s, (ly + 3.0) * s, 16.0 * s);
                                     36.0
                                 } else {
                                     14.0
                                 };
                                 let b = fonts.baseline_centered((ly + 2.0) * s, 18.0 * s, 12.0 * s, Weight::Regular);
-                                let label = fonts.elide(&st.name, 12.0 * s, Weight::Regular, (CC_WIDTH - name_x - 18.0) * s);
+                                let label = fonts.elide(&st_name, 12.0 * s, Weight::Regular, (CC_WIDTH - name_x - 18.0) * s);
                                 fonts.draw(&mut sub_pm, &label, (name_x + slide_x) * s, b, 12.0 * s, Weight::Regular, text);
                                 let (tx, ty, tw, th) = (14.0 + slide_x, ly + 22.0, CC_WIDTH - 28.0, 20.0);
-                                let shown = if st.muted { 0.0 } else { st.volume.min(1.0) };
-                                draw_pill_slider(&mut sub_pm, s, tx, ty, tw, th, shown, 1, st.muted, off);
+                                let app_hov = is_hov(tx - 2.0, ty - 3.0, tw + 4.0, th + 6.0);
+                                let app_drag = matches!(self.dragging, Some(Target::AppVolume(idx, ..)) if idx == i);
+                                draw_pill_slider(&mut sub_pm, s, tx, ty, tw, th, shown, 1, st_muted, off, app_hov, app_drag);
                                 // the speaker mutes; the rest of the track sets the level.
                                 // local targets get x0 added, slider ranges are absolute.
                                 local_targets.push(((tx - 2.0, ty - 3.0, 24.0, th + 6.0), Target::AppMute(i)));
@@ -1355,14 +1729,14 @@ impl Panel {
                 // Translate & clip local targets to the visible list viewport
                 for ((rx, ry, rw, rh), target) in local_targets {
                     let y1 = ry.max(0.0);
-                    let y2 = (ry + rh).min(visible_list_h);
+                    let y2 = (ry + rh).min(body_h);
                     if y2 > y1 {
                         self.targets.push(((x0 + rx, list_y + y1, rw, y2 - y1), target));
                     }
                 }
             }
 
-            cur_y += visible_list_h;
+            cur_y += body_h;
         }
 
         // ---- Footer ("… Settings…") ----
@@ -1394,21 +1768,39 @@ fn pm_draw_icon(pm: &mut Pixmap, icon: &Pixmap, x: f32, y: f32, size: f32) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_pill_slider(pm: &mut Pixmap, s: f32, tx: f32, ty: f32, tw: f32, th: f32, value: f32, icon: u8, muted: bool, off: Rgba) {
+fn draw_pill_slider(
+    pm: &mut Pixmap,
+    s: f32,
+    tx: f32,
+    ty: f32,
+    tw: f32,
+    th: f32,
+    value: f32,
+    icon: u8,
+    muted: bool,
+    off: Rgba,
+    hovered: bool,
+    dragging: bool,
+) {
     fill_rounded(pm, tx * s, ty * s, tw * s, th * s, (th / 2.0) * s, off);
     let fill_w = (th + (tw - th) * value.clamp(0.0, 1.0)).max(th);
-    fill_rounded(pm, tx * s, ty * s, fill_w * s, th * s, (th / 2.0) * s, [255, 255, 255, 238]);
+    let fill_alpha = if dragging { 252 } else if hovered { 246 } else { 236 };
+    fill_rounded(pm, tx * s, ty * s, fill_w * s, th * s, (th / 2.0) * s, [255, 255, 255, fill_alpha]);
     let knob_x = tx + fill_w - th / 2.0;
-    fill_circle(pm, knob_x * s, (ty + th / 2.0) * s, (th / 2.0 - 1.0) * s, [255, 255, 255, 255]);
+    let knob_r = th / 2.0 - if dragging { 0.6 } else { 1.0 };
+    if hovered || dragging {
+        fill_circle(pm, knob_x * s, (ty + th / 2.0 + 0.6) * s, knob_r * s, [0, 0, 0, if dragging { 38 } else { 22 }]);
+    }
+    fill_circle(pm, knob_x * s, (ty + th / 2.0) * s, knob_r * s, [255, 255, 255, 255]);
     stroke_rounded(
         pm,
-        (knob_x - th / 2.0 + 1.0) * s,
-        (ty + 1.0) * s,
-        (th - 2.0) * s,
-        (th - 2.0) * s,
-        (th / 2.0 - 1.0) * s,
+        (knob_x - knob_r) * s,
+        (ty + th / 2.0 - knob_r) * s,
+        (knob_r * 2.0) * s,
+        (knob_r * 2.0) * s,
+        knob_r * s,
         1.0 * s,
-        [0, 0, 0, 30],
+        [0, 0, 0, if dragging { 42 } else { 28 }],
     );
     let glyph: Rgba = [90, 90, 92, 255];
     match icon {
@@ -1822,11 +2214,16 @@ fn chevron_left(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     }
 }
 
-fn chevron_down(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+fn chevron_rotated(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, angle: f32, c: Rgba) {
+    let (sa, ca) = angle.sin_cos();
+    let rot = |x: f32, y: f32| (cx + x * ca - y * sa, cy + x * sa + y * ca);
+    let (x0, y0) = rot(-r * 0.45, -r);
+    let (x1, y1) = rot(r * 0.45, 0.0);
+    let (x2, y2) = rot(-r * 0.45, r);
     let mut pb = PathBuilder::new();
-    pb.move_to(cx - r, cy - r * 0.4);
-    pb.line_to(cx, cy + r * 0.5);
-    pb.line_to(cx + r, cy - r * 0.4);
+    pb.move_to(x0, y0);
+    pb.line_to(x1, y1);
+    pb.line_to(x2, y2);
     if let Some(p) = pb.finish() {
         let st = Stroke {
             width: (r * 0.38).max(1.3),
@@ -1956,17 +2353,14 @@ fn transport(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, dir: i32, c: Rgba) {
     }
 }
 
-/// macOS / iOS-style switch at (x, y), 38×22.
-fn switch(pm: &mut Pixmap, s: f32, x: f32, y: f32, on: bool, accent: Rgba, dark: bool) {
-    let bg = if on {
-        accent
-    } else if dark {
-        [120, 120, 128, 100]
-    } else {
-        [0, 0, 0, 42]
-    };
+/// Animated macOS / iOS-style switch at (x, y), 38×22 (`t` in `0..=1`).
+fn switch_anim(pm: &mut Pixmap, s: f32, x: f32, y: f32, t: f32, accent: Rgba, dark: bool) {
+    let off_bg = if dark { [120, 120, 128, 100] } else { [0, 0, 0, 42] };
+    let bg = lerp_rgba(off_bg, accent, t);
     fill_rounded(pm, x * s, y * s, 38.0 * s, 22.0 * s, 11.0 * s, bg);
-    let kx = if on { x + 27.0 } else { x + 11.0 };
+    let kx = lerp(x + 11.0, x + 27.0, t.clamp(0.0, 1.0));
+    // Soft knob drop shadow
+    fill_circle(pm, kx * s, (y + 11.8) * s, 9.0 * s, [0, 0, 0, if dark { 42 } else { 26 }]);
     fill_circle(pm, kx * s, (y + 11.0) * s, 9.0 * s, [255, 255, 255, 255]);
     stroke_rounded(pm, (kx - 9.0) * s, (y + 2.0) * s, 18.0 * s, 18.0 * s, 9.0 * s, 0.75 * s, [0, 0, 0, 26]);
 }
@@ -2796,4 +3190,3 @@ wlan0:wifi:connected:OfficeWiFi
         assert!(!panel.targets.iter().any(|(_, t)| *t == Target::EthernetToggle));
     }
 }
-
