@@ -1,4 +1,11 @@
-use std::{io::Read, time::Duration};
+use std::{
+    io::Read,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use tracing::warn;
 use xcursor::{
@@ -7,12 +14,20 @@ use xcursor::{
 };
 
 static FALLBACK_CURSOR_DATA: &[u8] = include_bytes!("../resources/cursor.rgba");
+static NEXT_CURSOR_ID: AtomicU64 = AtomicU64::new(1);
+
+fn tag_images(images: Vec<Image>) -> Vec<(u64, Arc<Image>)> {
+    images
+        .into_iter()
+        .map(|img| (NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed), Arc::new(img)))
+        .collect()
+}
 
 pub struct Cursor {
-    icons: Vec<Image>,
+    icons: Vec<(u64, Arc<Image>)>,
     size: u32,
     theme: CursorTheme,
-    named: std::cell::RefCell<std::collections::HashMap<String, Option<Vec<Image>>>>,
+    named: std::cell::RefCell<std::collections::HashMap<String, Option<Vec<(u64, Arc<Image>)>>>>,
 }
 
 impl Cursor {
@@ -39,7 +54,7 @@ impl Cursor {
             });
 
         Cursor {
-            icons,
+            icons: tag_images(icons),
             size,
             theme,
             named: Default::default(),
@@ -47,13 +62,20 @@ impl Cursor {
     }
 
     pub fn get_image(&self, scale: u32, time: Duration) -> Image {
+        let (_, img, _) = self.get_image_cached(scale, time);
+        (*img).clone()
+    }
+
+    /// Cached lookup returning `(unique_id, Arc<Image>, is_animated)` without
+    /// cloning `pixels_rgba` on every frame.
+    pub fn get_image_cached(&self, scale: u32, time: Duration) -> (u64, Arc<Image>, bool) {
         let size = self.size * scale;
-        frame(time.as_millis() as u32, size, &self.icons)
+        frame_cached(time.as_millis() as u32, size, &self.icons)
     }
 
     /// Image for a named cursor (CSS names like "text", "pointer", "ew-resize"),
     /// trying the given alternatives, falling back to the default arrow.
-    pub fn get_named_image(&self, names: &[&str], scale: u32, time: Duration) -> Image {
+    pub fn get_named_image_cached(&self, names: &[&str], scale: u32, time: Duration) -> (u64, Arc<Image>, bool) {
         for name in names {
             if *name == "default" {
                 break;
@@ -62,38 +84,45 @@ impl Cursor {
             let entry = cache.entry(name.to_string()).or_insert_with(|| {
                 let path = self.theme.load_icon(name)?;
                 let data = std::fs::read(path).ok()?;
-                parse_xcursor(&data).filter(|v| !v.is_empty())
+                parse_xcursor(&data).filter(|v| !v.is_empty()).map(tag_images)
             });
             if let Some(icons) = entry {
-                return frame(time.as_millis() as u32, self.size * scale, icons);
+                return frame_cached(time.as_millis() as u32, self.size * scale, icons);
             }
         }
-        self.get_image(scale, time)
+        self.get_image_cached(scale, time)
     }
 }
 
-fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {
+fn nearest_images(size: u32, images: &[(u64, Arc<Image>)]) -> impl Iterator<Item = &(u64, Arc<Image>)> {
     // Follow the nominal size of the cursor to choose the nearest
     let nearest_image = images
         .iter()
-        .min_by_key(|image| (size as i32 - image.size as i32).abs())
+        .min_by_key(|(_, image)| (size as i32 - image.size as i32).abs())
         .unwrap();
 
     images
         .iter()
-        .filter(move |image| image.width == nearest_image.width && image.height == nearest_image.height)
+        .filter(move |(_, image)| image.width == nearest_image.1.width && image.height == nearest_image.1.height)
 }
 
-fn frame(mut millis: u32, size: u32, images: &[Image]) -> Image {
-    let total = nearest_images(size, images).fold(0, |acc, image| acc + image.delay);
+fn frame_cached(mut millis: u32, size: u32, images: &[(u64, Arc<Image>)]) -> (u64, Arc<Image>, bool) {
+    let mut count = 0usize;
+    let mut total = 0u32;
+    for (_, image) in nearest_images(size, images) {
+        count += 1;
+        total += image.delay;
+    }
+    let animated = count > 1 && total > 0;
     if total == 0 {
-        return nearest_images(size, images).next().unwrap().clone();
+        let (id, img) = nearest_images(size, images).next().unwrap();
+        return (*id, img.clone(), false);
     }
     millis %= total;
 
-    for img in nearest_images(size, images) {
+    for (id, img) in nearest_images(size, images) {
         if millis < img.delay {
-            return img.clone();
+            return (*id, img.clone(), animated);
         }
         millis -= img.delay;
     }

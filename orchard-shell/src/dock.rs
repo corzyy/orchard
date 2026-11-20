@@ -184,25 +184,26 @@ pub fn load_pinned(apps: &Apps) -> Vec<String> {
             }
         }
     }
-    let defaults = [
-        "org.kde.dolphin",
-        "firefox",
-        "org.mozilla.firefox",
-        "org.kde.konsole",
-        "org.kde.kate",
-        "org.kde.kwrite",
-        "org.kde.kcalc",
-        "org.kde.spectacle",
-        "org.orchard.settings",
-        "systemsettings",
-        "org.kde.systemsettings",
+    let categories: &[&[&str]] = &[
+        &["org.gnome.Nautilus", "thunar", "nemo", "pcmanfm", "com.system76.CosmicFiles"],
+        &["firefox", "org.mozilla.firefox", "chromium", "com.brave.Browser", "org.gnome.Epiphany"],
+        &[
+            "com.mitchellh.ghostty",
+            "kitty",
+            "Alacritty",
+            "foot",
+            "org.wezfurlong.wezterm",
+            "org.gnome.Ptyxis",
+            "org.gnome.Terminal",
+            "xfce4-terminal",
+        ],
+        &["org.gnome.TextEditor", "mousepad", "geany", "code"],
+        &["org.gnome.Calculator", "galculator"],
+        &["org.orchard.settings"],
     ];
-    let have_orchard_settings = apps.by_id("org.orchard.settings").is_some();
-    defaults
+    categories
         .iter()
-        .filter(|id| apps.by_id(id).is_some())
-        // one settings app is enough: Orchard's own replaces KDE's
-        .filter(|id| !(have_orchard_settings && id.contains("systemsettings")))
+        .filter_map(|group| group.iter().find(|id| apps.by_id(id).is_some()))
         .map(|s| s.to_string())
         .collect()
 }
@@ -433,11 +434,28 @@ impl Dock {
                 false,
             ));
         }
-        let trash_name = if std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false) { "Papierkorb" } else { "Trash" };
+        static GERMAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trash_name = if *GERMAN.get_or_init(|| std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false)) {
+            "Papierkorb"
+        } else {
+            "Trash"
+        };
+        static TRASH_CACHE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+        let full = {
+            let mut guard = TRASH_CACHE.lock().unwrap();
+            match *guard {
+                Some((at, v)) if at.elapsed() < std::time::Duration::from_secs(5) => v,
+                _ => {
+                    let v = trash_full();
+                    *guard = Some((Instant::now(), v));
+                    v
+                }
+            }
+        };
         items.push(Item::new(
             ItemKind::Trash,
             trash_name.into(),
-            Some(if trash_full() { "user-trash-full" } else { "user-trash" }.into()),
+            Some(if full { "user-trash-full" } else { "user-trash" }.into()),
             false,
         ));
 
@@ -747,9 +765,12 @@ impl Dock {
     }
 
     pub fn hit(&self, x: f32, y: f32, surface_w: f32, surface_h: f32) -> Option<usize> {
+        if self.is_hidden() {
+            return None;
+        }
         let (x, y) = self.unmap_point(x, y, surface_w, surface_h);
         let (placed, bg) = self.layout(surface_w, surface_h);
-        if y < bg.1 - (self.icon_max() - self.icon()) - 4.0 || y > bg.1 + bg.3 {
+        if y < bg.1 - (self.icon_max() - self.icon()) - 4.0 || y > bg.1 + bg.3 + MARGIN_BOTTOM + 1.0 {
             return None;
         }
         placed.iter().enumerate().find_map(|(i, p)| {
@@ -786,7 +807,7 @@ impl Dock {
         }
         let ht = self.hidden_target();
         // hide a little slower than revealing, like macOS
-        let kh = 1.0 - (-dt * if ht > self.hidden { 9.0 } else { 16.0 }).exp();
+        let kh = 1.0 - (-dt * if ht > self.hidden { 9.0 } else { 20.0 }).exp();
         self.hidden += (ht - self.hidden) * kh;
         if (self.hidden - ht).abs() < 0.002 {
             self.hidden = ht;
@@ -857,7 +878,11 @@ impl Dock {
                     ph.sin().abs() * 18.0
                 })
                 .unwrap_or(0.0);
-            let size_px = (p.size * s).round() as u32;
+            let size_px = p.size * s;
+            // Rasterize icons once at max magnified size for this scale and let draw_icon
+            // scale smoothly with bilinear filtering (avoids caching 100+ sizes per icon).
+            let raster_px = (self.icon_max() * s).round().max(1.0) as u32;
+            let badge_raster_px = (self.icon_max() * 0.42 * s).round().max(1.0) as u32;
             // icon square on the surface (bounces away from the screen edge)
             let (ix, iy, _, _) = self.map_rect((p.x, p.bottom - p.size - bounce, p.size, p.size), sw, sh);
             let (ix, top) = (ix * s, iy * s);
@@ -869,7 +894,7 @@ impl Dock {
                     .or_else(|| apps.icon("application-x-executable", n.max(1)))
             };
             match &it.kind {
-                ItemKind::Launchpad => draw_launchpad_icon(pm, ix, top, p.size * s, pressed),
+                ItemKind::Launchpad => draw_launchpad_icon(pm, ix, top, size_px, pressed),
                 ItemKind::Minimized { thumb: Some(path), .. } if self.thumbs.contains_key(path) => {
                     // the genie is still flying into this tile: keep it empty
                     let reveal = ((it.born.elapsed().as_secs_f32() - THUMB_REVEAL_AT) / THUMB_REVEAL_FADE).clamp(0.0, 1.0);
@@ -878,7 +903,7 @@ impl Dock {
                     }
                     let shade = |a: u8| (a as f32 * reveal) as u8;
                     let pic = &self.thumbs[path];
-                    let (tx, ty, tw, th) = thumb_rect(ix, top, p.size * s, pic.width() as f32, pic.height() as f32);
+                    let (tx, ty, tw, th) = thumb_rect(ix, top, size_px, pic.width() as f32, pic.height() as f32);
                     // soft shadow under the window picture
                     for (grow, a) in [(3.0, 18u8), (1.5, 30)] {
                         let g = grow * s;
@@ -893,13 +918,13 @@ impl Dock {
                     pm.draw_pixmap(0, 0, pic.as_ref().as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, tx, ty), None);
                     // the app's icon as a badge in the corner
                     let b = (p.size * 0.42 * s).round();
-                    if let Some(icon) = app_icon(b as u32) {
-                        draw_icon(pm, &icon, ix + p.size * s - b, top + p.size * s - b, b, pressed);
+                    if let Some(icon) = app_icon(badge_raster_px) {
+                        draw_icon(pm, &icon, ix + size_px - b, top + size_px - b, b, pressed);
                     }
                 }
-                _ => match app_icon(size_px) {
-                    Some(icon) => draw_icon(pm, &icon, ix, top, size_px as f32, pressed),
-                    None => fill_rounded(pm, ix, top, p.size * s, p.size * s, p.size * 0.22 * s, [128, 128, 128, 200]),
+                _ => match app_icon(raster_px) {
+                    Some(icon) => draw_icon(pm, &icon, ix, top, size_px, pressed),
+                    None => fill_rounded(pm, ix, top, size_px, size_px, p.size * 0.22 * s, [128, 128, 128, 200]),
                 },
             }
             if it.running && self.cfg.show_indicators && !it.leaving {
@@ -1269,5 +1294,13 @@ mod tests {
         d.hover_x = Some(400.0);
         d.step(1.0);
         assert!(!d.is_hidden());
+        // hitting the bottom monitor edge pixel still hits the icon above it when shown,
+        // and does not hit when hidden
+        let (p, _) = d.layout(800.0, d.surface_height());
+        assert_eq!(d.hit(p[1].x + 5.0, d.surface_height() - 1.0, 800.0, d.surface_height()), Some(1));
+        d.hover_x = None;
+        d.step(1.0);
+        assert!(d.is_hidden());
+        assert_eq!(d.hit(p[1].x + 5.0, d.surface_height() - 1.0, 800.0, d.surface_height()), None);
     }
 }

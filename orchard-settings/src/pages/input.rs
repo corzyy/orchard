@@ -4,9 +4,12 @@ use std::time::Duration;
 
 use orchard_config::{SecondaryClick, Settings};
 
+use iced::widget::column;
+use orchard_ui::{choices, form};
+
 use crate::{
+    pages::{edit, some, El},
     sys::{Bg, Wake},
-    ui::Ui,
 };
 
 #[derive(Default)]
@@ -71,138 +74,166 @@ fn set_opt(opts: &mut String, o: &str, on: bool) {
     *opts = v.join(",");
 }
 
-pub fn keyboard(ui: &mut Ui, s: &mut Settings, st: &mut InputState, wake: &Wake) {
+pub fn keyboard(s: &Settings, st: &mut InputState, wake: &Wake) -> El {
     st.xkb.ensure(wake, Duration::from_secs(3600), load_xkb);
-    let k = &mut s.keyboard;
+    let k = &s.keyboard;
 
-    ui.group("kb-repeat", |ui| {
-        let mut rate = if k.repeat_rate == 0 { 30.0 } else { k.repeat_rate as f64 };
-        if ui.row_slider("kb-rate", "Key repeat rate", None, &mut rate, 2.0, 80.0, "Slow", "Fast") {
-            k.repeat_rate = rate.round() as i32;
-        }
-        let mut delay = 1000.0 - if k.repeat_delay == 0 { 250.0 } else { k.repeat_delay as f64 };
-        if ui.row_slider("kb-delay", "Delay until repeat", None, &mut delay, 0.0, 850.0, "Long", "Short") {
-            k.repeat_delay = (1000.0 - delay).round() as i32;
-        }
-    });
+    let rate = if k.repeat_rate == 0 { 30.0 } else { k.repeat_rate as f64 };
+    let delay = 1000.0 - if k.repeat_delay == 0 { 250.0 } else { k.repeat_delay as f64 };
+    let repeat = form::group([
+        form::slider_row("Key repeat rate", None, 2.0..=80.0, rate, 1.0, Some(("Slow", "Fast")), |v| {
+            edit(move |s| s.keyboard.repeat_rate = v.round() as i32)
+        }),
+        form::slider_row("Delay until repeat", None, 0.0..=850.0, delay, 1.0, Some(("Long", "Short")), |v| {
+            edit(move |s| s.keyboard.repeat_delay = (1000.0 - v).round() as i32)
+        }),
+    ]);
 
-    ui.section("Text Input");
     let xkb = st.xkb.value.clone().unwrap_or_default();
-    ui.group("kb-layout", |ui| {
-        let cur_layout = k.layout.split(',').next().unwrap_or_default().to_string();
-        let mut opts = vec![(String::new(), "Automatic (system layout)".into())];
-        opts.extend(xkb.layouts.iter().map(|(c, d)| (c.clone(), format!("{d} ({c})"))));
-        if let Some(v) = ui.row_popup("kb-src", "Input source", None, &cur_layout, &opts) {
-            k.layout = v;
-            k.variant.clear();
-        }
-        if !k.layout.is_empty() {
-            let mut vopts = vec![(String::new(), "Standard".into())];
-            vopts.extend(
-                xkb.variants
-                    .iter()
-                    .filter(|(l, _, _)| *l == k.layout)
-                    .map(|(_, v, d)| (v.clone(), d.clone())),
-            );
-            if let Some(v) = ui.row_popup("kb-var", "Variant", None, &k.variant, &vopts) {
-                k.variant = v;
-            }
-        }
-    });
+    let cur_layout = k.layout.split(',').next().unwrap_or_default().to_string();
+    let mut layout_opts = vec![(String::new(), "Automatic (system layout)".to_string())];
+    layout_opts.extend(xkb.layouts.iter().map(|(c, d)| (c.clone(), format!("{d} ({c})"))));
+    let mut layout_rows = vec![form::popup_row("Input source", None, choices(layout_opts), &cur_layout, |v| {
+        edit(move |s| {
+            s.keyboard.layout = v.clone();
+            s.keyboard.variant.clear();
+        })
+    })];
+    if !k.layout.is_empty() {
+        let mut vopts = vec![(String::new(), "Standard".to_string())];
+        vopts.extend(
+            xkb.variants
+                .iter()
+                .filter(|(l, _, _)| *l == k.layout)
+                .map(|(_, v, d)| (v.clone(), d.clone())),
+        );
+        layout_rows.push(form::popup_row("Variant", None, choices(vopts), &k.variant, |v| {
+            edit(move |s| s.keyboard.variant = v.clone())
+        }));
+    }
 
-    ui.section("Modifier Keys");
-    ui.group("kb-mods", |ui| {
-        let caps_opts = vec![
-            (String::new(), "Caps Lock".into()),
-            ("ctrl:nocaps".into(), "Control".into()),
-            ("caps:escape".into(), "Escape".into()),
-            ("caps:backspace".into(), "Backspace".into()),
-            ("caps:none".into(), "No Action".into()),
-        ];
-        let cur_caps = caps_opts
-            .iter()
-            .skip(1)
-            .find(|(o, _)| has_opt(&k.options, o))
-            .map(|(o, _)| o.clone())
-            .unwrap_or_default();
-        if let Some(v) = ui.row_popup("kb-caps", "Caps Lock key", None, &cur_caps, &caps_opts) {
-            for (o, _) in caps_opts.iter().skip(1) {
-                set_opt(&mut k.options, o, false);
-            }
-            if !v.is_empty() {
-                set_opt(&mut k.options, &v, true);
-            }
-        }
-        let mut swap = has_opt(&k.options, "altwin:swap_alt_win");
-        if ui.row_toggle(
+    let caps_opts: Vec<(String, String)> = vec![
+        (String::new(), "Caps Lock".into()),
+        ("ctrl:nocaps".into(), "Control".into()),
+        ("caps:escape".into(), "Escape".into()),
+        ("caps:backspace".into(), "Backspace".into()),
+        ("caps:none".into(), "No Action".into()),
+    ];
+    let cur_caps = caps_opts
+        .iter()
+        .skip(1)
+        .find(|(o, _)| has_opt(&k.options, o))
+        .map(|(o, _)| o.clone())
+        .unwrap_or_default();
+    let caps_keys: Vec<String> = caps_opts.iter().skip(1).map(|(o, _)| o.clone()).collect();
+    let option_toggle = |label: &'static str, sub: &'static str, opt: &'static str| {
+        form::toggle_row(label, some(sub), has_opt(&k.options, opt), move |on| {
+            edit(move |s| set_opt(&mut s.keyboard.options, opt, on))
+        })
+    };
+    let mods = form::group([
+        form::popup_row("Caps Lock key", None, choices(caps_opts.clone()), &cur_caps, move |v| {
+            let caps_keys = caps_keys.clone();
+            edit(move |s| {
+                for o in &caps_keys {
+                    set_opt(&mut s.keyboard.options, o, false);
+                }
+                if !v.is_empty() {
+                    set_opt(&mut s.keyboard.options, &v, true);
+                }
+            })
+        }),
+        option_toggle(
             "Swap ⌘ Command and ⌥ Option",
-            Some("Puts ⌘ next to the space bar, like on a Mac keyboard"),
-            &mut swap,
-        ) {
-            set_opt(&mut k.options, "altwin:swap_alt_win", swap);
-        }
-        let mut compose = has_opt(&k.options, "compose:ralt");
-        if ui.row_toggle(
-            "Right Alt is Compose",
-            Some("Type special characters with Compose sequences"),
-            &mut compose,
-        ) {
-            set_opt(&mut k.options, "compose:ralt", compose);
-        }
-        ui.row_toggle("Turn on Num Lock at login", None, &mut k.numlock);
-    });
+            "Puts ⌘ next to the space bar, like on a Mac keyboard",
+            "altwin:swap_alt_win",
+        ),
+        option_toggle("Right Alt is Compose", "Type special characters with Compose sequences", "compose:ralt"),
+        form::toggle_row("Turn on Num Lock at login", None, k.numlock, |v| edit(move |s| s.keyboard.numlock = v)),
+    ]);
+
+    column![
+        repeat,
+        form::section("Text Input"),
+        form::group(layout_rows),
+        form::section("Modifier Keys"),
+        mods,
+    ]
+    .into()
 }
 
-pub fn pointer(ui: &mut Ui, s: &mut Settings) {
-    let p = &mut s.pointer;
+/// Rounds pointer speeds to 0.05 steps like the old slider did.
+fn step20(v: f64) -> f64 {
+    (v * 20.0).round() / 20.0
+}
 
-    ui.section("Mouse");
-    ui.group("ptr-mouse", |ui| {
-        let mut speed = p.mouse_speed;
-        if ui.row_slider("mouse-speed", "Tracking speed", None, &mut speed, -1.0, 1.0, "Slow", "Fast") {
-            p.mouse_speed = (speed * 20.0).round() / 20.0;
-        }
-        let mut scroll = p.scroll_factor;
-        if ui.row_slider("scroll-speed", "Scrolling speed", None, &mut scroll, 0.25, 3.0, "Slow", "Fast") {
-            p.scroll_factor = (scroll * 20.0).round() / 20.0;
-        }
-        ui.row_toggle("Natural scrolling", Some("Content tracks finger movement"), &mut p.mouse_natural_scroll);
-        ui.row_toggle("Pointer acceleration", None, &mut p.mouse_acceleration);
-        let btn_opts = vec![("left".into(), "Left".into()), ("right".into(), "Right".into())];
-        let cur = if p.mouse_left_handed { "right" } else { "left" };
-        if let Some(v) = ui.row_popup("mouse-btn", "Primary mouse button", None, cur, &btn_opts) {
-            p.mouse_left_handed = v == "right";
-        }
-    });
+pub fn mouse(s: &Settings) -> El {
+    let p = &s.pointer;
+    let cur = if p.mouse_left_handed { "right" } else { "left" };
+    form::group([
+        form::slider_row("Tracking speed", None, -1.0..=1.0, p.mouse_speed, 0.05, Some(("Slow", "Fast")), |v| {
+            edit(move |s| s.pointer.mouse_speed = step20(v))
+        }),
+        form::slider_row("Scrolling speed", None, 0.25..=3.0, p.scroll_factor, 0.05, Some(("Slow", "Fast")), |v| {
+            edit(move |s| s.pointer.scroll_factor = step20(v))
+        }),
+        form::toggle_row("Natural scrolling", some("Content tracks finger movement"), p.mouse_natural_scroll, |v| {
+            edit(move |s| s.pointer.mouse_natural_scroll = v)
+        }),
+        form::toggle_row("Pointer acceleration", None, p.mouse_acceleration, |v| {
+            edit(move |s| s.pointer.mouse_acceleration = v)
+        }),
+        form::popup_row(
+            "Primary mouse button",
+            None,
+            choices([("left", "Left"), ("right", "Right")]),
+            cur,
+            |v| edit(move |s| s.pointer.mouse_left_handed = v == "right"),
+        ),
+    ])
+}
 
-    ui.section("Trackpad");
-    ui.group("ptr-pad", |ui| {
-        let mut tspeed = p.touchpad_speed;
-        if ui.row_slider("pad-speed", "Tracking speed", None, &mut tspeed, -1.0, 1.0, "Slow", "Fast") {
-            p.touchpad_speed = (tspeed * 20.0).round() / 20.0;
-        }
-        let sc_opts = vec![
-            ("two".into(), "Two Fingers".into()),
-            ("corner".into(), "Bottom-Right Corner".into()),
-        ];
-        let cur_sc = match p.secondary_click {
-            SecondaryClick::TwoFingers => "two",
-            SecondaryClick::BottomRight => "corner",
-        };
-        if let Some(v) = ui.row_popup("pad-sec", "Secondary click", None, cur_sc, &sc_opts) {
-            p.secondary_click = if v == "corner" {
-                SecondaryClick::BottomRight
-            } else {
-                SecondaryClick::TwoFingers
-            };
-        }
-        ui.row_toggle("Tap to click", None, &mut p.tap_to_click);
-        ui.row_toggle("Natural scrolling", None, &mut p.touchpad_natural_scroll);
-        ui.row_toggle("Ignore trackpad while typing", None, &mut p.disable_while_typing);
-        ui.row_toggle(
-            "Three-finger swipe gestures",
-            Some("Switch Spaces and open Mission Control"),
-            &mut s.desktop.gestures,
-        );
-    });
+pub fn trackpad(s: &Settings) -> El {
+    let p = &s.pointer;
+    let cur_sc = match p.secondary_click {
+        SecondaryClick::TwoFingers => "two",
+        SecondaryClick::BottomRight => "corner",
+    };
+    column![
+        form::section("Point & Click"),
+        form::group([
+            form::slider_row("Tracking speed", None, -1.0..=1.0, p.touchpad_speed, 0.05, Some(("Slow", "Fast")), |v| {
+                edit(move |s| s.pointer.touchpad_speed = step20(v))
+            }),
+            form::popup_row(
+                "Secondary click",
+                None,
+                choices([("two", "Two Fingers"), ("corner", "Bottom-Right Corner")]),
+                cur_sc,
+                |v| {
+                    edit(move |s| {
+                        s.pointer.secondary_click =
+                            if v == "corner" { SecondaryClick::BottomRight } else { SecondaryClick::TwoFingers }
+                    })
+                },
+            ),
+            form::toggle_row("Tap to click", None, p.tap_to_click, |v| edit(move |s| s.pointer.tap_to_click = v)),
+            form::toggle_row("Ignore trackpad while typing", None, p.disable_while_typing, |v| {
+                edit(move |s| s.pointer.disable_while_typing = v)
+            }),
+        ]),
+        form::section("Scroll & Gestures"),
+        form::group([
+            form::toggle_row("Natural scrolling", some("Content tracks finger movement"), p.touchpad_natural_scroll, |v| {
+                edit(move |s| s.pointer.touchpad_natural_scroll = v)
+            }),
+            form::toggle_row(
+                "Three-finger swipe gestures",
+                some("Switch Spaces and open Mission Control"),
+                s.desktop.gestures,
+                |v| edit(move |s| s.desktop.gestures = v),
+            ),
+        ]),
+    ]
+    .into()
 }

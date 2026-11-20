@@ -33,7 +33,9 @@ use smithay::{
 const SHADER: &str = include_str!("shaders/kawase.frag");
 
 /// Downsample/upsample passes at output scale 1 (each halves the resolution).
-const ITERATIONS: u32 = 4;
+pub const ITERATIONS: u32 = 4;
+/// Fewest passes that still produce a result (one down, one up).
+pub const MIN_ITERATIONS: u32 = 2;
 /// Sample offset of each pass, in texels of the level being read.
 const OFFSET: f32 = 2.5;
 /// Extra area rendered around a backdrop, so it can grow or move a little
@@ -205,6 +207,7 @@ impl LiveBlur {
 
     /// A blurred picture of `below` (output-local physical elements, topmost
     /// first) for the backdrop `region`. `output_size` bounds the padding.
+    /// `iterations` is the blur strength at output scale 1 (see [`ITERATIONS`]).
     #[allow(clippy::too_many_arguments)]
     pub fn backdrop<E: RenderElement<GlesRenderer>>(
         &mut self,
@@ -217,6 +220,7 @@ impl LiveBlur {
         alpha: f32,
         clear: Color32F,
         now: Duration,
+        iterations: u32,
     ) -> Option<(TextureRenderElement<GlesTexture>, Size<i32, Buffer>)> {
         let output = Rectangle::from_size(output_size);
         // (the menu bar asks for a very wide rect; only the visible part matters)
@@ -225,7 +229,8 @@ impl LiveBlur {
             return None;
         }
         let prog = program(renderer)?;
-        let iterations = if scale >= 1.75 { ITERATIONS + 1 } else { ITERATIONS };
+        let iterations = iterations.clamp(MIN_ITERATIONS, ITERATIONS + 1);
+        let iterations = if scale >= 1.75 { iterations + 1 } else { iterations };
         let grow = |r: Rectangle<i32, Physical>, d: i32| {
             Rectangle::<i32, Physical>::new((r.loc.x - d, r.loc.y - d).into(), (r.size.w + 2 * d, r.size.h + 2 * d).into())
                 .intersection(output)

@@ -440,6 +440,7 @@ fn main() {
     };
     app.dock.cfg = settings.dock.clone();
     app.menubar.cfg = settings.menu_bar.clone();
+    app.menubar.tiling_mode = settings.windows.tiling_mode;
     app.menubar.refresh_status();
     app.refresh_volume();
     app.notes.do_not_disturb = panel_app::load_dnd();
@@ -1268,6 +1269,7 @@ impl App {
         let icons_changed = self.apps.set_icon_theme(s.appearance.icon_theme.clone());
         let was_showing_volume = self.menubar.cfg.show_volume;
         self.menubar.cfg = s.menu_bar.clone();
+        self.menubar.tiling_mode = s.windows.tiling_mode;
         self.menubar.refresh_status_with(self.perf.battery_saver);
         if self.menubar.cfg.show_volume && !was_showing_volume {
             self.refresh_volume();
@@ -1276,6 +1278,9 @@ impl App {
             || (self.menubar.open == Some(BarItem::Network) && !self.menubar.cfg.show_network)
         {
             self.close_panel();
+        }
+        if self.menubar.open == Some(BarItem::Tiling) && !self.menubar.cfg.show_tiling {
+            self.close_menu();
         }
         let old_h = self.dock.surface_height();
         let old_zone = self.dock.exclusive_zone();
@@ -2261,12 +2266,12 @@ impl App {
             BarItem::Logo => vec![
                 MenuItem::new(
                     t("About This Device", "Über dieses Gerät"),
-                    Action::Launch("orchard-settings --about-device || kinfocenter".into()),
+                    Action::Launch("orchard-settings --about-device".into()),
                 ),
                 MenuItem::separator(),
-                MenuItem::new(t("System Settings…", "Systemeinstellungen …"), Action::Launch("orchard-settings || systemsettings".into())),
+                MenuItem::new(t("System Settings…", "Systemeinstellungen …"), Action::Launch("orchard-settings".into())),
                 MenuItem::separator(),
-                MenuItem::new(t("Force Quit…", "Sofort beenden …"), Action::Launch("plasma-systemmonitor || ksysguard".into()))
+                MenuItem::new(t("Force Quit…", "Sofort beenden …"), Action::Launch(orchard_config::system_monitor_command()))
                     .with_shortcut("⌥⌘⎋"),
                 MenuItem::separator(),
                 MenuItem::new(t("Sleep", "Ruhezustand"), Action::Confirm(dialog::DialogKind::Sleep)),
@@ -2293,10 +2298,13 @@ impl App {
                         MenuItem::new(format!("{name} {}", t("quit", "beenden")), Action::QuitApp(app_id))
                             .with_shortcut("⌘Q"),
                     ],
-                    None => vec![
-                        MenuItem::new(t("Open Files", "Dateien öffnen"), Action::Launch("dolphin".into())),
-                        MenuItem::new(t("Terminal", "Terminal"), Action::Launch("konsole".into())),
-                    ],
+                    None => {
+                        let term = orchard_config::resolve_terminal(&orchard_config::Settings::load().apps.terminal);
+                        vec![
+                            MenuItem::new(t("Open Files", "Dateien öffnen"), Action::Launch("xdg-open \"$HOME\"".into())),
+                            MenuItem::new(t("Terminal", "Terminal"), Action::Launch(term)),
+                        ]
+                    }
                 }
             }
             BarItem::Window => vec![
@@ -2315,6 +2323,20 @@ impl App {
                 Action::Launch("xdg-open https://github.com/Smithay/smithay".into()),
             )],
             BarItem::Control | BarItem::Volume | BarItem::Network => vec![],
+            BarItem::Tiling => {
+                let mode = self.menubar.tiling_mode;
+                vec![
+                    MenuItem::disabled("Tiling"),
+                    MenuItem::separator(),
+                    MenuItem::new("Floating", Action::SetTilingMode(orchard_config::TilingMode::Floating))
+                        .with_checked(mode == orchard_config::TilingMode::Floating),
+                    MenuItem::new(
+                        "Tiling (Dwindle)",
+                        Action::SetTilingMode(orchard_config::TilingMode::Tiling),
+                    )
+                    .with_checked(mode == orchard_config::TilingMode::Tiling),
+                ]
+            }
             BarItem::Dev => self.menubar.dev.as_ref().map(|d| d.menu()).unwrap_or_default(),
             BarItem::AppMenu(i) => {
                 let items = match (&self.menu_addr, self.app_menu_ids.get(i as usize), &self.gmenu) {
@@ -2331,7 +2353,7 @@ impl App {
             }
             BarItem::Clock => vec![MenuItem::new(
                 t("Open Calendar", "Kalender öffnen"),
-                Action::Launch("merkuro-calendar || korganizer || gnome-calendar".into()),
+                Action::Launch("gnome-calendar || thunderbird -calendar || evolution -c calendar".into()),
             )],
             BarItem::Tray(idx) => {
                 let Some(item) = self.menubar.tray_items.get(idx) else {
@@ -2434,7 +2456,7 @@ impl App {
                 self.redraw(Which::Dock);
                 self.send_dock_tiles();
             }
-            Action::OpenTrash => self.spawn("dolphin trash:/ || xdg-open trash:/"),
+            Action::OpenTrash => self.spawn("gio open trash:/// || xdg-open trash:///"),
             Action::DbusMenu { service, path, id } => {
                 if let Some(conn) = self.gmenu.as_ref().map(|g| g.conn.clone()) {
                     let _ = std::thread::Builder::new()
@@ -2484,6 +2506,18 @@ impl App {
                         let _ = child.wait();
                     }
                 });
+            }
+            Action::SetTilingMode(mode) => {
+                let mut s = orchard_config::Settings::load();
+                s.windows.tiling_mode = mode;
+                if let Err(e) = s.save() {
+                    tracing::warn!("saving tiling mode: {e}");
+                }
+                self.menubar.tiling_mode = mode;
+                self.redraw(Which::Bar);
+                if let Some(ipc) = self.ipc.as_mut() {
+                    ipc.request("reload_settings", json!({}));
+                }
             }
         }
     }
@@ -2607,6 +2641,7 @@ impl App {
                     .map(|(_, a, _)| a)
                     .or_else(|| match item {
                         BarItem::Dev => self.menubar.dev_range(&self.fonts, width).map(|(a, _)| a),
+                        BarItem::Tiling => self.menubar.tiling_range(&self.fonts, width).map(|(a, _)| a),
                         _ => None,
                     })
                     .unwrap_or_else(|| self.menubar.clock_range(&self.fonts, width).0);
@@ -2715,7 +2750,10 @@ impl App {
         if y < menubar::HEIGHT && matches!(self.menu_owner, Some(MenuOwner::Bar(_))) {
             let width = self.output_size.0 as f32;
             if let Some(item) = self.menubar.hit(&self.fonts, x, width) {
-                if !matches!(item, BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Dev)
+                if !matches!(
+                    item,
+                    BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network | BarItem::Tiling | BarItem::Dev
+                )
                     && Some(MenuOwner::Bar(item)) != self.menu_owner
                 {
                     if let PointerEventKind::Motion { .. } = kind {

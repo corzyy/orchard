@@ -2,11 +2,26 @@
 
 use std::time::{Duration, Instant};
 
+use iced::widget::{column, row, text, text_input, Column, Space};
+use iced::{Alignment, Length};
+use orchard_ui::{controls, form, palette, palette::from_rgb};
+
 use crate::{
+    pages::{act, loading, some, tile, El, Page},
     sys::{self, nm_fields, output, Bg, Job, Wake},
-    theme::Weight,
-    ui::{hash_id, Rect, Ui},
+    Message,
 };
+
+const BLUE: [u8; 3] = [0x0A, 0x84, 0xFF];
+
+fn password_id() -> text_input::Id {
+    text_input::Id::new("wifi-password")
+}
+
+/// Push button that runs a page action.
+fn btn(label: &'static str, msg: Option<Message>) -> El {
+    controls::push_button(label, msg).into()
+}
 
 #[derive(Default)]
 pub struct ConnState {
@@ -130,152 +145,212 @@ fn load_wifi() -> WifiInfo {
     info
 }
 
-pub fn wifi(ui: &mut Ui, st: &mut ConnState, wake: &Wake) {
+pub fn wifi(st: &mut ConnState, wake: &Wake) -> El {
     st.wifi.ensure(wake, Duration::from_secs(12), load_wifi);
     if st.wifi_job.take_done() {
         st.wifi.invalidate();
     }
     let Some(info) = st.wifi.value.clone() else {
-        ui.group("wifi-load", |ui| {
-            ui.row_value("Network", "Loading…");
-        });
-        return;
+        return loading("Wi‑Fi");
     };
+    if !info.has_wifi {
+        return form::group([form::value_row("No Wi‑Fi hardware found", "")]);
+    }
 
-    if info.has_wifi {
-        let current = info.networks.iter().find(|w| w.in_use).cloned();
-        ui.group("wifi-main", |ui| {
-            let mut on = info.enabled;
-            if ui.row_toggle("Wi‑Fi", None, &mut on) {
-                st.wifi_job
-                    .run_cmd(wake, "nmcli", &["radio", "wifi", if on { "on" } else { "off" }]);
-            }
-            if let Some(cur) = &current {
-                let r = ui.row_base(&cur.ssid, Some("Connected"), None);
-                let bw = 86.0;
-                let br = Rect::new(r.right() - 14.0 - bw, r.cy() - 12.0, bw, 24.0);
-                if ui.button_at(br, "Disconnect", false, true) {
-                    st.wifi_job.run_cmd(wake, "nmcli", &["dev", "disconnect", &info.device]);
-                }
-                ui.signal_bars(br.x - 26.0, r.cy(), cur.signal);
+    let current = info.networks.iter().find(|w| w.in_use).cloned();
+    let status_sub = if !info.enabled {
+        "Off"
+    } else if current.is_some() {
+        "Connected"
+    } else {
+        "Not Connected"
+    };
+    let mut main = vec![form::header_row(
+        tile("network-wireless", from_rgb(BLUE), 30.0),
+        "Wi‑Fi",
+        some(status_sub),
+        controls::switch(info.enabled, |on| {
+            act(move |_, st, wake| st.conn.wifi_job.run_cmd(wake, "nmcli", &["radio", "wifi", if on { "on" } else { "off" }]))
+        }),
+    )];
+    if let Some(cur) = &current {
+        let dev = info.device.clone();
+        main.push(form::row(
+            cur.ssid.clone(),
+            some("Connected"),
+            row![
+                controls::signal_bars(cur.signal),
+                btn(
+                    "Disconnect",
+                    Some(act(move |_, st, wake| st.conn.wifi_job.run_cmd(wake, "nmcli", &["dev", "disconnect", &dev]))),
+                ),
+            ]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        ));
+    }
+    let mut col = column![form::group(main), form::error(st.wifi_job.error())];
+    if !info.enabled {
+        return col.into();
+    }
+
+    if !info.known.is_empty() {
+        col = col.push(form::section("Known Networks")).push(form::group(info.known.iter().map(|k| {
+            let k2 = k.clone();
+            form::button_row(
+                k.clone(),
+                None,
+                "Forget",
+                Some(act(move |_, st, wake| st.conn.wifi_job.run_cmd(wake, "nmcli", &["con", "delete", "id", &k2]))),
+            )
+        })));
+    }
+
+    let scanning = st.wifi.busy();
+    let dev = info.device.clone();
+    col = col.push(form::section_with(
+        "Other Networks",
+        btn(
+            if scanning { "Scanning…" } else { "Refresh" },
+            (!scanning).then(|| {
+                act(move |_, st, wake| {
+                    let dev = dev.clone();
+                    st.conn.wifi_job.start(wake, move || sys::run("nmcli", &["dev", "wifi", "rescan", "ifname", &dev]));
+                })
+            }),
+        ),
+    ));
+
+    let others: Vec<&WifiNet> = info.networks.iter().filter(|w| !w.in_use).collect();
+    let mut rows: Vec<El> = Vec::new();
+    if others.is_empty() {
+        rows.push(form::value_row("No other networks found", ""));
+    }
+    for w in others {
+        let asking = st.pw_for.as_deref() == Some(w.ssid.as_str());
+        let ssid = w.ssid.clone();
+        let known = info.known.contains(&w.ssid);
+        let secure = w.secure;
+        let connect = act(move |_, st, wake| {
+            let c = &mut st.conn;
+            if known {
+                c.wifi_job.run_cmd(wake, "nmcli", &["con", "up", "id", &ssid]);
+            } else if secure {
+                c.pw_for = Some(ssid.clone());
+                c.password.clear();
+                st.focus = Some(password_id());
+            } else {
+                c.wifi_job.run_cmd(wake, "nmcli", &["dev", "wifi", "connect", &ssid]);
             }
         });
-        ui.error_line(st.wifi_job.error().as_deref());
+        let mut trailing = row![controls::signal_bars(w.signal)].spacing(12).align_y(Alignment::Center);
+        if !asking {
+            trailing = trailing.push(btn("Connect", Some(connect)));
+        }
+        rows.push(form::row(w.ssid.clone(), w.secure.then(|| "Secured".to_string()), trailing));
 
-        if info.enabled {
-            // Available networks
-            let sy = ui.y;
-            ui.section("Available Networks");
-            let scan_r = Rect::new(ui.x + ui.w - 72.0, sy + 2.0, 72.0, 22.0);
-            if ui.button_at(scan_r, if st.wifi.busy() { "Scanning…" } else { "Refresh" }, false, !st.wifi.busy()) {
-                let dev = info.device.clone();
-                st.wifi_job
-                    .start(wake, move || sys::run("nmcli", &["dev", "wifi", "rescan", "ifname", &dev]));
-            }
-
-            let others: Vec<&WifiNet> = info.networks.iter().filter(|w| !w.in_use).collect();
-            ui.group("wifi-others", |ui| {
-                if others.is_empty() {
-                    ui.row_value("No other networks found", "");
-                }
-                for w in others {
-                    let asking = st.pw_for.as_deref() == Some(w.ssid.as_str());
-                    let r = ui.row_base(&w.ssid, if w.secure { Some("Secured") } else { None }, None);
-                    let bw = 76.0;
-                    let br = Rect::new(r.right() - 14.0 - bw, r.cy() - 12.0, bw, 24.0);
-                    if !asking && ui.button_at(br, "Connect", false, true) {
-                        if info.known.contains(&w.ssid) {
-                            st.wifi_job.run_cmd(wake, "nmcli", &["con", "up", "id", &w.ssid]);
-                        } else if w.secure {
-                            st.pw_for = Some(w.ssid.clone());
-                            st.password.clear();
-                            ui.st.focused_input = Some(hash_id("wifi-pw"));
-                        } else {
-                            st.wifi_job.run_cmd(wake, "nmcli", &["dev", "wifi", "connect", &w.ssid]);
-                        }
+        if asking {
+            let ssid = w.ssid.clone();
+            let join = (!st.password.is_empty()).then(|| {
+                act(move |_, st, wake| {
+                    let c = &mut st.conn;
+                    let pw = std::mem::take(&mut c.password);
+                    if !pw.is_empty() {
+                        c.wifi_job.run_cmd(wake, "nmcli", &["dev", "wifi", "connect", &ssid, "password", &pw]);
                     }
-                    ui.signal_bars(br.x - 26.0, r.cy(), w.signal);
-
-                    if asking {
-                        let pr = ui.custom_row(44.0);
-                        let input_r = Rect::new(pr.x + 14.0, pr.y + 8.0, (pr.w - 178.0).max(120.0), 28.0);
-                        let enter = ui.text_input_at(hash_id("wifi-pw"), input_r, &mut st.password, "Password", true);
-                        let join_r = Rect::new(input_r.right() + 8.0, pr.y + 9.0, 62.0, 26.0);
-                        let cancel_r = Rect::new(join_r.right() + 6.0, pr.y + 9.0, 68.0, 26.0);
-                        if ui.button_at(join_r, "Join", true, !st.password.is_empty()) || (enter && !st.password.is_empty()) {
-                            let pw = std::mem::take(&mut st.password);
-                            st.wifi_job.run_cmd(
-                                wake,
-                                "nmcli",
-                                &["dev", "wifi", "connect", &w.ssid, "password", &pw],
-                            );
-                            st.pw_for = None;
-                            ui.st.focused_input = None;
-                        }
-                        if ui.button_at(cancel_r, "Cancel", false, true) {
-                            st.pw_for = None;
-                            ui.st.focused_input = None;
-                        }
-                    }
-                }
+                    c.pw_for = None;
+                })
             });
-
-            if !info.known.is_empty() {
-                ui.section("Known Networks");
-                ui.group("wifi-known", |ui| {
-                    for k in &info.known {
-                        if ui.row_button(k, None, "Forget") {
-                            st.wifi_job.run_cmd(wake, "nmcli", &["con", "delete", "id", k]);
-                        }
-                    }
-                });
-            }
+            let field = controls::secure_field("Password", &st.password, |v| {
+                act(move |_, st, _| st.conn.password = v.clone())
+            })
+            .id(password_id())
+            .on_submit_maybe(join.clone())
+            .width(Length::Fill);
+            rows.push(form::custom_row(
+                row![
+                    field,
+                    controls::primary_button("Join", join),
+                    btn("Cancel", Some(act(|_, st, _| st.conn.pw_for = None))),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ));
         }
     }
+    col.push(form::group(rows)).into()
+}
 
-    // Ethernet
+pub fn network(st: &mut ConnState, wake: &Wake) -> El {
+    st.wifi.ensure(wake, Duration::from_secs(12), load_wifi);
+    if st.wifi_job.take_done() {
+        st.wifi.invalidate();
+    }
+    let Some(info) = st.wifi.value.clone() else {
+        return loading("Network");
+    };
+
+    let mut col = Column::new();
+    if info.has_wifi {
+        let wifi_status = if !info.enabled {
+            "Off".to_string()
+        } else if let Some(cur) = info.networks.iter().find(|w| w.in_use) {
+            cur.ssid.clone()
+        } else {
+            "Not Connected".to_string()
+        };
+        col = col.push(form::group([form::nav_row(
+            tile("network-wireless", from_rgb(BLUE), 22.0),
+            "Wi‑Fi",
+            Some(wifi_status),
+            Message::Go(Page::Wifi),
+        )]));
+    }
+
     if !info.ethernet.is_empty() {
-        ui.section("Ethernet");
-        ui.group("net-eth", |ui| {
-            for e in &info.ethernet {
-                let connected = e.state == "connected" || (e.state.starts_with("connected") && !e.state.contains("externally"));
-                let sub = if connected {
-                    if e.ip.is_empty() { "Connected".to_string() } else { format!("Connected · {}", e.ip) }
-                } else if e.state == "unavailable" {
-                    "Cable unplugged".to_string()
-                } else {
-                    "Disconnected".to_string()
-                };
-                if e.state != "unavailable" {
-                    let btn = if connected { "Disconnect" } else { "Connect" };
-                    if ui.row_button(&format!("Ethernet ({})", e.name), Some(&sub), btn) {
-                        let verb = if connected { "disconnect" } else { "connect" };
-                        st.wifi_job.run_cmd(wake, "nmcli", &["dev", verb, &e.name]);
-                    }
-                } else {
-                    ui.row_base(&format!("Ethernet ({})", e.name), Some(&sub), None);
-                }
+        col = col.push(form::section("Ethernet")).push(form::group(info.ethernet.iter().map(|e| {
+            let connected =
+                e.state == "connected" || (e.state.starts_with("connected") && !e.state.contains("externally"));
+            let sub = if connected {
+                if e.ip.is_empty() { "Connected".to_string() } else { format!("Connected · {}", e.ip) }
+            } else if e.state == "unavailable" {
+                "Cable unplugged".to_string()
+            } else {
+                "Disconnected".to_string()
+            };
+            let label = format!("Ethernet ({})", e.name);
+            if e.state != "unavailable" {
+                let name = e.name.clone();
+                let verb = if connected { "disconnect" } else { "connect" };
+                form::button_row(
+                    label,
+                    Some(sub),
+                    if connected { "Disconnect" } else { "Connect" },
+                    Some(act(move |_, st, wake| st.conn.wifi_job.run_cmd(wake, "nmcli", &["dev", verb, &name]))),
+                )
+            } else {
+                form::row(label, Some(sub), Space::new(0, 0))
             }
-        });
+        })));
     }
 
-    // VPN
     if !info.vpns.is_empty() {
-        ui.section("VPN");
-        ui.group("net-vpn", |ui| {
-            for v in &info.vpns {
-                let mut on = v.active;
-                let kind = if v.kind == "wireguard" { "WireGuard" } else { "VPN" };
-                if ui.row_toggle(&v.name, Some(kind), &mut on) {
-                    st.wifi_job.run_cmd(
-                        wake,
-                        "nmcli",
-                        &["con", if on { "up" } else { "down" }, "id", &v.name],
-                    );
-                }
-            }
-        });
+        col = col.push(form::section("VPN")).push(form::group(info.vpns.iter().map(|v| {
+            let kind = if v.kind == "wireguard" { "WireGuard" } else { "VPN" };
+            let name = v.name.clone();
+            form::toggle_row(v.name.clone(), some(kind), v.active, move |on| {
+                let name = name.clone();
+                act(move |_, st, wake| {
+                    st.conn.wifi_job.run_cmd(wake, "nmcli", &["con", if on { "up" } else { "down" }, "id", &name])
+                })
+            })
+        })));
     }
+
+    if !info.has_wifi && info.ethernet.is_empty() && info.vpns.is_empty() {
+        col = col.push(form::group([form::value_row("No network interfaces found", "")]));
+    }
+    col.push(form::error(st.wifi_job.error())).into()
 }
 
 // ---------------------------------------------------------------- Bluetooth
@@ -351,91 +426,96 @@ fn load_bt() -> BtInfo {
     info
 }
 
-pub fn bluetooth(ui: &mut Ui, st: &mut ConnState, wake: &Wake) {
+pub fn bluetooth(st: &mut ConnState, wake: &Wake) -> El {
     st.bt.ensure(wake, Duration::from_secs(8), load_bt);
     if st.bt_job.take_done() || st.bt_scan.take_done() {
         st.bt.invalidate();
     }
     let Some(info) = st.bt.value.clone() else {
-        ui.group("bt-load", |ui| {
-            ui.row_value("Bluetooth", "Loading…");
-        });
-        return;
+        return loading("Bluetooth");
     };
     if !info.available {
-        ui.group("bt-none", |ui| {
-            ui.row_value("No Bluetooth controller found", "");
-        });
-        return;
+        return form::group([form::value_row("No Bluetooth controller found", "")]);
     }
 
-    ui.group("bt-main", |ui| {
-        let mut on = info.powered;
-        if ui.row_toggle("Bluetooth", None, &mut on) {
-            st.bt_job
-                .run_cmd(wake, "bluetoothctl", &["power", if on { "on" } else { "off" }]);
-        }
-    });
-    ui.error_line(st.bt_job.error().as_deref());
+    let sub = if info.powered { "Discoverable while Bluetooth settings is open" } else { "Off" };
+    let mut col = column![
+        form::group([form::header_row(
+            tile("bluetooth", from_rgb(BLUE), 30.0),
+            "Bluetooth",
+            some(sub),
+            controls::switch(info.powered, |on| {
+                act(move |_, st, wake| st.conn.bt_job.run_cmd(wake, "bluetoothctl", &["power", if on { "on" } else { "off" }]))
+            }),
+        )]),
+        form::error(st.bt_job.error()),
+    ];
     if !info.powered {
-        return;
+        return col.into();
     }
 
     let mine: Vec<&BtDev> = info.devices.iter().filter(|d| d.paired).collect();
     if !mine.is_empty() {
-        ui.section("My Devices");
-        ui.group("bt-mine", |ui| {
-            for d in mine {
-                let status = match (d.connected, d.battery) {
-                    (true, Some(b)) => format!("Connected · {b}%"),
-                    (true, None) => "Connected".into(),
-                    _ => "Not Connected".into(),
-                };
-                let r = ui.row_base(&d.name, Some(&status), None);
-                let f_r = Rect::new(r.right() - 14.0 - 64.0, r.cy() - 12.0, 64.0, 24.0);
-                if ui.button_at(f_r, "Forget", false, true) {
-                    st.bt_job.run_cmd(wake, "bluetoothctl", &["remove", &d.mac]);
-                }
-                let lbl = if d.connected { "Disconnect" } else { "Connect" };
-                let cw = if d.connected { 86.0 } else { 72.0 };
-                let c_r = Rect::new(f_r.x - 6.0 - cw, r.cy() - 12.0, cw, 24.0);
-                if ui.button_at(c_r, lbl, false, true) {
-                    let verb = if d.connected { "disconnect" } else { "connect" };
-                    st.bt_job.run_cmd(wake, "bluetoothctl", &[verb, &d.mac]);
-                }
-            }
-        });
+        col = col.push(form::section("My Devices")).push(form::group(mine.into_iter().map(|d| {
+            let status = match (d.connected, d.battery) {
+                (true, Some(b)) => format!("Connected · {b}%"),
+                (true, None) => "Connected".into(),
+                _ => "Not Connected".into(),
+            };
+            let (mac, mac2) = (d.mac.clone(), d.mac.clone());
+            let verb = if d.connected { "disconnect" } else { "connect" };
+            form::row(
+                d.name.clone(),
+                Some(status),
+                row![
+                    btn(
+                        if d.connected { "Disconnect" } else { "Connect" },
+                        Some(act(move |_, st, wake| st.conn.bt_job.run_cmd(wake, "bluetoothctl", &[verb, &mac]))),
+                    ),
+                    btn("Forget", Some(act(move |_, st, wake| st.conn.bt_job.run_cmd(wake, "bluetoothctl", &["remove", &mac2])))),
+                ]
+                .spacing(6),
+            )
+        })));
     }
 
-    let sy = ui.y;
-    ui.section("Nearby Devices");
-    let scan_r = Rect::new(ui.x + ui.w - 82.0, sy + 2.0, 82.0, 22.0);
-    if ui.button_at(
-        scan_r,
-        if st.bt_scan.busy() { "Scanning…" } else { "Scan" },
-        false,
-        !st.bt_scan.busy(),
-    ) {
-        st.bt_scan
-            .run_cmd(wake, "bluetoothctl", &["--timeout", "10", "scan", "on"]);
-    }
+    let scanning = st.bt_scan.busy();
+    col = col.push(form::section_with(
+        "Nearby Devices",
+        btn(
+            if scanning { "Scanning…" } else { "Scan" },
+            (!scanning).then(|| {
+                act(|_, st, wake| st.conn.bt_scan.run_cmd(wake, "bluetoothctl", &["--timeout", "10", "scan", "on"]))
+            }),
+        ),
+    ));
 
     let nearby: Vec<&BtDev> = info.devices.iter().filter(|d| !d.paired).collect();
-    ui.group("bt-nearby", |ui| {
-        if nearby.is_empty() {
-            ui.row_base("No nearby devices", Some("Click Scan and put your device in pairing mode."), None);
-        }
-        for d in nearby {
-            if ui.row_button(&d.name, None, "Pair") {
-                let mac = d.mac.clone();
-                st.bt_job.start(wake, move || {
+    let mut rows: Vec<El> = Vec::new();
+    if nearby.is_empty() {
+        rows.push(form::row(
+            "No nearby devices",
+            some("Click Scan and put your device in pairing mode."),
+            Space::new(0, 0),
+        ));
+    }
+    for d in nearby {
+        let mac = d.mac.clone();
+        rows.push(form::button_row(
+            d.name.clone(),
+            None,
+            "Pair",
+            Some(act(move |_, st, wake| {
+                let mac = mac.clone();
+                st.conn.bt_job.start(wake, move || {
                     sys::run("bluetoothctl", &["pair", &mac])?;
                     let _ = sys::run("bluetoothctl", &["trust", &mac]);
                     sys::run("bluetoothctl", &["connect", &mac])
                 });
-            }
-        }
-    });
+            })),
+        ));
+    }
+    col.push(form::group(rows)).into()
 }
 
 // ---------------------------------------------------------------- Sound
@@ -508,8 +588,10 @@ fn pactl_async(args: Vec<String>) {
     });
 }
 
-fn sound_section(ui: &mut Ui, st: &mut ConnState, is_output: bool) {
-    let Some(info) = st.sound.value.clone() else { return };
+fn sound_section(st: &mut ConnState, is_output: bool) -> El {
+    let Some(info) = st.sound.value.clone() else {
+        return Space::new(0, 0).into();
+    };
     let (devs, default, kind) = if is_output {
         (&info.sinks, &info.default_sink, "sink")
     } else {
@@ -517,81 +599,85 @@ fn sound_section(ui: &mut Ui, st: &mut ConnState, is_output: bool) {
     };
     let current = devs.iter().find(|d| &d.name == default).or(devs.first()).cloned();
 
-    ui.section(if is_output { "Output" } else { "Input" });
-    ui.group(if is_output { "snd-out-devs" } else { "snd-in-devs" }, |ui| {
-        if devs.is_empty() {
-            ui.row_value(if is_output { "No output devices" } else { "No input devices" }, "");
-        }
-        for d in devs {
-            let sel = current.as_ref().map(|c| c.name == d.name).unwrap_or(false);
-            if ui.row_clickable(&d.desc, None, sel) && !sel {
-                pactl_async(vec![format!("set-default-{kind}"), d.name.clone()]);
-                if let Some(v) = st.sound.value.as_mut() {
+    let mut dev_rows: Vec<El> = Vec::new();
+    if devs.is_empty() {
+        dev_rows.push(form::value_row(if is_output { "No output devices" } else { "No input devices" }, ""));
+    }
+    for d in devs {
+        let sel = current.as_ref().map(|c| c.name == d.name).unwrap_or(false);
+        let name = d.name.clone();
+        dev_rows.push(form::check_row(
+            d.desc.clone(),
+            None,
+            sel,
+            act(move |_, st, _| {
+                let c = &mut st.conn;
+                pactl_async(vec![format!("set-default-{kind}"), name.clone()]);
+                if let Some(v) = c.sound.value.as_mut() {
                     if is_output {
-                        v.default_sink = d.name.clone();
+                        v.default_sink = name.clone();
                     } else {
-                        v.default_source = d.name.clone();
+                        v.default_source = name.clone();
                     }
                 }
-                st.sound.invalidate();
-            }
-        }
-    });
+                c.sound.invalidate();
+            }),
+        ));
+    }
+    let mut col = column![
+        form::section(if is_output { "Output" } else { "Input" }),
+        form::group(dev_rows),
+    ];
 
-    let Some(cur) = current else { return };
+    let Some(cur) = current else { return col.into() };
     let held = if is_output { &mut st.out_vol } else { &mut st.in_vol };
     if held.map(|(_, t)| t.elapsed().as_secs_f32() > 1.5).unwrap_or(false) {
         *held = None;
     }
-    let mut vol = held.map(|(v, _)| v).unwrap_or(cur.volume).min(1.0);
-    let mut enabled = !cur.mute;
-
-    ui.group(if is_output { "snd-out-vol" } else { "snd-in-vol" }, |ui| {
-        let r = ui.row_base(if is_output { "Output volume" } else { "Input volume" }, None, None);
-        let tr = Rect::new(r.right() - 14.0 - 34.0, r.cy() - 9.5, 34.0, 19.0);
-        if ui.toggle_at(tr, &mut enabled) {
-            pactl_async(vec![
-                format!("set-{kind}-mute"),
-                cur.name.clone(),
-                if enabled { "0".into() } else { "1".into() },
-            ]);
-            if let Some(v) = st.sound.value.as_mut() {
-                let list = if is_output { &mut v.sinks } else { &mut v.sources };
-                if let Some(d) = list.iter_mut().find(|d| d.name == cur.name) {
-                    d.mute = !enabled;
-                }
-            }
-        }
-        let sw = 180.0f32.min(ui.w * 0.36);
-        let sr = Rect::new(tr.x - 14.0 - sw, r.cy() - 10.0, sw, 20.0);
-        let id = hash_id(if is_output { "vol-out" } else { "vol-in" });
-        if ui.slider_at(id, sr, &mut vol, 0.0, 1.0, "", "") {
-            *held = Some((vol, Instant::now()));
-            pactl_async(vec![
-                format!("set-{kind}-volume"),
-                cur.name.clone(),
-                format!("{}%", (vol * 100.0).round()),
-            ]);
-        }
-        ui.text_right(
-            &format!("{:.0}%", vol * 100.0),
-            sr.x - 10.0,
-            r.cy(),
-            12.0,
-            Weight::Regular,
-            ui.pal.text2,
-        );
-    });
+    let vol = held.map(|(v, _)| v).unwrap_or(cur.volume).min(1.0);
+    let (n1, n2) = (cur.name.clone(), cur.name.clone());
+    let p = palette();
+    col = col.push(form::group([form::row(
+        if is_output { "Output volume" } else { "Input volume" },
+        None,
+        row![
+            text(format!("{:.0}%", vol * 100.0)).size(12).color(p.text_secondary),
+            controls::slider(0.0..=1.0, vol, 0.01, move |v| {
+                let name = n1.clone();
+                act(move |_, st, _| {
+                    let held = if is_output { &mut st.conn.out_vol } else { &mut st.conn.in_vol };
+                    *held = Some((v, Instant::now()));
+                    pactl_async(vec![format!("set-{kind}-volume"), name.clone(), format!("{}%", (v * 100.0).round())]);
+                })
+            })
+            .width(180),
+            controls::switch(!cur.mute, move |enabled| {
+                let name = n2.clone();
+                act(move |_, st, _| {
+                    pactl_async(vec![
+                        format!("set-{kind}-mute"),
+                        name.clone(),
+                        if enabled { "0".into() } else { "1".into() },
+                    ]);
+                    if let Some(v) = st.conn.sound.value.as_mut() {
+                        let list = if is_output { &mut v.sinks } else { &mut v.sources };
+                        if let Some(d) = list.iter_mut().find(|d| d.name == name) {
+                            d.mute = !enabled;
+                        }
+                    }
+                })
+            }),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )]));
+    col.into()
 }
 
-pub fn sound(ui: &mut Ui, st: &mut ConnState, wake: &Wake) {
+pub fn sound(st: &mut ConnState, wake: &Wake) -> El {
     st.sound.ensure(wake, Duration::from_secs(4), load_sound);
     if st.sound.value.is_none() {
-        ui.group("snd-load", |ui| {
-            ui.row_value("Sound", "Loading…");
-        });
-        return;
+        return loading("Sound");
     }
-    sound_section(ui, st, true);
-    sound_section(ui, st, false);
+    column![sound_section(st, true), sound_section(st, false)].into()
 }

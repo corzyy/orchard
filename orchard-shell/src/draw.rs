@@ -11,19 +11,64 @@ pub fn paint(c: Rgba) -> Paint<'static> {
     p
 }
 
+/// Superellipse exponent matching `SQUIRCLE_N` in `orchard/src/chrome/mod.rs`
+/// and `N` in `orchard/src/effects/shaders/rounded.frag` so frosted-glass blur
+/// backdrops and shell-painted chrome share the exact same corner contour.
+const SQUIRCLE_N: f32 = 2.6;
+
+/// Number of line segments per squircle corner (chord error < 0.03px at r = 24).
+const SQUIRCLE_SEGMENTS: usize = 16;
+
 pub fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
-    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
-    let k = 0.5523 * r; // cubic circle approximation
+    use std::f32::consts::FRAC_PI_2;
+    let x0 = x;
+    let y0 = y;
+    let x1 = x + w.max(0.0);
+    let y1 = y + h.max(0.0);
+    let r = r.clamp(0.0, (w * 0.5).min(h * 0.5).max(0.0));
     let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    if r <= 0.5 {
+        pb.move_to(x0, y0);
+        pb.line_to(x1, y0);
+        pb.line_to(x1, y1);
+        pb.line_to(x0, y1);
+        pb.close();
+        return pb.finish();
+    }
+    let exp = 2.0 / SQUIRCLE_N;
+    pb.move_to(x0 + r, y0);
+    pb.line_to(x1 - r, y0);
+    // Top-right corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.sin().max(0.0).powf(exp);
+        let qy = r * t.cos().max(0.0).powf(exp);
+        pb.line_to(x1 - r + qx, y0 + r - qy);
+    }
+    pb.line_to(x1, y1 - r);
+    // Bottom-right corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.cos().max(0.0).powf(exp);
+        let qy = r * t.sin().max(0.0).powf(exp);
+        pb.line_to(x1 - r + qx, y1 - r + qy);
+    }
+    pb.line_to(x0 + r, y1);
+    // Bottom-left corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.sin().max(0.0).powf(exp);
+        let qy = r * t.cos().max(0.0).powf(exp);
+        pb.line_to(x0 + r - qx, y1 - r + qy);
+    }
+    pb.line_to(x0, y0 + r);
+    // Top-left corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.cos().max(0.0).powf(exp);
+        let qy = r * t.sin().max(0.0).powf(exp);
+        pb.line_to(x0 + r - qx, y0 + r - qy);
+    }
     pb.close();
     pb.finish()
 }

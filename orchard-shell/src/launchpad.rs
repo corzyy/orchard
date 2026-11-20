@@ -29,6 +29,16 @@ const ICON: f32 = 64.0;
 const LABEL_PX: f32 = 12.5;
 /// one mouse wheel notch
 const NOTCH: f32 = 48.0;
+/// how far a touchpad can pull the grid past its ends (logical px)
+const RUBBER: f32 = 72.0;
+/// opacity of the highlight under the keyboard selection / the hovered app
+const HL_SEL: f32 = 36.0;
+const HL_HOVER: f32 = 22.0;
+/// soft fade where the grid scrolls under the field / off the bottom
+const EDGE_FADE: f32 = 22.0;
+/// the scroll bar stays this long after scrolling, then fades out
+const BAR_SHOW: f32 = 0.9;
+const BAR_FADE: f32 = 0.35;
 
 /// What a click / hover hits.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,6 +107,14 @@ pub struct Launchpad {
     /// 0 = closed, 1 = open (animated)
     pub open: f32,
     pub closing: bool,
+    /// the highlight glides between apps: its cell in grid content
+    /// coordinates (animated) and its opacity (0 ..= `HL_SEL`)
+    hl_x: f32,
+    hl_y: f32,
+    hl_a: f32,
+    /// seconds since the grid last moved (the scroll bar fades out after)
+    idle: f32,
+    last_scroll: f32,
     /// last layout, for keyboard navigation and scrolling
     geo: Geometry,
     cache: Cache,
@@ -124,8 +142,10 @@ struct BaseKey {
 struct PanelKey {
     base: BaseKey,
     scroll: u32,
-    selected: Option<usize>,
-    hovered: Option<usize>,
+    /// highlight position and opacity
+    hl: (u32, u32, u8),
+    /// scroll bar opacity
+    bar: u8,
     pressed: Option<isize>,
     icon_gen: Option<usize>,
     results: usize,
@@ -141,7 +161,7 @@ struct Cache {
 }
 
 impl Launchpad {
-    pub fn new(apps: &Apps) -> Launchpad {
+    fn collect_all(apps: &Apps) -> Vec<usize> {
         let mut all: Vec<usize> = apps
             .entries
             .iter()
@@ -151,7 +171,19 @@ impl Launchpad {
             .collect();
         all.sort_by_key(|i| apps.entries[*i].name.to_lowercase());
         all.dedup_by(|a, b| apps.entries[*a].name == apps.entries[*b].name);
-        Launchpad::with(all)
+        all
+    }
+
+    pub fn new(apps: &Apps) -> Launchpad {
+        Launchpad::with(Launchpad::collect_all(apps))
+    }
+
+    /// Rebuild the app list after `apps` was reloaded while Launchpad is open.
+    pub fn refresh(&mut self, apps: &Apps) {
+        self.all = Launchpad::collect_all(apps);
+        let q = self.query.clone();
+        self.set_query(apps, q);
+        self.cache.panel = None;
     }
 
     fn with(all: Vec<usize>) -> Launchpad {
@@ -166,6 +198,12 @@ impl Launchpad {
             pressed: None,
             open: 0.0,
             closing: false,
+            hl_x: 0.0,
+            hl_y: 0.0,
+            hl_a: 0.0,
+            // flash the scroll bar on open, so it is clear there is more
+            idle: 0.0,
+            last_scroll: 0.0,
             geo: Geometry::new(1920.0, 1080.0),
             cache: Cache::default(),
         }
@@ -212,9 +250,38 @@ impl Launchpad {
     /// Icon rect of result `i` (logical, settled panel, current scroll).
     fn icon_rect(&self, g: &Geometry, i: usize) -> (f32, f32, f32) {
         let (col, row) = ((i % g.cols) as f32, (i / g.cols) as f32);
-        let x = g.x + SIDE + col * CELL_W + (CELL_W - ICON) / 2.0;
-        let y = g.grid_top() + row * CELL_H + 10.0 - self.scroll;
+        self.icon_at(g, col * CELL_W, row * CELL_H)
+    }
+
+    /// Icon rect of the cell whose top-left is (`cx`, `cy`) in grid content
+    /// coordinates.
+    fn icon_at(&self, g: &Geometry, cx: f32, cy: f32) -> (f32, f32, f32) {
+        let x = g.x + SIDE + cx + (CELL_W - ICON) / 2.0;
+        let y = g.grid_top() + cy + 10.0 - self.scroll;
         (x, y, ICON)
+    }
+
+    /// Where the highlight is heading: the selected (else hovered) app's
+    /// cell and the opacity for it.
+    fn hl_target(&self) -> Option<(f32, f32, f32)> {
+        let (i, a) = match (self.selected, self.hovered) {
+            (Some(i), _) => (i, HL_SEL),
+            (None, Some(i)) => (i, HL_HOVER),
+            _ => return None,
+        };
+        (i < self.results.len()).then(|| ((i % self.geo.cols) as f32 * CELL_W, (i / self.geo.cols) as f32 * CELL_H, a))
+    }
+
+    /// How far the grid is pulled past either end (touchpad rubber band).
+    fn overscroll(&self) -> f32 {
+        (-self.scroll).max(self.scroll - self.max_scroll()).max(0.0)
+    }
+
+    fn bar_alpha(&self) -> f32 {
+        if self.max_scroll() <= 0.0 {
+            return 0.0;
+        }
+        (1.0 - (self.idle - BAR_SHOW) / BAR_FADE).clamp(0.0, 1.0)
     }
 
     pub fn hit(&mut self, w: f32, h: f32, x: f32, y: f32) -> Hit {
@@ -267,6 +334,9 @@ impl Launchpad {
         self.scroll = 0.0;
         self.scroll_target = 0.0;
         self.hovered = None;
+        // the grid is reshuffled: fade the highlight in at its new place
+        // instead of gliding there
+        self.hl_a = 0.0;
     }
 
     /// Arrow keys: move the selection through the grid, scrolling along.
@@ -340,17 +410,33 @@ impl Launchpad {
 
     /// Mouse wheel / touchpad: `delta` in logical px, positive scrolls down.
     pub fn scroll_by(&mut self, delta: f32) {
-        self.scroll_target += delta;
-        self.clamp_scroll();
-        // touchpads move 1:1 with the fingers
+        let max = self.max_scroll();
         if delta.abs() < NOTCH {
-            self.scroll = self.scroll_target;
+            // touchpads move 1:1 with the fingers and rubber-band past the
+            // ends; `step` springs the grid back
+            let pushing_out = (self.scroll <= 0.0 && delta < 0.0) || (self.scroll >= max && delta > 0.0);
+            let d = if pushing_out {
+                delta * 0.5 * (1.0 - self.overscroll() / RUBBER).max(0.0)
+            } else {
+                delta
+            };
+            self.scroll = (self.scroll + d).clamp(-RUBBER, max + RUBBER);
+            self.scroll_target = self.scroll.clamp(0.0, max);
+        } else {
+            self.scroll_target = (self.scroll_target + delta).clamp(0.0, max);
         }
     }
 
     pub fn is_animating(&self) -> bool {
         let to = if self.closing { 0.0 } else { 1.0 };
-        (self.open - to).abs() > 0.002 || (self.scroll - self.scroll_target).abs() > 0.3
+        let hl = match self.hl_target() {
+            Some((x, y, a)) => (self.hl_a - a).abs() > 0.5 || (self.hl_x - x).abs() > 0.25 || (self.hl_y - y).abs() > 0.25,
+            None => self.hl_a > 0.5,
+        };
+        (self.open - to).abs() > 0.002
+            || (self.scroll - self.scroll_target).abs() > 0.3
+            || hl
+            || (self.max_scroll() > 0.0 && self.idle < BAR_SHOW + BAR_FADE)
     }
 
     /// Fully closed after the closing animation.
@@ -365,10 +451,41 @@ impl Launchpad {
         if (self.open - to).abs() < 0.004 {
             self.open = to;
         }
-        let ks = 1.0 - (-dt * 18.0).exp();
+        // a touch softer when springing back from a rubber band
+        let ks = 1.0 - (-dt * if self.overscroll() > 0.0 { 14.0 } else { 18.0 }).exp();
         self.scroll += (self.scroll_target - self.scroll) * ks;
         if (self.scroll - self.scroll_target).abs() < 0.3 {
             self.scroll = self.scroll_target;
+        }
+
+        if (self.scroll - self.last_scroll).abs() > 0.01 {
+            self.idle = 0.0;
+            self.last_scroll = self.scroll;
+        } else {
+            self.idle = (self.idle + dt).min(10.0);
+        }
+
+        let kp = 1.0 - (-dt * 26.0).exp();
+        let ka = 1.0 - (-dt * 20.0).exp();
+        let to_a = match self.hl_target() {
+            Some((x, y, a)) => {
+                if self.hl_a < 1.0 {
+                    // (nearly) invisible: appear in place
+                    (self.hl_x, self.hl_y) = (x, y);
+                } else {
+                    self.hl_x += (x - self.hl_x) * kp;
+                    self.hl_y += (y - self.hl_y) * kp;
+                    if (self.hl_x - x).abs() < 0.25 && (self.hl_y - y).abs() < 0.25 {
+                        (self.hl_x, self.hl_y) = (x, y);
+                    }
+                }
+                a
+            }
+            None => 0.0,
+        };
+        self.hl_a += (to_a - self.hl_a) * ka;
+        if (self.hl_a - to_a).abs() < 0.5 {
+            self.hl_a = to_a;
         }
     }
 
@@ -448,8 +565,8 @@ impl Launchpad {
         let key = PanelKey {
             base: base_key.clone(),
             scroll: self.scroll.to_bits(),
-            selected: self.selected,
-            hovered: self.hovered,
+            hl: (self.hl_x.to_bits(), self.hl_y.to_bits(), self.hl_a.round() as u8),
+            bar: (self.bar_alpha() * 255.0).round() as u8,
             pressed: self.pressed.map(|h| match h {
                 Hit::App(i) => i as isize,
                 _ => -1,
@@ -497,6 +614,13 @@ impl Launchpad {
         let (Some(base), Some(clip)) = (self.cache.base.as_ref(), self.cache.clip.as_ref()) else { return };
         panel.data_mut().copy_from_slice(base.pm.data());
         self.paint_grid(&mut panel, &clip.pm, s, g, apps, fonts, theme, german);
+        // hairline under the field, once apps scroll beneath it
+        let k = (self.scroll / 12.0).clamp(0.0, 1.0);
+        if k > 0.0 {
+            let c = theme.menu_separator;
+            let c = [c[0], c[1], c[2], (c[3] as f32 * k).round() as u8];
+            fill_rounded(&mut panel, 0.0, (HEADER_H * s).round() - s, g.w * s, s.max(1.0), 0.0, c);
+        }
         self.cache.panel = Some(Cached { key, pm: panel });
     }
 
@@ -548,9 +672,6 @@ impl Launchpad {
             let w = fonts.draw(pm, &shown, tx, baseline, px, Weight::Regular, text);
             fill_rounded(pm, tx + w + 2.0 * s, baseline - 19.0 * s, 2.0 * s, 23.0 * s, 1.0, theme.menu_selection);
         }
-
-        // hairline under the field
-        fill_rounded(pm, 0.0, (HEADER_H * s).round() - s, g.w * s, s.max(1.0), 0.0, theme.menu_separator);
     }
 
     #[allow(clippy::too_many_arguments)]

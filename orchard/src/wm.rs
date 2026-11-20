@@ -156,6 +156,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if pending.is_none() {
             return;
         }
+        if self.is_tiling_mode() {
+            self.dwindle_place_new(window);
+            return;
+        }
         let Some(area) = self.usable_area_for(window) else { return };
         let mut x = area.loc.x + (area.size.w - size.w) / 2;
         let mut y = area.loc.y + ((area.size.h - size.h) as f64 * CENTER_BIAS_Y) as i32;
@@ -373,22 +377,22 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         };
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = dir.join(format!("{}-{n}.png", window.ipc_id().0));
-        // forget pictures of windows that are no longer minimized
+        // forget pictures of windows that are no longer minimized (done off the main thread)
         let keep: Vec<String> = self.minimized.iter().filter_map(thumb_path_of).collect();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let p = e.path().to_string_lossy().into_owned();
-                if !keep.contains(&p) {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
         window.user_data().insert_if_missing(|| ThumbPath(RefCell::new(None)));
         if let Some(t) = window.user_data().get::<ThumbPath>() {
             *t.0.borrow_mut() = Some(path.to_string_lossy().into_owned());
         }
         std::thread::spawn(move || {
             let _ = std::fs::create_dir_all(&dir);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let p = e.path().to_string_lossy().into_owned();
+                    if !keep.contains(&p) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
             let tmp = path.with_extension("tmp");
             let ok = image::RgbaImage::from_raw(w, h, rgba)
                 .map(|img| img.save_with_format(&tmp, image::ImageFormat::Png).is_ok())
@@ -454,6 +458,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         {
             self.fx.space_transition = None;
         }
+        if self.fx.transients.is_empty() {
+            return;
+        }
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.fx.transients)
             .into_iter()
             .partition(|t| t.is_done(now));
@@ -473,6 +480,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         // after its snapshot is gone (flicker at the end of a restore)
         if mapped {
             self.space.refresh();
+            self.refit_all_windows();
         }
     }
 
@@ -516,6 +524,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         self.space.unmap_elem(window);
         self.minimized.retain(|w| w != window);
         self.minimized.push(window.clone());
+        if self.is_tiling_mode() {
+            self.dwindle.remove_everywhere(window.ipc_id().0);
+            self.retile_all();
+        }
         self.focus_topmost();
     }
 
@@ -564,6 +576,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             Some(t) => self.fx.transients.push(t),
             None => {
                 self.space.map_element(window.clone(), loc, true);
+                self.refit_all_windows();
                 self.focus_window(&window);
             }
         }
@@ -750,6 +763,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             self.minimized.retain(|m| m != &w);
             self.minimized.push(w);
         }
+        if self.is_tiling_mode() {
+            self.retile_all();
+        }
         self.focus_topmost();
     }
 
@@ -783,6 +799,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             self.space.map_element(w.clone(), loc, true);
         }
         if let Some(top) = hidden.last() {
+            if self.is_tiling_mode() {
+                self.retile_all();
+            }
             self.focus_window(top);
         }
         !hidden.is_empty()

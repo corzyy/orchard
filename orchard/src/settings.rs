@@ -7,7 +7,7 @@
 //! live objects (keyboard, input devices, outputs, wallpaper).
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, RwLock,
 };
 
@@ -15,6 +15,81 @@ pub use orchard_config::Settings;
 
 static CURRENT: RwLock<Option<Arc<Settings>>> = RwLock::new(None);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static FOCUS_FOLLOWS_MOUSE: AtomicBool = AtomicBool::new(false);
+static ON_BATTERY: AtomicBool = AtomicBool::new(false);
+
+/// Query `/sys/class/power_supply` for whether the machine is running on battery.
+fn probe_on_battery() -> bool {
+    let Ok(rd) = std::fs::read_dir("/sys/class/power_supply") else {
+        return false;
+    };
+    let mut has_battery = false;
+    let mut mains_online = None;
+    let mut discharging = false;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+        match kind.trim() {
+            "Mains" => {
+                if let Ok(on) = std::fs::read_to_string(p.join("online")) {
+                    mains_online = Some(on.trim() == "1");
+                }
+            }
+            "Battery" => {
+                // ignore peripheral (mouse/keyboard) batteries
+                if std::fs::read_to_string(p.join("scope")).map(|s| s.trim() == "Device").unwrap_or(false) {
+                    continue;
+                }
+                has_battery = true;
+                if std::fs::read_to_string(p.join("status")).map(|s| s.trim() == "Discharging").unwrap_or(false) {
+                    discharging = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !has_battery {
+        return false;
+    }
+    match mains_online {
+        Some(online) => !online,
+        None => discharging,
+    }
+}
+
+/// Refresh cached AC / battery status. Returns true if it changed.
+pub fn refresh_power_source() -> bool {
+    let now = probe_on_battery();
+    let prev = ON_BATTERY.swap(now, Ordering::Relaxed);
+    prev != now
+}
+
+/// Whether the machine is currently running on battery power (cached).
+pub fn on_battery() -> bool {
+    ON_BATTERY.load(Ordering::Relaxed)
+}
+
+/// Whether live frosted-glass blur is active right now, combining env override,
+/// settings, preset, and automatic battery power-saving.
+pub fn effective_live_blur() -> bool {
+    if !crate::effects::blur::enabled() {
+        return false;
+    }
+    let s = get();
+    if !s.performance.live_blur || s.performance.preset == orchard_config::PerformancePreset::PowerSaver {
+        return false;
+    }
+    if s.performance.battery_saver && on_battery() {
+        return false;
+    }
+    true
+}
+
+/// Whether low-latency frame pacing is active right now.
+pub fn effective_low_latency() -> bool {
+    let s = get();
+    s.performance.low_latency || s.performance.preset == orchard_config::PerformancePreset::Performance
+}
 
 /// The current settings (loaded from disk on first use).
 pub fn get() -> Arc<Settings> {
@@ -27,6 +102,7 @@ pub fn get() -> Arc<Settings> {
 /// Re-read the settings file. Returns the new settings.
 pub fn reload() -> Arc<Settings> {
     let s = Arc::new(Settings::load());
+    FOCUS_FOLLOWS_MOUSE.store(s.windows.focus_follows_mouse, Ordering::Relaxed);
     *CURRENT.write().unwrap() = Some(s.clone());
     GENERATION.fetch_add(1, Ordering::Relaxed);
     crate::chrome::theme::refresh_appearance();
@@ -38,15 +114,9 @@ pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
-/// Command for ⌘Return (env var wins, then settings).
+/// Command for ⌘Return (env var wins, then settings, then auto-detected terminal).
 pub fn terminal() -> String {
-    std::env::var("ORCHARD_TERMINAL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let t = get().apps.terminal.clone();
-            if t.trim().is_empty() { "konsole".into() } else { t }
-        })
+    orchard_config::resolve_terminal(&get().apps.terminal)
 }
 
 /// Command used to lock the screen: env var, then settings, then Orchard's own
@@ -205,12 +275,29 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
         }
 
+        // tiling mode (Floating <-> Dwindle)
+        if s.windows.tiling_mode != self.dwindle.mode {
+            self.dwindle.mode = s.windows.tiling_mode;
+            match s.windows.tiling_mode {
+                orchard_config::TilingMode::Tiling => self.retile_all(),
+                orchard_config::TilingMode::Floating => self.untile_all_dwindle(),
+            }
+        } else if scaled || s.tiling.clamped() != self.dwindle.cfg.clamped() {
+            self.dwindle.cfg = s.tiling.clone();
+            self.refit_all_windows();
+        }
+        self.dwindle.cfg = s.tiling.clone();
+
         // pointer theme, and the appearance settings apps read
         self.backend_data.reload_cursor();
         crate::session::sync_app_appearance(s);
 
-        // wallpaper
+        // wallpaper & blur cache (live_blur / VRR / direct_scanout may have changed)
         self.fx.wallpaper.reset();
+        self.fx.blur.invalidate();
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            self.backend_data.reset_buffers(&output);
+        }
 
         self.prefs_rt.idle_locked = false;
     }
@@ -265,7 +352,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         self.update_fs_reveal(pos);
         self.fs_reveal_cursor(pos);
         self.check_hot_corner(pos);
-        if get().windows.focus_follows_mouse {
+        if FOCUS_FOLLOWS_MOUSE.load(Ordering::Relaxed) {
             self.focus_under_pointer(pos);
         }
     }
@@ -289,11 +376,18 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
     }
 
-    /// Start a 15 s timer that drives the idle lock.
+    /// Start a 15 s timer that drives the idle lock and AC/battery detection.
     pub fn init_settings_timers(&mut self) {
         use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+        refresh_power_source();
         let res = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(15)), |_, _, state| {
             state.check_idle_lock();
+            if refresh_power_source() && get().performance.battery_saver {
+                state.fx.blur.invalidate();
+                for output in state.space.outputs().cloned().collect::<Vec<_>>() {
+                    state.backend_data.reset_buffers(&output);
+                }
+            }
             TimeoutAction::ToDuration(std::time::Duration::from_secs(15))
         });
         if let Err(e) = res {

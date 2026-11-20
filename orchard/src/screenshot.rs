@@ -26,25 +26,77 @@ use crate::{
     state::{Backend, OrchardState},
 };
 
-fn pictures_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("ORCHARD_SCREENSHOT_DIR") {
-        return PathBuf::from(dir);
+/// Where a screenshot should be saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveTarget {
+    Pictures,
+    Desktop,
+    Documents,
+    Clipboard,
+}
+
+impl SaveTarget {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("desktop") => Self::Desktop,
+            Some("documents") => Self::Documents,
+            Some("clipboard") => Self::Clipboard,
+            _ => Self::Pictures,
+        }
+    }
+}
+
+fn xdg_dir(key: &str, fallback: &str) -> PathBuf {
+    if let Some(dir) = std::env::var_os(key) {
+        let p = PathBuf::from(dir);
+        if p.is_absolute() {
+            return p;
+        }
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home.join(".config"));
-    // honour user-dirs.dirs (e.g. "$HOME/Bilder")
+    let prefix = format!("{key}=");
     if let Ok(s) = std::fs::read_to_string(config.join("user-dirs.dirs")) {
         for line in s.lines() {
-            if let Some(v) = line.strip_prefix("XDG_PICTURES_DIR=") {
+            if let Some(v) = line.strip_prefix(&prefix) {
                 let v = v.trim_matches('"').replace("$HOME", &home.to_string_lossy());
                 return PathBuf::from(v);
             }
         }
     }
-    home.join("Pictures")
+    home.join(fallback)
+}
+
+fn screenshots_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ORCHARD_SCREENSHOT_DIR") {
+        return PathBuf::from(dir);
+    }
+    let pictures = xdg_dir("XDG_PICTURES_DIR", "Pictures");
+    let de_sub = pictures.join("Bildschirmfotos");
+    let en_sub = pictures.join("Screenshots");
+    if de_sub.is_dir() {
+        de_sub
+    } else if en_sub.is_dir() {
+        en_sub
+    } else if german() || pictures.file_name().and_then(|n| n.to_str()) == Some("Bilder") {
+        de_sub
+    } else {
+        en_sub
+    }
+}
+
+fn target_dir(target: SaveTarget) -> PathBuf {
+    match target {
+        SaveTarget::Pictures => screenshots_dir(),
+        SaveTarget::Desktop => xdg_dir("XDG_DESKTOP_DIR", "Desktop"),
+        SaveTarget::Documents => xdg_dir("XDG_DOCUMENTS_DIR", "Documents"),
+        SaveTarget::Clipboard => {
+            std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+        }
+    }
 }
 
 fn german() -> bool {
@@ -123,13 +175,20 @@ fn read_back(renderer: &mut GlesRenderer, texture: &mut GlesTexture, size: Size<
 }
 
 impl<BackendData: Backend> OrchardState<BackendData> {
-    /// Render `output` offscreen (no cursor, no selection overlay).
-    fn capture_output(&mut self, output: &Output) -> Option<Pixels> {
+    /// Render `output` offscreen (no selection overlay, no screenshot toolbar;
+    /// optionally includes the mouse pointer).
+    fn capture_output(&mut self, output: &Output, include_cursor: bool) -> Option<Pixels> {
         let mode = output.current_mode()?;
         let scale = output.current_scale().fractional_scale();
         let size: Size<i32, smithay::utils::Buffer> = (mode.size.w, mode.size.h).into();
         let now = self.clock.now().into();
         let overlay = self.fx.shot_overlay.take();
+        let prev_hide = self.fx.hide_screenshot_ui;
+        self.fx.hide_screenshot_ui = true;
+        let cursor_buffer = if include_cursor { self.backend_data.cursor_buffer() } else { None };
+        let cursor_status = self.cursor_status.clone();
+        let pointer_pos = self.pointer.current_location();
+        let output_geo = self.space.output_geometry(output);
         let space = &self.space;
         let mut ctx = RenderCtx {
             fx: &mut self.fx,
@@ -143,8 +202,13 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             let mut texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size).map_err(|e| e.to_string())?;
             {
                 let mut target = renderer.bind(&mut texture).map_err(|e| e.to_string())?;
+                let cursor = if include_cursor {
+                    crate::screencopy::cursor_elements(output_geo, pointer_pos, &cursor_status, scale, renderer, cursor_buffer)
+                } else {
+                    Vec::<CustomRenderElements<GlesRenderer>>::new()
+                };
                 let (elements, clear) =
-                    output_elements(output, space, &mut ctx, Vec::<CustomRenderElements<GlesRenderer>>::new(), renderer, now);
+                    output_elements(output, space, &mut ctx, cursor, renderer, now);
                 let mut tracker = OutputDamageTracker::new(mode.size, scale, Transform::Normal);
                 tracker
                     .render_output(renderer, &mut target, 0, &elements, clear)
@@ -152,6 +216,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             }
             read_back(renderer, &mut texture, size)
         });
+        self.fx.hide_screenshot_ui = prev_hide;
         self.fx.shot_overlay = overlay;
         match result {
             Some(Ok(data)) => Some(Pixels {
@@ -198,8 +263,91 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     pub fn screenshot_screen(&mut self, clipboard: bool) {
         let Some(output) = self.active_output() else { return };
-        if let Some(px) = self.capture_output(&output) {
-            self.deliver_screenshot(px, clipboard);
+        if let Some(px) = self.capture_output(&output, false) {
+            let target = if clipboard { SaveTarget::Clipboard } else { SaveTarget::Pictures };
+            self.deliver_screenshot(px, target);
+        }
+    }
+
+    /// Print / ⌘⇧5: open the macOS-style interactive screenshot toolbar in orchard-shell.
+    pub fn open_screenshot_tool(&mut self) {
+        if self.protocols.locked {
+            return;
+        }
+        if self.mc.is_some() {
+            self.close_mission_control(None);
+        }
+        self.cancel_area_screenshot();
+        let Some(output) = self.active_output() else { return };
+        let Some(geo) = self.space.output_geometry(&output) else { return };
+        let windows: Vec<crate::ipc::ShotWindow> = self
+            .space
+            .elements_for_output(&output)
+            .rev()
+            .filter_map(|w| {
+                let loc = self.space.element_location(w)?;
+                let sz = smithay::desktop::space::SpaceElement::geometry(w).size;
+                Some(crate::ipc::ShotWindow {
+                    id: w.ipc_id().0,
+                    x: loc.x - geo.loc.x,
+                    y: loc.y - geo.loc.y,
+                    w: sz.w,
+                    h: sz.h,
+                    title: w.title(),
+                })
+            })
+            .collect();
+        self.ipc_broadcast(&crate::ipc::Event::ScreenshotTool {
+            output: output.name(),
+            windows,
+        });
+    }
+
+    /// Perform a capture requested by the screenshot toolbar over IPC.
+    pub fn capture_from_tool(
+        &mut self,
+        mode: &str,
+        output_name: Option<&str>,
+        rect: Option<crate::ipc::Rect>,
+        window_id: Option<u64>,
+        target: Option<&str>,
+        include_cursor: bool,
+    ) {
+        let save_target = SaveTarget::parse(target);
+        let output = output_name
+            .and_then(|name| self.space.outputs().find(|o| o.name() == name).cloned())
+            .or_else(|| self.active_output());
+        match mode {
+            "window" => {
+                let window = window_id
+                    .and_then(|id| self.space.elements().find(|w| w.ipc_id().0 == id).cloned())
+                    .or_else(|| self.focused_window());
+                if let Some(px) = window.and_then(|w| self.capture_window(&w)) {
+                    self.deliver_screenshot(px, save_target);
+                }
+            }
+            "area" => {
+                let (Some(output), Some(r)) = (output, rect) else { return };
+                if r.w < 2.0 || r.h < 2.0 {
+                    return;
+                }
+                let scale = output.current_scale().fractional_scale();
+                let x = (r.x.max(0.0) * scale).round() as u32;
+                let y = (r.y.max(0.0) * scale).round() as u32;
+                let w = (r.w.max(1.0) * scale).round() as u32;
+                let h = (r.h.max(1.0) * scale).round() as u32;
+                if let Some(px) = self.capture_output(&output, include_cursor) {
+                    if let Some(cropped) = px.crop(x, y, w, h) {
+                        self.deliver_screenshot(cropped, save_target);
+                    }
+                }
+            }
+            _ => {
+                let Some(output) = output else { return };
+                if let Some(px) = self.capture_output(&output, include_cursor) {
+                    self.deliver_screenshot(px, save_target);
+                }
+            }
         }
     }
 
@@ -269,7 +417,8 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 let window = self.window_at(pos);
                 self.cancel_area_screenshot();
                 if let Some(px) = window.and_then(|w| self.capture_window(&w)) {
-                    self.deliver_screenshot(px, sel.clipboard);
+                    let target = if sel.clipboard { SaveTarget::Clipboard } else { SaveTarget::Pictures };
+                    self.deliver_screenshot(px, target);
                 }
             }
             return true;
@@ -294,9 +443,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         let scale = output.current_scale().fractional_scale();
         let Some(local) = rect.intersection(geo) else { return true };
         let phys = Rectangle::new(local.loc - geo.loc, local.size).to_f64().to_physical(scale).to_i32_round::<i32>();
-        if let Some(px) = self.capture_output(&output) {
+        if let Some(px) = self.capture_output(&output, false) {
             if let Some(px) = px.crop(phys.loc.x.max(0) as u32, phys.loc.y.max(0) as u32, phys.size.w as u32, phys.size.h as u32) {
-                self.deliver_screenshot(px, sel.clipboard);
+                let target = if sel.clipboard { SaveTarget::Clipboard } else { SaveTarget::Pictures };
+                self.deliver_screenshot(px, target);
             }
         }
         true
@@ -319,18 +469,18 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         pointer.frame(self);
     }
 
-    /// Save to Pictures (or copy to the clipboard), play the shutter sound and
+    /// Save to Pictures/Desktop/Documents (or copy to the clipboard), play the shutter sound and
     /// confirm with a notification. The encoding runs on a helper thread.
-    fn deliver_screenshot(&self, px: Pixels, clipboard: bool) {
+    fn deliver_screenshot(&self, px: Pixels, target: SaveTarget) {
+        let clipboard = target == SaveTarget::Clipboard;
         let mut env: Vec<(String, String)> = Vec::new();
         if let Some(s) = &self.socket_name {
             env.push(("WAYLAND_DISPLAY".into(), s.clone()));
         }
         let path = if clipboard {
-            let dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-            dir.join("orchard-screenshot.png")
+            target_dir(SaveTarget::Clipboard).join("orchard-screenshot.png")
         } else {
-            let dir = pictures_dir();
+            let dir = target_dir(target);
             let _ = std::fs::create_dir_all(&dir);
             dir.join(file_name())
         };

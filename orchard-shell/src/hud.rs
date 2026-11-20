@@ -191,6 +191,10 @@ impl App {
     /// Blur behind each banner, and accept input only over them.
     pub(crate) fn send_notes_backdrop(&mut self) {
         let rects = self.notes.rects(&self.fonts);
+        if self.last_notes_backdrop.as_ref() == Some(&rects) {
+            return;
+        }
+        self.last_notes_backdrop = Some(rects.clone());
         if let Some(ipc) = self.ipc.as_mut() {
             let v: Vec<serde_json::Value> = rects
                 .iter()
@@ -213,9 +217,11 @@ impl App {
         let (x, y) = (x as f32, y as f32);
         match kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                let changed = self.notes.hover.is_none();
+                let prev_hit = self.notes.hover.and_then(|(hx, hy)| self.notes.hit(hx, hy));
+                let was_none = self.notes.hover.is_none();
                 self.notes.hover = Some((x, y));
-                if changed || matches!(kind, PointerEventKind::Motion { .. }) {
+                let new_hit = self.notes.hit(x, y);
+                if was_none || prev_hit != new_hit {
                     self.redraw(Which::Notify);
                 }
             }

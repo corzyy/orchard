@@ -6,7 +6,7 @@
 //! into four corners and four 1px edge strips that get stretched to any window
 //! size.
 
-use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
+use tiny_skia::{FillRule, Paint, Pixmap, Transform};
 
 use super::theme::corner_radius;
 
@@ -120,18 +120,7 @@ fn box_v(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
 
 fn rounded_rect_mask(size: u32, x: f32, y: f32, wh: f32, r: f32) -> Vec<f32> {
     let mut pm = Pixmap::new(size, size).unwrap();
-    let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + wh - r, y);
-    pb.quad_to(x + wh, y, x + wh, y + r);
-    pb.line_to(x + wh, y + wh - r);
-    pb.quad_to(x + wh, y + wh, x + wh - r, y + wh);
-    pb.line_to(x + r, y + wh);
-    pb.quad_to(x, y + wh, x, y + wh - r);
-    pb.line_to(x, y + r);
-    pb.quad_to(x, y, x + r, y);
-    pb.close();
-    let path = pb.finish().unwrap();
+    let path = super::squircle_rect_path(x, y, wh, wh, r).unwrap();
     let mut paint = Paint::default();
     paint.set_color_rgba8(0, 0, 0, 255);
     paint.anti_alias = true;

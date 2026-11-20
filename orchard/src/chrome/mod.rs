@@ -6,6 +6,116 @@ pub mod theme;
 pub mod tile_menu;
 pub mod titlebar;
 
+/// Superellipse exponent shared between CPU-painted chrome (titlebar, shadow)
+/// and the GPU `rounded.frag` shader so top and bottom corners match identically.
+pub const SQUIRCLE_N: f32 = 2.6;
+
+/// Number of line segments per squircle corner (chord error < 0.03px at r = 24).
+const SQUIRCLE_SEGMENTS: usize = 16;
+
+/// Build a path with continuous superellipse top corners and straight bottom
+/// edge from `(x0, y0)` to `(x1, y1)`. When `close` is false, the path stays
+/// open at the bottom (left -> top-left -> top -> top-right -> right) so
+/// stroking it never draws a line across the bottom seam.
+pub fn squircle_top_path(
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    r: f32,
+    close: bool,
+) -> Option<tiny_skia::Path> {
+    use std::f32::consts::FRAC_PI_2;
+    let w = (x1 - x0).max(0.0);
+    let h = (y1 - y0).max(0.0);
+    let r = r.clamp(0.0, (w * 0.5).min(h));
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x0, y1);
+    if r <= 0.5 {
+        pb.line_to(x0, y0);
+        pb.line_to(x1, y0);
+        pb.line_to(x1, y1);
+    } else {
+        let exp = 2.0 / SQUIRCLE_N;
+        pb.line_to(x0, y0 + r);
+        for i in 1..=SQUIRCLE_SEGMENTS {
+            let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+            let qx = r * t.cos().max(0.0).powf(exp);
+            let qy = r * t.sin().max(0.0).powf(exp);
+            pb.line_to(x0 + r - qx, y0 + r - qy);
+        }
+        pb.line_to(x1 - r, y0);
+        for i in 1..=SQUIRCLE_SEGMENTS {
+            let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+            let qx = r * t.sin().max(0.0).powf(exp);
+            let qy = r * t.cos().max(0.0).powf(exp);
+            pb.line_to(x1 - r + qx, y0 + r - qy);
+        }
+        pb.line_to(x1, y1);
+    }
+    if close {
+        pb.close();
+    }
+    pb.finish()
+}
+
+/// Build a closed path for a rectangle with all four continuous superellipse
+/// corners matching `rounded.frag`.
+pub fn squircle_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    use std::f32::consts::FRAC_PI_2;
+    let x0 = x;
+    let y0 = y;
+    let x1 = x + w.max(0.0);
+    let y1 = y + h.max(0.0);
+    let r = r.clamp(0.0, (w * 0.5).min(h * 0.5).max(0.0));
+    let mut pb = tiny_skia::PathBuilder::new();
+    if r <= 0.5 {
+        pb.move_to(x0, y0);
+        pb.line_to(x1, y0);
+        pb.line_to(x1, y1);
+        pb.line_to(x0, y1);
+        pb.close();
+        return pb.finish();
+    }
+    let exp = 2.0 / SQUIRCLE_N;
+    // Start at top-left after corner, go clockwise
+    pb.move_to(x0 + r, y0);
+    pb.line_to(x1 - r, y0);
+    // Top-right corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.sin().max(0.0).powf(exp);
+        let qy = r * t.cos().max(0.0).powf(exp);
+        pb.line_to(x1 - r + qx, y0 + r - qy);
+    }
+    pb.line_to(x1, y1 - r);
+    // Bottom-right corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.cos().max(0.0).powf(exp);
+        let qy = r * t.sin().max(0.0).powf(exp);
+        pb.line_to(x1 - r + qx, y1 - r + qy);
+    }
+    pb.line_to(x0 + r, y1);
+    // Bottom-left corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.sin().max(0.0).powf(exp);
+        let qy = r * t.cos().max(0.0).powf(exp);
+        pb.line_to(x0 + r - qx, y1 - r + qy);
+    }
+    pb.line_to(x0, y0 + r);
+    // Top-left corner
+    for i in 1..=SQUIRCLE_SEGMENTS {
+        let t = FRAC_PI_2 * (i as f32 / SQUIRCLE_SEGMENTS as f32);
+        let qx = r * t.cos().max(0.0).powf(exp);
+        let qy = r * t.sin().max(0.0).powf(exp);
+        pb.line_to(x0 + r - qx, y0 + r - qy);
+    }
+    pb.close();
+    pb.finish()
+}
+
 use std::{
     collections::HashMap,
     sync::{

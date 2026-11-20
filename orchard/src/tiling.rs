@@ -7,8 +7,12 @@
 //! * Dragging a tiled (or zoomed) window away restores its previous size, with
 //!   the pointer keeping its relative spot in the title bar.
 
+use std::collections::HashMap;
+
+use orchard_config::{NewWindowPlacement, SplitDirection, TilingMode, TilingSettings};
 use smithay::{
     desktop::{layer_map_for_output, space::SpaceElement, WindowSurface},
+    output::Output,
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{IsAlive, Logical, Point, Rectangle, Size},
 };
@@ -35,7 +39,7 @@ pub enum Tile {
 /// How far (logical px) from a left / right screen edge the pointer may be
 /// for the drop target to appear. Generous on purpose: aiming for a 2 px
 /// strip while dragging a whole window feels fiddly.
-const EDGE_ZONE: f64 = 32.0;
+pub const EDGE_ZONE: f64 = 32.0;
 /// Once a target shows, it stays until the pointer is this much further out
 /// (no flicker while the hand wobbles at the boundary).
 const STICKY: f64 = 48.0;
@@ -69,16 +73,58 @@ fn corner_zone(len: f64) -> f64 {
 /// macOS Sequoia's "tiled windows have margins".
 pub const GAP: i32 = 8;
 
-pub fn tile_rect(area: Rectangle<i32, Logical>, tile: Tile) -> Rectangle<i32, Logical> {
+/// The two margins of a layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gaps {
+    /// to the screen edges
+    pub outer: i32,
+    /// between two tiles
+    pub inner: i32,
+}
+
+impl Gaps {
+    pub const fn uniform(g: i32) -> Self {
+        Self { outer: g, inner: g }
+    }
+    pub const NONE: Gaps = Gaps::uniform(0);
+}
+
+impl From<&TilingSettings> for Gaps {
+    fn from(t: &TilingSettings) -> Self {
+        Self { outer: t.outer_gap, inner: t.inner_gap }
+    }
+}
+
+/// How far the pointer must be from an edge to snap, and whether corners count.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Snap {
+    pub zone: f64,
+    pub corners: bool,
+}
+
+impl Default for Snap {
+    fn default() -> Self {
+        Self { zone: EDGE_ZONE, corners: true }
+    }
+}
+
+impl From<&TilingSettings> for Snap {
+    fn from(t: &TilingSettings) -> Self {
+        Self { zone: t.edge_zone as f64, corners: t.snap_corners }
+    }
+}
+
+pub fn tile_rect_with(area: Rectangle<i32, Logical>, tile: Tile, gaps: Gaps) -> Rectangle<i32, Logical> {
     if tile == Tile::Fill {
         return area;
     }
-    // margin to the screen edges, then GAP between the halves
-    let (x, y) = (area.loc.x + GAP, area.loc.y + GAP);
-    let (w, h) = ((area.size.w - 2 * GAP).max(2), (area.size.h - 2 * GAP).max(2));
-    let (lw, th) = ((w - GAP) / 2, (h - GAP) / 2);
-    let (rw, bh) = (w - GAP - lw, h - GAP - th);
-    let (x2, y2) = (x + lw + GAP, y + th + GAP);
+    let (og, g) = (gaps.outer, gaps.inner);
+    // margin to the screen edges, then the inner gap between the halves
+    let (x, y) = (area.loc.x + og, area.loc.y + og);
+    let (w, h) = ((area.size.w - 2 * og).max(2), (area.size.h - 2 * og).max(2));
+    let (lw, th) = ((w - g) / 2, (h - g) / 2);
+    let (rw, bh) = (w - g - lw, h - g - th);
+    let (x2, y2) = (x + lw + g, y + th + g);
     let r = |x, y, w, h| Rectangle::new((x, y).into(), (w, h).into());
     match tile {
         Tile::Left => r(x, y, lw, h),
@@ -114,11 +160,22 @@ fn tiled_states(tile: Tile) -> [bool; 4] {
 /// displays a thin strip on each side (so moving a window across stays easy).
 /// `current` is the target shown right now; it gets a wider zone so it does
 /// not flicker.
+#[cfg(test)]
 pub fn edge_tile(
     outputs: &[(Rectangle<i32, Logical>, Rectangle<i32, Logical>)],
     pos: Point<f64, Logical>,
     window: Option<DragWindow>,
     current: Option<(Tile, Rectangle<i32, Logical>)>,
+) -> Option<(Tile, Rectangle<i32, Logical>)> {
+    edge_tile_with(outputs, pos, window, current, Snap::default())
+}
+
+pub fn edge_tile_with(
+    outputs: &[(Rectangle<i32, Logical>, Rectangle<i32, Logical>)],
+    pos: Point<f64, Logical>,
+    window: Option<DragWindow>,
+    current: Option<(Tile, Rectangle<i32, Logical>)>,
+    snap: Snap,
 ) -> Option<(Tile, Rectangle<i32, Logical>)> {
     let contains = |p: Point<f64, Logical>| outputs.iter().any(|(g, _)| g.to_f64().contains(p));
     let (geo, area) = outputs.iter().find(|(g, _)| g.to_f64().contains(pos))?;
@@ -134,7 +191,7 @@ pub fn edge_tile(
     let seam_l = contains((gl - 1.0, pos.y).into());
     let seam_r = contains((gr + 1.0, pos.y).into());
     let seam_t = contains((pos.x, g.loc.y - 1.0).into());
-    let zone = |seam: bool| if seam { SEAM_ZONE } else { EDGE_ZONE };
+    let zone = |seam: bool| if seam { SEAM_ZONE } else { snap.zone };
     let sticky_l = extra(&[Left, TopLeft, BottomLeft]);
     let sticky_r = extra(&[Right, TopRight, BottomRight]);
     // the window pushed against the side (pointer anywhere in its title bar);
@@ -171,10 +228,10 @@ pub fn edge_tile(
 
     let cy = corner_zone(a.size.h);
     let cx = corner_zone(g.size.w);
-    let near_top = pos.y <= a.loc.y + cy;
-    let near_bottom = pos.y >= a.loc.y + a.size.h - cy;
-    let near_left = pos.x <= g.loc.x + cx;
-    let near_right = pos.x >= g.loc.x + g.size.w - cx;
+    let near_top = snap.corners && pos.y <= a.loc.y + cy;
+    let near_bottom = snap.corners && pos.y >= a.loc.y + a.size.h - cy;
+    let near_left = snap.corners && pos.x <= g.loc.x + cx;
+    let near_right = snap.corners && pos.x >= g.loc.x + g.size.w - cx;
     let tile = if left {
         if near_top {
             TopLeft
@@ -239,6 +296,12 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 Some((geo, Rectangle::new(geo.loc + zone.loc, zone.size)))
             })
             .collect()
+    }
+
+    /// The margins in effect right now.
+    pub fn gaps(&self) -> Gaps {
+        let t = crate::settings::get().tiling.clamped();
+        Gaps::from(&t)
     }
 
     pub fn window_tile(&self, window: &WindowElement) -> Option<Tile> {
@@ -347,7 +410,8 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             return;
         }
         self.save_restore_geometry(window);
-        self.apply_frame(window, tile_rect(area, tile), Some(tile));
+        let gaps = self.gaps();
+        self.apply_frame(window, tile_rect_with(area, tile, gaps), Some(tile));
     }
 
     /// ⌥⌘R: back to the size and place from before tiling / zooming.
@@ -425,8 +489,16 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             rect: Rectangle::new(loc, window.geometry().size).to_f64(),
             start_x: start.x as f64,
         });
-        let hit = edge_tile(&self.output_areas(), pos, drag, current);
-        let target = hit.map(|(t, a)| tile_rect(a, t));
+        let cfg = crate::settings::get().tiling.clamped();
+        if !cfg.snap_to_edges {
+            self.fx.tile_preview = None;
+            self.fx.tile_preview_anim = None;
+            return None;
+        }
+        let hit = edge_tile_with(&self.output_areas(), pos, drag, current, Snap::from(&cfg));
+        let target = hit
+            .filter(|_| cfg.snap_preview)
+            .map(|(t, a)| tile_rect_with(a, t, Gaps::from(&cfg)));
         if target != self.fx.tile_preview {
             let now: std::time::Duration = self.clock.now().into();
             if let Some(to) = target {
@@ -461,9 +533,691 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     }
 }
 
+// ---- Hyprland-style dwindle layout (BSP tree) -------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDir {
+    /// Side-by-side (left | right).
+    Horizontal,
+    /// Stacked (top / bottom).
+    Vertical,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DwindleNode {
+    Leaf(u64),
+    Split {
+        dir: SplitDir,
+        ratio: f32,
+        first: Box<DwindleNode>,
+        second: Box<DwindleNode>,
+    },
+}
+
+impl DwindleNode {
+    pub fn contains(&self, id: u64) -> bool {
+        match self {
+            DwindleNode::Leaf(w) => *w == id,
+            DwindleNode::Split { first, second, .. } => first.contains(id) || second.contains(id),
+        }
+    }
+
+    pub fn ids(&self, out: &mut Vec<u64>) {
+        match self {
+            DwindleNode::Leaf(w) => out.push(*w),
+            DwindleNode::Split { first, second, .. } => {
+                first.ids(out);
+                second.ids(out);
+            }
+        }
+    }
+
+    /// Deepest rightmost leaf (the tail of the dwindle spiral).
+    pub fn tail_leaf(&self) -> u64 {
+        match self {
+            DwindleNode::Leaf(w) => *w,
+            DwindleNode::Split { second, .. } => second.tail_leaf(),
+        }
+    }
+
+    /// Compute `(window_id, rect)` for every leaf inside `rect` with `gap` between panes.
+    fn layout_in(&self, rect: Rectangle<i32, Logical>, gap: i32, out: &mut Vec<(u64, Rectangle<i32, Logical>)>) {
+        match self {
+            DwindleNode::Leaf(id) => out.push((*id, rect)),
+            DwindleNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let (r1, r2) = split_rect(rect, *dir, *ratio, gap);
+                first.layout_in(r1, gap, out);
+                second.layout_in(r2, gap, out);
+            }
+        }
+    }
+
+    /// Split leaf `target` into `(target, new_id)` choosing Horizontal if the
+    /// leaf's rect is wider than or equal to its height, else Vertical.
+    fn split_leaf(&mut self, target: u64, new_id: u64, rect: Rectangle<i32, Logical>, gap: i32, opts: SplitOpts) -> bool {
+        match self {
+            DwindleNode::Leaf(id) if *id == target => {
+                let dir = opts.dir.unwrap_or(if rect.size.w >= rect.size.h {
+                    SplitDir::Horizontal
+                } else {
+                    SplitDir::Vertical
+                });
+                *self = DwindleNode::Split {
+                    dir,
+                    ratio: opts.ratio,
+                    first: Box::new(DwindleNode::Leaf(*id)),
+                    second: Box::new(DwindleNode::Leaf(new_id)),
+                };
+                true
+            }
+            DwindleNode::Leaf(_) => false,
+            DwindleNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let (r1, r2) = split_rect(rect, *dir, *ratio, gap);
+                first.split_leaf(target, new_id, r1, gap, opts) || second.split_leaf(target, new_id, r2, gap, opts)
+            }
+        }
+    }
+
+    /// Swap two leaves in place.
+    pub fn swap(&mut self, a: u64, b: u64) {
+        match self {
+            DwindleNode::Leaf(id) => {
+                if *id == a {
+                    *id = b;
+                } else if *id == b {
+                    *id = a;
+                }
+            }
+            DwindleNode::Split { first, second, .. } => {
+                first.swap(a, b);
+                second.swap(a, b);
+            }
+        }
+    }
+}
+
+fn inset_area(area: Rectangle<i32, Logical>, gap: i32) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        (area.loc.x + gap, area.loc.y + gap).into(),
+        ((area.size.w - 2 * gap).max(2), (area.size.h - 2 * gap).max(2)).into(),
+    )
+}
+
+fn split_rect(
+    rect: Rectangle<i32, Logical>,
+    dir: SplitDir,
+    ratio: f32,
+    gap: i32,
+) -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
+    let ratio = ratio.clamp(0.15, 0.85);
+    match dir {
+        SplitDir::Horizontal => {
+            let avail = (rect.size.w - gap).max(2);
+            let w1 = ((avail as f32 * ratio).round() as i32).clamp(1, avail - 1);
+            let w2 = (avail - w1).max(1);
+            (
+                Rectangle::new(rect.loc, (w1, rect.size.h).into()),
+                Rectangle::new((rect.loc.x + w1 + gap, rect.loc.y).into(), (w2, rect.size.h).into()),
+            )
+        }
+        SplitDir::Vertical => {
+            let avail = (rect.size.h - gap).max(2);
+            let h1 = ((avail as f32 * ratio).round() as i32).clamp(1, avail - 1);
+            let h2 = (avail - h1).max(1);
+            (
+                Rectangle::new(rect.loc, (rect.size.w, h1).into()),
+                Rectangle::new((rect.loc.x, rect.loc.y + h1 + gap).into(), (rect.size.w, h2).into()),
+            )
+        }
+    }
+}
+
+/// How a new window splits its pane.
+#[derive(Debug, Clone, Copy)]
+pub struct SplitOpts {
+    /// fixed direction; `None` = along the pane's longer side
+    pub dir: Option<SplitDir>,
+    /// share the existing window keeps
+    pub ratio: f32,
+}
+
+impl Default for SplitOpts {
+    fn default() -> Self {
+        Self { dir: None, ratio: 0.5 }
+    }
+}
+
+impl From<&TilingSettings> for SplitOpts {
+    fn from(t: &TilingSettings) -> Self {
+        Self {
+            dir: match t.split_direction {
+                SplitDirection::Auto => None,
+                SplitDirection::Horizontal => Some(SplitDir::Horizontal),
+                SplitDirection::Vertical => Some(SplitDir::Vertical),
+            },
+            ratio: t.split_ratio,
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn dwindle_insert(
+    root: &mut Option<DwindleNode>,
+    id: u64,
+    target: Option<u64>,
+    area: Rectangle<i32, Logical>,
+    gaps: Gaps,
+) {
+    dwindle_insert_with(root, id, target, area, gaps, SplitOpts::default());
+}
+
+pub fn dwindle_insert_with(
+    root: &mut Option<DwindleNode>,
+    id: u64,
+    target: Option<u64>,
+    area: Rectangle<i32, Logical>,
+    gaps: Gaps,
+    opts: SplitOpts,
+) {
+    let Some(node) = root.as_mut() else {
+        *root = Some(DwindleNode::Leaf(id));
+        return;
+    };
+    if node.contains(id) {
+        return;
+    }
+    let split_target = target.filter(|t| node.contains(*t)).unwrap_or_else(|| node.tail_leaf());
+    let inner = inset_area(area, gaps.outer);
+    node.split_leaf(split_target, id, inner, gaps.inner, opts);
+}
+
+pub fn dwindle_remove(root: &mut Option<DwindleNode>, id: u64) -> bool {
+    fn remove_rec(node: DwindleNode, id: u64) -> (Option<DwindleNode>, bool) {
+        match node {
+            DwindleNode::Leaf(w) if w == id => (None, true),
+            DwindleNode::Leaf(w) => (Some(DwindleNode::Leaf(w)), false),
+            DwindleNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let (f, removed_f) = remove_rec(*first, id);
+                if removed_f {
+                    return match f {
+                        Some(f) => (
+                            Some(DwindleNode::Split {
+                                dir,
+                                ratio,
+                                first: Box::new(f),
+                                second,
+                            }),
+                            true,
+                        ),
+                        None => (Some(*second), true),
+                    };
+                }
+                let (s, removed_s) = remove_rec(*second, id);
+                if removed_s {
+                    return match s {
+                        Some(s) => (
+                            Some(DwindleNode::Split {
+                                dir,
+                                ratio,
+                                first: Box::new(f.unwrap()),
+                                second: Box::new(s),
+                            }),
+                            true,
+                        ),
+                        None => (f, true),
+                    };
+                }
+                (
+                    Some(DwindleNode::Split {
+                        dir,
+                        ratio,
+                        first: Box::new(f.unwrap()),
+                        second: Box::new(s.unwrap()),
+                    }),
+                    false,
+                )
+            }
+        }
+    }
+    let Some(node) = root.take() else { return false };
+    let (next, removed) = remove_rec(node, id);
+    *root = next;
+    removed
+}
+
+pub fn dwindle_layout(
+    root: &Option<DwindleNode>,
+    area: Rectangle<i32, Logical>,
+    gaps: Gaps,
+) -> Vec<(u64, Rectangle<i32, Logical>)> {
+    let mut out = Vec::new();
+    if let Some(node) = root {
+        node.layout_in(inset_area(area, gaps.outer), gaps.inner, &mut out);
+    }
+    out
+}
+
+/// Per-(output, space_index) dwindle trees and last-applied mode.
+#[derive(Debug, Default)]
+pub struct DwindleState {
+    pub mode: TilingMode,
+    /// the tiling settings last applied (to notice edits)
+    pub cfg: TilingSettings,
+    pub trees: HashMap<(String, usize), Option<DwindleNode>>,
+}
+
+impl DwindleState {
+    pub fn new(mode: TilingMode) -> Self {
+        Self {
+            mode,
+            cfg: crate::settings::get().tiling.clone(),
+            trees: HashMap::new(),
+        }
+    }
+
+    pub fn remove_everywhere(&mut self, id: u64) {
+        for tree in self.trees.values_mut() {
+            dwindle_remove(tree, id);
+        }
+    }
+}
+
+fn is_tileable(window: &WindowElement) -> bool {
+    if !window.alive() || window.is_fullscreen() {
+        return false;
+    }
+    #[cfg(feature = "xwayland")]
+    if let Some(x11) = window.0.x11_surface() {
+        if x11.is_override_redirect() {
+            return false;
+        }
+    }
+    // Wait until initial placement has run on the first sized commit.
+    let awaiting_initial = window
+        .user_data()
+        .get::<std::cell::RefCell<Option<crate::wm::NeedsInitialPlacement>>>()
+        .map(|c| c.borrow().is_some())
+        .unwrap_or(false);
+    !awaiting_initial
+}
+
+impl<BackendData: Backend> OrchardState<BackendData> {
+    pub fn is_tiling_mode(&self) -> bool {
+        self.dwindle.mode == TilingMode::Tiling
+    }
+
+    /// Move `window` to `loc` without changing its stacking order or focus.
+    fn move_window_preserving_stack(&mut self, window: &WindowElement, loc: Point<i32, Logical>) {
+        let above: Vec<WindowElement> = self
+            .space
+            .elements()
+            .skip_while(|w| **w != *window)
+            .skip(1)
+            .cloned()
+            .collect();
+        self.space.map_element(window.clone(), loc, false);
+        for w in &above {
+            self.space.raise_element(w, false);
+        }
+    }
+
+    /// Resize a maximized (zoomed) or snap-tiled window to fit `area` without
+    /// changing its stacking order, focus, or saved restore geometry.
+    fn refit_zoomed_or_tiled(&mut self, window: &WindowElement, area: Rectangle<i32, Logical>) {
+        if !is_tileable(window) {
+            return;
+        }
+        let zoomed = self.is_zoomed(window);
+        let tile = window.decoration_state().tile;
+        if !zoomed && tile.is_none() {
+            return;
+        }
+        let rect = if zoomed {
+            area
+        } else {
+            tile_rect_with(area, tile.unwrap(), self.gaps())
+        };
+        let header = if window.is_ssd() { HEADER_BAR_HEIGHT } else { 0 };
+        let client: Size<i32, Logical> = (rect.size.w, (rect.size.h - header).max(1)).into();
+
+        // Skip redundant configures if the window already matches `rect`.
+        let cur_loc = self.space.element_location(window);
+        let cur_size = window.client_geometry().size;
+        if cur_loc == Some(rect.loc) && cur_size == client {
+            return;
+        }
+
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                toplevel.with_pending_state(|s| {
+                    s.bounds = Some(area.size);
+                    if zoomed {
+                        s.states.set(xdg_toplevel::State::Maximized);
+                    } else if let Some(tile) = tile {
+                        let edges = tiled_states(tile);
+                        s.states.unset(xdg_toplevel::State::Maximized);
+                        for (state, on) in [
+                            (xdg_toplevel::State::TiledLeft, edges[0]),
+                            (xdg_toplevel::State::TiledRight, edges[1]),
+                            (xdg_toplevel::State::TiledTop, edges[2]),
+                            (xdg_toplevel::State::TiledBottom, edges[3]),
+                        ] {
+                            if on {
+                                s.states.set(state);
+                            } else {
+                                s.states.unset(state);
+                            }
+                        }
+                    }
+                    s.size = Some(client);
+                });
+                toplevel.send_pending_configure();
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(x) => {
+                let _ = x.set_maximized(zoomed);
+                let _ = x.configure(Rectangle::new(rect.loc + Point::from((0, header)), client));
+            }
+        }
+        self.animate_frame(window, rect);
+        self.move_window_preserving_stack(window, rect.loc);
+    }
+
+    /// Refit all tiled (dwindle or snap-tiled) and maximized windows on `output`
+    /// to its current usable area (e.g. after the Dock hides/unhides or moves).
+    pub fn refit_windows_on_output(&mut self, output: &Output) {
+        if self.is_tiling_mode() {
+            self.retile_output(output);
+            return;
+        }
+        let Some(geo) = self.space.output_geometry(output) else { return };
+        let zone = layer_map_for_output(output).non_exclusive_zone();
+        let area = Rectangle::new(geo.loc + zone.loc, zone.size);
+        if area.size.w <= 2 * GAP || area.size.h <= 2 * GAP {
+            return;
+        }
+        let windows: Vec<WindowElement> = self
+            .windows_on_output(output)
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect();
+        for window in windows {
+            self.refit_zoomed_or_tiled(&window, area);
+        }
+    }
+
+    /// Refit all tiled and maximized windows across every output.
+    pub fn refit_all_windows(&mut self) {
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        for output in outputs {
+            self.refit_windows_on_output(&output);
+        }
+    }
+
+    /// Apply a dwindle tile frame without altering stacking order or focus.
+    fn apply_dwindle_frame(&mut self, window: &WindowElement, rect: Rectangle<i32, Logical>, animate: bool) {
+        let header = if window.is_ssd() { HEADER_BAR_HEIGHT } else { 0 };
+        let client: Size<i32, Logical> = (rect.size.w, (rect.size.h - header).max(1)).into();
+
+        // Skip redundant configures if the window is already at `rect` and tiled.
+        let cur_loc = self.space.element_location(window);
+        let cur_size = window.client_geometry().size;
+        let already_dwindled = window.decoration_state().dwindled;
+        if already_dwindled && cur_loc == Some(rect.loc) && cur_size == client && !self.is_zoomed(window) {
+            return;
+        }
+
+        match window.0.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                toplevel.with_pending_state(|s| {
+                    s.states.unset(xdg_toplevel::State::Maximized);
+                    s.states.set(xdg_toplevel::State::TiledLeft);
+                    s.states.set(xdg_toplevel::State::TiledRight);
+                    s.states.set(xdg_toplevel::State::TiledTop);
+                    s.states.set(xdg_toplevel::State::TiledBottom);
+                    s.size = Some(client);
+                });
+                toplevel.send_pending_configure();
+            }
+            #[cfg(feature = "xwayland")]
+            WindowSurface::X11(x) => {
+                let _ = x.set_maximized(false);
+                let _ = x.configure(Rectangle::new(rect.loc + Point::from((0, header)), client));
+            }
+        }
+
+        window.decoration_state().tile = None;
+        window.decoration_state().dwindled = true;
+        if animate {
+            self.animate_frame(window, rect);
+        }
+        // Preserve stacking order (Space::map_element raises on top).
+        self.move_window_preserving_stack(window, rect.loc);
+    }
+
+    /// Reconcile and tile all tileable windows on `output`'s active Space.
+    /// `newly_placed` is a freshly opened window that should appear directly
+    /// in its tile (using its open animation rather than sliding from spawn).
+    pub fn retile_output_with(&mut self, output: &Output, newly_placed: Option<u64>, split_target: Option<u64>) {
+        if !self.is_tiling_mode() {
+            return;
+        }
+        let Some(geo) = self.space.output_geometry(output) else { return };
+        let zone = layer_map_for_output(output).non_exclusive_zone();
+        let area = Rectangle::new(geo.loc + zone.loc, zone.size);
+        if area.size.w <= 2 * GAP || area.size.h <= 2 * GAP {
+            return;
+        }
+
+        let name = output.name();
+        let (active_space, _) = self.spaces.info(&name);
+        let key = (name, active_space);
+
+        let windows: Vec<WindowElement> = self
+            .windows_on_output(output)
+            .into_iter()
+            .map(|(w, _)| w)
+            .filter(is_tileable)
+            .collect();
+
+        let live_ids: Vec<u64> = windows.iter().map(|w| w.ipc_id().0).collect();
+
+        // Prune leaves that are no longer on this output/Space.
+        let tree = self.dwindle.trees.entry(key.clone()).or_default();
+        let mut stale = Vec::new();
+        if let Some(node) = tree.as_ref() {
+            let mut in_tree = Vec::new();
+            node.ids(&mut in_tree);
+            for id in in_tree {
+                if !live_ids.contains(&id) {
+                    stale.push(id);
+                }
+            }
+        }
+        for id in stale {
+            dwindle_remove(tree, id);
+        }
+
+        // Insert any live windows not yet in the tree.
+        let cfg = crate::settings::get().tiling.clamped();
+        let opts = SplitOpts::from(&cfg);
+        let gaps = if cfg.smart_gaps && live_ids.len() <= 1 { Gaps::NONE } else { Gaps::from(&cfg) };
+        let tree = self.dwindle.trees.entry(key.clone()).or_default();
+        for &id in &live_ids {
+            let target = if Some(id) == newly_placed {
+                split_target
+            } else {
+                None
+            };
+            dwindle_insert_with(tree, id, target, area, gaps, opts);
+        }
+
+        let rects = dwindle_layout(tree, area, gaps);
+        for (id, rect) in rects {
+            let Some(window) = windows.iter().find(|w| w.ipc_id().0 == id) else { continue };
+            let is_new = newly_placed == Some(id);
+            if !is_new && !window.decoration_state().dwindled {
+                self.save_restore_geometry(window);
+            }
+            self.apply_dwindle_frame(window, rect, !is_new);
+        }
+    }
+
+    pub fn retile_output(&mut self, output: &Output) {
+        self.retile_output_with(output, None, None);
+    }
+
+    pub fn retile_all(&mut self) {
+        if !self.is_tiling_mode() {
+            return;
+        }
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        for output in outputs {
+            self.retile_output(&output);
+        }
+    }
+
+    /// Place a newly sized window into the dwindle tree on its output.
+    pub fn dwindle_place_new(&mut self, window: &WindowElement) {
+        let Some(output) = self
+            .window_output(window)
+            .or_else(|| self.active_output())
+            .or_else(|| self.primary_output())
+        else {
+            return;
+        };
+        let target = self
+            .focused_window()
+            .filter(|w| w != window && self.window_output(w).as_ref() == Some(&output))
+            .filter(|_| crate::settings::get().tiling.new_window == NewWindowPlacement::Focused)
+            .map(|w| w.ipc_id().0);
+        self.retile_output_with(&output, Some(window.ipc_id().0), target);
+        window.start_open_animation(self.clock.now().into());
+        self.focus_window(window);
+    }
+
+    /// Restore all dwindle-tiled windows on `output` back to floating geometry.
+    pub fn untile_dwindled_on_output(&mut self, output: &Output) {
+        let windows: Vec<WindowElement> = self
+            .windows_on_output(output)
+            .into_iter()
+            .map(|(w, _)| w)
+            .filter(|w| w.alive() && w.decoration_state().dwindled)
+            .collect();
+        for window in windows {
+            self.untile_single_dwindled(&window);
+        }
+    }
+
+    /// Leave dwindle tiling mode: clear trees and restore all tiled windows to floating.
+    pub fn untile_all_dwindle(&mut self) {
+        self.dwindle.trees.clear();
+        let windows: Vec<WindowElement> = self
+            .space
+            .elements()
+            .filter(|w| w.alive() && w.decoration_state().dwindled)
+            .cloned()
+            .collect();
+        for window in windows {
+            self.untile_single_dwindled(&window);
+        }
+    }
+
+    fn untile_single_dwindled(&mut self, window: &WindowElement) {
+        window.decoration_state().dwindled = false;
+        let restore = window.decoration_state().restore_geometry.take();
+        let header = if window.is_ssd() { HEADER_BAR_HEIGHT } else { 0 };
+        let frame = if let Some(r) = restore {
+            Rectangle::new(r.loc, (r.size.w, r.size.h + header).into())
+        } else if let Some(area) = self.usable_area_for(window) {
+            // Opened while in Tiling mode: give it a comfortable 2/3 centered floating frame.
+            let w = (area.size.w * 2 / 3).max(400).min(area.size.w);
+            let h = (area.size.h * 2 / 3).max(300).min(area.size.h);
+            let loc: Point<i32, Logical> = (
+                area.loc.x + (area.size.w - w) / 2,
+                area.loc.y + (area.size.h - h) / 2,
+            )
+                .into();
+            Rectangle::new(loc, (w, h).into())
+        } else {
+            return;
+        };
+        self.apply_frame(window, frame, None);
+    }
+
+    /// Handle releasing a dragged window in Tiling mode: swap with the window
+    /// under `pointer` (or move to another output), then retile.
+    pub fn dwindle_drop_drag(&mut self, window: &WindowElement, pointer: Point<f64, Logical>) {
+        if !self.is_tiling_mode() {
+            return;
+        }
+        let id = window.ipc_id().0;
+        // Find topmost other tileable window whose frame contains `pointer`.
+        let other = self
+            .space
+            .elements()
+            .rev()
+            .find(|w| {
+                **w != *window
+                    && is_tileable(w)
+                    && self
+                        .space
+                        .element_location(w)
+                        .map(|loc| {
+                            let r = Rectangle::new(loc, SpaceElement::geometry(*w).size).to_f64();
+                            r.contains(pointer)
+                        })
+                        .unwrap_or(false)
+            })
+            .cloned();
+
+        let src_out = self.window_output(window);
+        let dst_out = other
+            .as_ref()
+            .and_then(|o| self.window_output(o))
+            .or_else(|| self.space.output_under(pointer).next().cloned());
+
+        match (src_out, dst_out, other) {
+            (Some(src), Some(dst), Some(other)) if src == dst => {
+                let (active, _) = self.spaces.info(&src.name());
+                let key = (src.name(), active);
+                if let Some(Some(node)) = self.dwindle.trees.get_mut(&key) {
+                    node.swap(id, other.ipc_id().0);
+                }
+            }
+            (Some(src), Some(dst), _) if src != dst => {
+                // Move window into the destination output's tree.
+                self.dwindle.remove_everywhere(id);
+                if let Some(geo) = self.space.output_geometry(&dst) {
+                    self.space.map_element(window.clone(), geo.loc + Point::from((self.gaps().outer, self.gaps().outer)), false);
+                }
+            }
+            _ => {}
+        }
+        self.retile_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const G: Gaps = Gaps::uniform(GAP);
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
         Rectangle::new((x, y).into(), (w, h).into())
@@ -472,19 +1226,19 @@ mod tests {
     #[test]
     fn halves_cover_the_area() {
         let area = rect(0, 24, 1921, 1000);
-        let l = tile_rect(area, Tile::Left);
-        let r = tile_rect(area, Tile::Right);
+        let l = tile_rect_with(area, Tile::Left, G);
+        let r = tile_rect_with(area, Tile::Right, G);
         // margin, left half, gap, right half, margin
         assert_eq!(l.loc.x, GAP);
         assert_eq!(GAP + l.size.w + GAP + r.size.w + GAP, 1921);
         assert_eq!(r.loc.x, l.loc.x + l.size.w + GAP);
         assert_eq!(l.loc.y, 24 + GAP);
         assert_eq!(l.size.h, 1000 - 2 * GAP);
-        let tl = tile_rect(area, Tile::TopLeft);
-        let bl = tile_rect(area, Tile::BottomLeft);
+        let tl = tile_rect_with(area, Tile::TopLeft, G);
+        let bl = tile_rect_with(area, Tile::BottomLeft, G);
         assert_eq!(bl.loc.y, tl.loc.y + tl.size.h + GAP);
         assert_eq!(bl.loc.y + bl.size.h, 24 + 1000 - GAP);
-        assert_eq!(tile_rect(area, Tile::Fill), area);
+        assert_eq!(tile_rect_with(area, Tile::Fill, G), area);
     }
 
     #[test]
@@ -550,7 +1304,7 @@ mod tests {
         assert!(hit(1890.0).is_none());
         assert!(hit(1950.0).is_none());
         // the tile lands in that display's half
-        let r = tile_rect(outs[1].1, Tile::Left);
+        let r = tile_rect_with(outs[1].1, Tile::Left, G);
         assert_eq!(r.loc.x, 1920 + GAP);
         assert_eq!(r.size.w, (2560 - 3 * GAP) / 2);
     }
@@ -593,5 +1347,60 @@ mod tests {
         assert_eq!(neighbour(&outs, outs[0].0, 1), Some(outs[1].1));
         assert_eq!(neighbour(&outs, outs[1].0, -1), Some(outs[0].1));
         assert_eq!(neighbour(&outs, outs[0].0, -1), None);
+    }
+
+    #[test]
+    fn dwindle_spiral_layout_matches_hyprland() {
+        let area = rect(0, 24, 1920, 1056);
+        let mut root = None;
+
+        // 1 window: fills usable area with outer gap
+        dwindle_insert(&mut root, 1, None, area, G);
+        let r1 = dwindle_layout(&root, area, G);
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0], (1, rect(GAP, 24 + GAP, 1920 - 2 * GAP, 1056 - 2 * GAP)));
+
+        // 2nd window: container is wider than tall -> splits horizontally (left | right)
+        dwindle_insert(&mut root, 2, Some(1), area, G);
+        let r2 = dwindle_layout(&root, area, G);
+        assert_eq!(r2.len(), 2);
+        assert_eq!(r2[0].1.loc.y, r2[1].1.loc.y);
+        assert_eq!(r2[0].1.size.h, r2[1].1.size.h);
+        assert_eq!(r2[1].1.loc.x, r2[0].1.loc.x + r2[0].1.size.w + GAP);
+
+        // 3rd window splitting 2: right half (948x1040) is taller than wide -> splits vertically (2 over 3)
+        dwindle_insert(&mut root, 3, Some(2), area, G);
+        let r3 = dwindle_layout(&root, area, G);
+        assert_eq!(r3.len(), 3);
+        let (_, b1) = r3.iter().find(|(id, _)| *id == 1).unwrap();
+        let (_, b2) = r3.iter().find(|(id, _)| *id == 2).unwrap();
+        let (_, b3) = r3.iter().find(|(id, _)| *id == 3).unwrap();
+        assert_eq!(b1.size.h, 1056 - 2 * GAP);
+        assert_eq!(b2.loc.x, b3.loc.x);
+        assert_eq!(b3.loc.y, b2.loc.y + b2.size.h + GAP);
+
+        // 4th window splitting 3: bottom-right (948x516) is wider than tall -> splits horizontally (3 | 4)
+        dwindle_insert(&mut root, 4, Some(3), area, G);
+        let r4 = dwindle_layout(&root, area, G);
+        assert_eq!(r4.len(), 4);
+        let (_, c3) = r4.iter().find(|(id, _)| *id == 3).unwrap();
+        let (_, c4) = r4.iter().find(|(id, _)| *id == 4).unwrap();
+        assert_eq!(c3.loc.y, c4.loc.y);
+        assert_eq!(c4.loc.x, c3.loc.x + c3.size.w + GAP);
+
+        // Removing window 3 promotes window 4 to fill bottom-right
+        assert!(dwindle_remove(&mut root, 3));
+        let r_after = dwindle_layout(&root, area, G);
+        assert_eq!(r_after.len(), 3);
+        let (_, d4) = r_after.iter().find(|(id, _)| *id == 4).unwrap();
+        assert_eq!(*d4, *b3);
+
+        // Swapping 1 and 4 exchanges their rects
+        root.as_mut().unwrap().swap(1, 4);
+        let r_swapped = dwindle_layout(&root, area, G);
+        let (_, s1) = r_swapped.iter().find(|(id, _)| *id == 1).unwrap();
+        let (_, s4) = r_swapped.iter().find(|(id, _)| *id == 4).unwrap();
+        assert_eq!(*s1, *b3);
+        assert_eq!(*s4, *b1);
     }
 }

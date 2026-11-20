@@ -30,6 +30,7 @@ pub enum Action {
     DesktopNewFolder,
     DesktopSort(crate::desktop::SortBy),
     CopyText(String),
+    SetTilingMode(orchard_config::TilingMode),
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,10 @@ impl MenuItem {
     }
     pub fn with_shortcut(mut self, s: &str) -> Self {
         self.shortcut = s.into();
+        self
+    }
+    pub fn with_checked(mut self, checked: bool) -> Self {
+        self.checked = Some(checked);
         self
     }
     pub fn disabled(label: impl Into<String>) -> Self {

@@ -127,9 +127,10 @@ impl DevBuild {
             ));
         }
         if self.log_path().is_file() {
+            let term = orchard_config::resolve_terminal(&orchard_config::Settings::load().apps.terminal);
             v.push(MenuItem::new(
                 t("Show Build Log", "Build-Protokoll anzeigen"),
-                Action::Launch(format!("konsole -e less +G {log}")),
+                Action::Launch(orchard_config::terminal_exec(&term, &format!("less +G {log}"))),
             ));
         }
         if self.compositor_stale {
@@ -161,15 +162,35 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 }
 
 /// Any in-repo source listed in `<bin>.d` is newer than `<bin>` (or it was never built).
+/// Caches parsed `.d` dependency lists by the `.d` file's mtime so we don't re-read and
+/// re-parse them on every poll.
 fn sources_newer(root: &Path, release: &Path, bin: &str) -> bool {
+    use std::{collections::HashMap, sync::{Mutex, OnceLock}};
+    static DEP_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, Vec<PathBuf>)>>> = OnceLock::new();
+
     let Some(built) = mtime(&release.join(bin)) else { return true };
-    let Ok(dep) = std::fs::read_to_string(release.join(format!("{bin}.d"))) else {
-        return true;
+    let dep_path = release.join(format!("{bin}.d"));
+    let Some(dep_mtime) = mtime(&dep_path) else { return true };
+
+    let sources: Vec<PathBuf> = {
+        let mut cache = DEP_CACHE.get_or_init(Default::default).lock().unwrap();
+        if let Some((cached_mtime, cached_srcs)) = cache.get(&dep_path) {
+            if *cached_mtime == dep_mtime {
+                cached_srcs.clone()
+            } else {
+                let Ok(dep) = std::fs::read_to_string(&dep_path) else { return true };
+                let srcs: Vec<PathBuf> = dep_info_sources(&dep).into_iter().filter(|p| p.starts_with(root)).collect();
+                cache.insert(dep_path, (dep_mtime, srcs.clone()));
+                srcs
+            }
+        } else {
+            let Ok(dep) = std::fs::read_to_string(&dep_path) else { return true };
+            let srcs: Vec<PathBuf> = dep_info_sources(&dep).into_iter().filter(|p| p.starts_with(root)).collect();
+            cache.insert(dep_path, (dep_mtime, srcs.clone()));
+            srcs
+        }
     };
-    dep_info_sources(&dep)
-        .into_iter()
-        .filter(|p| p.starts_with(root))
-        .any(|p| mtime(&p).is_none_or(|m| m > built))
+    sources.iter().any(|p| mtime(p).is_none_or(|m| m > built))
 }
 
 /// Parse a Makefile-style dep-info file: `target: dep dep\ with\ space ...`.

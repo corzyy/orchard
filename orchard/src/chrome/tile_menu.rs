@@ -16,7 +16,7 @@ use smithay::{
     utils::{Logical, Physical, Point, Rectangle},
     utils::Transform,
 };
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform as SkTransform};
+use tiny_skia::{Color, FillRule, Paint, Pixmap, Stroke, Transform as SkTransform};
 
 use crate::{
     chrome::{
@@ -175,7 +175,7 @@ impl TileMenu {
             scale_milli: (scale * 1000.0).round() as u32,
             hovered: self.hovered.clone(),
             outputs: self.outputs.clone(),
-            accent: crate::settings::get().appearance.accent.rgb(),
+            accent: crate::settings::get().appearance.accent_rgb(),
             german: is_german(),
         };
         let fresh = !matches!(&self.cache, Some((k, _)) if *k == key);
@@ -215,19 +215,7 @@ fn paint_rgba(c: Rgba) -> Paint<'static> {
 }
 
 fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
-    let r = r.min(w * 0.5).min(h * 0.5);
-    let mut pb = PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.quad_to(x + w, y, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.quad_to(x + w, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.quad_to(x, y + h, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.quad_to(x, y, x + r, y);
-    pb.close();
-    pb.finish()
+    super::squircle_rect_path(x, y, w, h, r)
 }
 
 fn paint_popover(key: &RenderKey, size: (f64, f64)) -> Option<Pixmap> {

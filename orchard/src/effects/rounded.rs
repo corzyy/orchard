@@ -14,42 +14,50 @@ use std::cell::RefCell;
 
 const SHADER: &str = include_str!("shaders/rounded.frag");
 
-struct RoundedProgram(RefCell<(u64, GlesTexProgram)>);
+const GLASS_SHADER: &str = include_str!("shaders/liquid_glass.frag");
 
-/// Compile (once per GL context, or again after `reload_shaders`) and return
-/// the rounded-corner program.
-pub fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
+/// A compiled program cached per GL context, recompiled after `reload_shaders`.
+struct ProgramSlot<M>(RefCell<(u64, GlesTexProgram)>, std::marker::PhantomData<M>);
+struct RoundedMarker;
+struct GlassMarker;
+
+fn uniforms(glass: bool) -> Vec<UniformName<'static>> {
+    let mut u = vec![
+        UniformName::new("size", UniformType::_2f),
+        UniformName::new("radius", UniformType::_1f),
+        UniformName::new("corners", UniformType::_4f),
+        UniformName::new("src_off", UniformType::_2f),
+        UniformName::new("src_scale", UniformType::_2f),
+        UniformName::new("rim", UniformType::_4f),
+        UniformName::new("rim_width", UniformType::_1f),
+    ];
+    if glass {
+        u.push(UniformName::new("glass", UniformType::_4f));
+    }
+    u
+}
+
+fn cached<M: 'static>(renderer: &mut GlesRenderer, file: &str, fallback: &'static str, glass: bool) -> Option<GlesTexProgram> {
     let gen = crate::effects::shader_generation();
-    if let Some(cached) = renderer.egl_context().user_data().get::<RoundedProgram>() {
+    if let Some(cached) = renderer.egl_context().user_data().get::<ProgramSlot<M>>() {
         let (cached_gen, ref prog) = *cached.0.borrow();
         if cached_gen == gen {
             return Some(prog.clone());
         }
     }
-    let src = crate::effects::load_shader("rounded.frag", SHADER);
+    let src = crate::effects::load_shader(file, fallback);
     let compiled = renderer
-        .compile_custom_texture_shader(
-            &src,
-            &[
-                UniformName::new("size", UniformType::_2f),
-                UniformName::new("radius", UniformType::_1f),
-                UniformName::new("corners", UniformType::_4f),
-                UniformName::new("src_off", UniformType::_2f),
-                UniformName::new("src_scale", UniformType::_2f),
-                UniformName::new("rim", UniformType::_4f),
-                UniformName::new("rim_width", UniformType::_1f),
-            ],
-        )
-        .map_err(|e| tracing::error!("failed to compile rounded-corner shader: {e:?}"))
+        .compile_custom_texture_shader(&src, &uniforms(glass))
+        .map_err(|e| tracing::error!("failed to compile {file}: {e:?}"))
         .ok();
     let ud = renderer.egl_context().user_data();
-    match (compiled, ud.get::<RoundedProgram>()) {
+    match (compiled, ud.get::<ProgramSlot<M>>()) {
         (Some(program), Some(cached)) => {
             *cached.0.borrow_mut() = (gen, program.clone());
             Some(program)
         }
         (Some(program), None) => {
-            ud.insert_if_missing(|| RoundedProgram(RefCell::new((gen, program.clone()))));
+            ud.insert_if_missing(|| ProgramSlot::<M>(RefCell::new((gen, program.clone())), std::marker::PhantomData));
             Some(program)
         }
         (None, Some(cached)) => {
@@ -60,6 +68,18 @@ pub fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
         }
         (None, None) => None,
     }
+}
+
+/// Compile (once per GL context, or again after `reload_shaders`) and return
+/// the rounded-corner program.
+pub fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
+    cached::<RoundedMarker>(renderer, "rounded.frag", SHADER, false)
+}
+
+/// The Liquid Glass program: the rounded-corner interface plus a `glass`
+/// uniform (see [`RoundedElement::with_glass`]).
+pub fn glass_program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
+    cached::<GlassMarker>(renderer, "liquid_glass.frag", GLASS_SHADER, true)
 }
 
 /// Which corners to round (top-left, top-right, bottom-right, bottom-left).
@@ -83,6 +103,8 @@ pub struct RoundedElement<E = WaylandSurfaceRenderElement<GlesRenderer>> {
     rim: (f32, f32, f32, f32),
     /// rim thickness in physical pixels
     rim_width: f32,
+    /// Liquid Glass parameters, for the [`glass_program`] only
+    glass: Option<(f32, f32, f32, f32)>,
 }
 
 impl<E> RoundedElement<E> {
@@ -96,7 +118,16 @@ impl<E> RoundedElement<E> {
             tex_size: None,
             rim: (0.0, 0.0, 0.0, 0.0),
             rim_width: 1.0,
+            glass: None,
         }
+    }
+
+    /// Liquid Glass parameters (the program must be [`glass_program`]):
+    /// bezel width and refraction depth in physical px, specular strength
+    /// (0..1) and transparency (0 = frosted .. 1 = clear).
+    pub fn with_glass(mut self, bezel: f32, depth: f32, specular: f32, transparency: f32) -> Self {
+        self.glass = Some((bezel, depth, specular, transparency));
+        self
     }
 
     /// The inner element samples `src` out of a texture of this size (buffer px).
@@ -188,18 +219,19 @@ impl<E: RenderElement<GlesRenderer>> RenderElement<GlesRenderer> for RoundedElem
             ),
             None => ((0.0, 0.0), (1.0, 1.0)),
         };
-        frame.override_default_tex_program(
-            self.program.clone(),
-            vec![
-                Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
-                Uniform::new("radius", self.radius),
-                Uniform::new("corners", (f(c[0]), f(c[1]), f(c[2]), f(c[3]))),
-                Uniform::new("src_off", off),
-                Uniform::new("src_scale", scale),
-                Uniform::new("rim", self.rim),
-                Uniform::new("rim_width", self.rim_width),
-            ],
-        );
+        let mut uniforms = vec![
+            Uniform::new("size", (dst.size.w as f32, dst.size.h as f32)),
+            Uniform::new("radius", self.radius),
+            Uniform::new("corners", (f(c[0]), f(c[1]), f(c[2]), f(c[3]))),
+            Uniform::new("src_off", off),
+            Uniform::new("src_scale", scale),
+            Uniform::new("rim", self.rim),
+            Uniform::new("rim_width", self.rim_width),
+        ];
+        if let Some(glass) = self.glass {
+            uniforms.push(Uniform::new("glass", glass));
+        }
+        frame.override_default_tex_program(self.program.clone(), uniforms);
         let res = RenderElement::<GlesRenderer>::draw(&self.inner, frame, src, dst, damage, opaque_regions);
         frame.clear_tex_program_override();
         res

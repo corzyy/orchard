@@ -68,10 +68,12 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
                 return;
             }
             self.dragged = true;
-            // dragging a tiled / zoomed window away gives it its old size back
-            if let Some(loc) = data.restore_for_drag(&self.window, event.location) {
-                self.initial_window_location = loc;
-                self.start_data.location = event.location;
+            // dragging a tiled / zoomed window away gives it its old size back (floating mode only)
+            if !data.is_tiling_mode() {
+                if let Some(loc) = data.restore_for_drag(&self.window, event.location) {
+                    self.initial_window_location = loc;
+                    self.start_data.location = event.location;
+                }
             }
         }
 
@@ -80,7 +82,9 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
 
         data.space
             .map_element(self.window.clone(), new_location.to_i32_round(), true);
-        self.tile = data.update_tile_preview(&self.window, event.location, self.initial_window_location, self.tile);
+        if !data.is_tiling_mode() {
+            self.tile = data.update_tile_preview(&self.window, event.location, self.initial_window_location, self.tile);
+        }
     }
 
     fn relative_motion(
@@ -102,7 +106,13 @@ impl<BackendData: Backend> PointerGrab<OrchardState<BackendData>> for PointerMov
         handle.button(data, event);
         if handle.current_pressed().is_empty() {
             data.clear_tile_preview();
-            if let Some((tile, area)) = self.tile.take() {
+            if data.is_tiling_mode() {
+                if self.dragged {
+                    let window = self.window.clone();
+                    let pointer = data.pointer.current_location();
+                    data.dwindle_drop_drag(&window, pointer);
+                }
+            } else if let Some((tile, area)) = self.tile.take() {
                 let window = self.window.clone();
                 data.tile_window_in(&window, tile, area);
             }

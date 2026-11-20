@@ -192,6 +192,8 @@ pub struct OrchardState<BackendData: Backend + 'static> {
     pub ipc: crate::ipc::IpcState,
     /// Spaces (virtual desktops) per output.
     pub spaces: crate::spaces::Spaces,
+    /// Hyprland-style dwindle tiling state (per output & Space).
+    pub dwindle: crate::tiling::DwindleState,
     /// Mission Control / App Exposé while open.
     pub mc: Option<crate::mission_control::MissionControl>,
     /// headless tests: act as if Super were held for mouse buttons
@@ -517,12 +519,38 @@ impl<BackendData: Backend> XdgDecorationHandler for OrchardState<BackendData> {
 }
 delegate_xdg_decoration!(@<BackendData: Backend + 'static> OrchardState<BackendData>);
 
+/// Per-surface KDE server-decoration preference, stored in `WlSurface`'s `data_map`
+/// so requests arriving before `xdg_surface.get_toplevel` (e.g. Ghostty / GTK4)
+/// are still applied when `XdgShellHandler::new_toplevel` runs.
+struct KdeDecorationPref(std::sync::Mutex<Option<bool>>);
+
+pub(crate) fn kde_decoration_pref(surface: &WlSurface) -> Option<bool> {
+    smithay::wayland::compositor::with_states(surface, |states| {
+        states
+            .data_map
+            .get::<KdeDecorationPref>()
+            .and_then(|p| *p.0.lock().ok()?)
+    })
+}
+
 impl<BackendData: Backend> OrchardState<BackendData> {
     /// Apply a KDE server-decoration choice to the surface's xdg toplevel.
     /// Only the pending xdg configure state changes; `ack_configure` then
     /// flips the window's SSD flag exactly as it does for xdg-decoration.
     fn apply_kde_decoration(&mut self, surface: &WlSurface, server_side: bool) {
         use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+        if surface.is_alive() {
+            smithay::wayland::compositor::with_states(surface, |states| {
+                states
+                    .data_map
+                    .insert_if_missing_threadsafe(|| KdeDecorationPref(std::sync::Mutex::new(None)));
+                if let Some(pref) = states.data_map.get::<KdeDecorationPref>() {
+                    if let Ok(mut g) = pref.0.lock() {
+                        *g = Some(server_side);
+                    }
+                }
+            });
+        }
         let Some(toplevel) = self
             .xdg_shell_state
             .toplevel_surfaces()
@@ -866,6 +894,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             fx: Default::default(),
             ipc: Default::default(),
             spaces: Default::default(),
+            dwindle: crate::tiling::DwindleState::new(crate::settings::get().windows.tiling_mode),
             mc: None,
             fake_logo: false,
             switcher: None,

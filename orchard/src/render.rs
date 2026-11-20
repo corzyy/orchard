@@ -114,6 +114,9 @@ struct PendingBackdrop {
     region: Rectangle<i32, Physical>,
     radius: f32,
     alpha: f32,
+    /// a shell panel, drawn in the chosen blur style (client-requested
+    /// window blur always stays plain frosted glass)
+    panel: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -195,6 +198,7 @@ fn layer_elements_filtered(
                     region,
                     radius: (rect.radius * scale) as f32,
                     alpha: rect.alpha.clamp(0.0, 1.0) as f32,
+                    panel: true,
                 });
             }
         }
@@ -220,10 +224,19 @@ fn resolve_backdrops(
     fx.blur.evict(now);
     let program = crate::effects::rounded::program(renderer);
     let live = crate::settings::effective_live_blur();
+    let appearance = &crate::settings::get().appearance;
+    let clarity = appearance.glass_transparency();
+    let liquid = appearance.blur_style == orchard_config::BlurStyle::LiquidGlass && !appearance.reduce_transparency;
+    let glass_program = if liquid { crate::effects::rounded::glass_program(renderer) } else { None };
+    // Liquid Glass is clearer: fewer blur passes the more transparent it is
+    let glass_iterations =
+        crate::effects::blur::MIN_ITERATIONS + ((1.0 - clarity) * 2.0).round() as u32;
     for p in pending.into_iter().rev() {
+        let glass = glass_program.as_ref().filter(|_| p.panel);
+        let iterations = if glass.is_some() { glass_iterations } else { crate::effects::blur::ITERATIONS };
         let blurred = if live {
             fx.blur
-                .backdrop(renderer, &p.id, p.region, mode_size, &out[p.index..], scale, p.alpha, clear, now)
+                .backdrop(renderer, &p.id, p.region, mode_size, &out[p.index..], scale, p.alpha, clear, now, iterations)
                 .map(|(tex, size)| (tex, (size.w as f64, size.h as f64)))
         } else {
             None
@@ -234,11 +247,24 @@ fn resolve_backdrops(
             Some((tex, (wp.blurred_size.w as f64, wp.blurred_size.h as f64)))
         });
         let Some((tex, (tw, th))) = blurred else { continue };
-        let el = match &program {
-            Some(prog) => OutputRenderElements::Backdrop(
+        let el = match (glass, &program) {
+            (Some(prog), _) => {
+                let short = p.region.size.w.min(p.region.size.h) as f32;
+                let s = scale as f32;
+                // the bezel follows the corner curve, but stays a rim on
+                // square or very large panels
+                let bezel = (p.radius * 0.9).max(6.0 * s).min(short * 0.45).min(28.0 * s);
+                let depth = bezel * 0.55;
+                OutputRenderElements::Backdrop(
+                    RoundedElement::new(tex, prog.clone(), p.radius, Corners::ALL)
+                        .with_texture_size(tw, th)
+                        .with_glass(bezel, depth, 0.30 + 0.25 * clarity, clarity),
+                )
+            }
+            (None, Some(prog)) => OutputRenderElements::Backdrop(
                 RoundedElement::new(tex, prog.clone(), p.radius, Corners::ALL).with_texture_size(tw, th),
             ),
-            None => OutputRenderElements::Texture(tex),
+            (None, None) => OutputRenderElements::Texture(tex),
         };
         out.insert(p.index, el);
     }
@@ -1136,6 +1162,7 @@ fn output_elements_inner(
                 region: phys,
                 radius,
                 alpha: 1.0,
+                panel: true,
             });
         }
     }
@@ -1180,6 +1207,7 @@ fn output_elements_inner(
                         region: rect,
                         radius,
                         alpha,
+                        panel: false,
                     });
                 }
             }

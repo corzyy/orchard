@@ -33,6 +33,7 @@ pub enum Accent {
     Yellow,
     Green,
     Graphite,
+    Wallpaper,
 }
 
 impl Accent {
@@ -57,6 +58,7 @@ impl Accent {
             Accent::Yellow => [0xFC, 0xB8, 0x27],
             Accent::Green => [0x62, 0xBA, 0x46],
             Accent::Graphite => [0x8C, 0x8C, 0x8C],
+            Accent::Wallpaper => [0x6D, 0x6B, 0xC4],
         }
     }
     pub fn name(self) -> &'static str {
@@ -69,6 +71,7 @@ impl Accent {
             Accent::Yellow => "Yellow",
             Accent::Green => "Green",
             Accent::Graphite => "Graphite",
+            Accent::Wallpaper => "Wallpaper",
         }
     }
 }
@@ -78,10 +81,16 @@ impl Accent {
 pub struct AppearanceSettings {
     pub mode: ThemeMode,
     pub accent: Accent,
+    /// Accent colour extracted from the current wallpaper when `accent == Accent::Wallpaper`.
+    pub wallpaper_accent: Option<[u8; 3]>,
     /// Replace spring / genie / slide animations with quick fades.
     pub reduce_motion: bool,
     /// Draw panels with solid colours instead of frosted glass.
     pub reduce_transparency: bool,
+    /// Look of the glass behind the menu bar, Dock, menus and popups.
+    pub blur_style: BlurStyle,
+    /// Liquid Glass transparency, 0.0 (frosted) ..= 1.0 (clear).
+    pub glass_transparency: f32,
     /// Window corner radius in logical px.
     pub corner_radius: f32,
     /// Icon theme for Orchard and the apps running in it.
@@ -98,6 +107,13 @@ pub const DEFAULT_ICON_THEME: &str = "Adwaita";
 pub const DEFAULT_CURSOR_THEME: &str = "Adwaita";
 
 impl AppearanceSettings {
+    /// Effective sRGB accent colour (using `wallpaper_accent` when `accent == Accent::Wallpaper`).
+    pub fn accent_rgb(&self) -> [u8; 3] {
+        match self.accent {
+            Accent::Wallpaper => self.wallpaper_accent.unwrap_or_else(|| Accent::Wallpaper.rgb()),
+            other => other.rgb(),
+        }
+    }
     pub fn icon_theme(&self) -> &str {
         self.icon_theme.as_deref().filter(|t| !t.is_empty()).unwrap_or(DEFAULT_ICON_THEME)
     }
@@ -107,6 +123,30 @@ impl AppearanceSettings {
     pub fn cursor_size(&self) -> u32 {
         if (8..=256).contains(&self.cursor_size) { self.cursor_size } else { 24 }
     }
+    /// [`Self::glass_transparency`], clamped to 0..=1.
+    pub fn glass_transparency(&self) -> f32 {
+        if self.glass_transparency.is_finite() { self.glass_transparency.clamp(0.0, 1.0) } else { 0.5 }
+    }
+}
+
+/// How shell panels render the desktop behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlurStyle {
+    /// Dual Kawase frosted glass.
+    #[default]
+    Kawase,
+    /// Lighter blur with refracting edges and a specular rim (macOS Tahoe).
+    LiquidGlass,
+}
+
+impl BlurStyle {
+    pub fn name(self) -> &'static str {
+        match self {
+            BlurStyle::Kawase => "Kawase",
+            BlurStyle::LiquidGlass => "Liquid Glass",
+        }
+    }
 }
 
 impl Default for AppearanceSettings {
@@ -114,8 +154,11 @@ impl Default for AppearanceSettings {
         Self {
             mode: ThemeMode::Auto,
             accent: Accent::Blue,
+            wallpaper_accent: None,
             reduce_motion: false,
             reduce_transparency: false,
+            blur_style: BlurStyle::Kawase,
+            glass_transparency: 0.5,
             corner_radius: 10.0,
             icon_theme: None,
             cursor_theme: None,
@@ -139,6 +182,96 @@ pub enum TitlebarDoubleClick {
     Zoom,
     Minimize,
     Nothing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TilingMode {
+    #[default]
+    Floating,
+    Tiling,
+}
+
+/// Where a new window goes in Tiling mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NewWindowPlacement {
+    /// Splits the focused window.
+    #[default]
+    Focused,
+    /// Goes to the end of the layout (the tail of the spiral).
+    Last,
+}
+
+/// Which way Tiling mode splits a pane for a new window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitDirection {
+    /// Along the longer side of the pane (dwindle).
+    #[default]
+    Auto,
+    /// Side by side.
+    Horizontal,
+    /// Stacked.
+    Vertical,
+}
+
+/// Floating-mode snapping and Tiling-mode layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TilingSettings {
+    // ---- shared
+    /// Margin between tiles and the screen edges, logical px.
+    pub outer_gap: i32,
+    /// Space between two tiles, logical px.
+    pub inner_gap: i32,
+    // ---- floating
+    /// Dragging a window against a screen edge tiles it.
+    pub snap_to_edges: bool,
+    /// Show the translucent drop preview while dragging.
+    pub snap_preview: bool,
+    /// Corners give quarter tiles.
+    pub snap_corners: bool,
+    /// How close to the edge (px) the pointer must get to snap.
+    pub edge_zone: i32,
+    // ---- tiling
+    /// No gaps when a display has a single window.
+    pub smart_gaps: bool,
+    /// Share of a pane the existing window keeps when it splits, 0.3..=0.7.
+    pub split_ratio: f32,
+    pub split_direction: SplitDirection,
+    pub new_window: NewWindowPlacement,
+}
+
+impl TilingSettings {
+    pub const GAP_MAX: i32 = 48;
+
+    /// The values the compositor works with: everything within its range.
+    pub fn clamped(&self) -> Self {
+        let mut t = self.clone();
+        t.outer_gap = t.outer_gap.clamp(0, Self::GAP_MAX);
+        t.inner_gap = t.inner_gap.clamp(0, Self::GAP_MAX);
+        t.edge_zone = t.edge_zone.clamp(8, 120);
+        t.split_ratio = if t.split_ratio.is_finite() { t.split_ratio.clamp(0.3, 0.7) } else { 0.5 };
+        t
+    }
+}
+
+impl Default for TilingSettings {
+    fn default() -> Self {
+        Self {
+            outer_gap: 8,
+            inner_gap: 8,
+            snap_to_edges: true,
+            snap_preview: true,
+            snap_corners: true,
+            edge_zone: 32,
+            smart_gaps: false,
+            split_ratio: 0.5,
+            split_direction: SplitDirection::Auto,
+            new_window: NewWindowPlacement::Focused,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -233,6 +366,7 @@ pub struct MenuBarSettings {
     pub show_network: bool,
     pub show_volume: bool,
     pub show_battery: bool,
+    pub show_tiling: bool,
 }
 
 impl Default for MenuBarSettings {
@@ -246,6 +380,7 @@ impl Default for MenuBarSettings {
             show_network: true,
             show_volume: true,
             show_battery: true,
+            show_tiling: true,
         }
     }
 }
@@ -258,6 +393,8 @@ pub struct WindowSettings {
     pub focus_follows_mouse: bool,
     /// Show files and folders from ~/Desktop on the desktop background.
     pub show_desktop_icons: bool,
+    /// Window layout mode: Floating (macOS-style) or Tiling (dwindle).
+    pub tiling_mode: TilingMode,
 }
 
 impl Default for WindowSettings {
@@ -266,6 +403,7 @@ impl Default for WindowSettings {
             double_click_titlebar: TitlebarDoubleClick::Zoom,
             focus_follows_mouse: false,
             show_desktop_icons: true,
+            tiling_mode: TilingMode::Floating,
         }
     }
 }
@@ -445,10 +583,107 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            terminal: "konsole".into(),
+            terminal: String::new(),
             run_autostart: true,
         }
     }
+}
+
+/// True if the first token of `cmd` is an existing executable on `PATH` (or an absolute path).
+pub fn command_in_path(cmd: &str) -> bool {
+    let Some(bin) = cmd.split_whitespace().next() else {
+        return false;
+    };
+    if bin.starts_with('/') {
+        return std::path::Path::new(bin).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// First installed terminal emulator (no KDE dependency).
+pub fn default_terminal() -> String {
+    const CANDIDATES: &[&str] = &[
+        "ghostty",
+        "kitty",
+        "alacritty",
+        "foot",
+        "wezterm",
+        "ptyxis",
+        "gnome-terminal",
+        "xfce4-terminal",
+        "kgx",
+        "xterm",
+    ];
+    for &c in CANDIDATES {
+        if command_in_path(c) {
+            return c.to_string();
+        }
+    }
+    for app in desktop::applications() {
+        if app.categories().iter().any(|c| c == "TerminalEmulator") {
+            if let Some(cmd) = app.command() {
+                if let Some(bin) = cmd.split_whitespace().next() {
+                    if command_in_path(bin) {
+                        return bin.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "xterm".to_string()
+}
+
+/// Resolve the terminal command: `ORCHARD_TERMINAL` env var, then `configured`
+/// (if non-empty and installed), then [`default_terminal`].
+pub fn resolve_terminal(configured: &str) -> String {
+    if let Ok(env) = std::env::var("ORCHARD_TERMINAL") {
+        let t = env.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    let t = configured.trim();
+    if !t.is_empty() && command_in_path(t) {
+        return t.to_string();
+    }
+    default_terminal()
+}
+
+/// Build a shell command line that executes `args` inside `terminal`.
+pub fn terminal_exec(terminal: &str, args: &str) -> String {
+    let bin = terminal.split_whitespace().next().unwrap_or(terminal);
+    let base = bin.rsplit('/').next().unwrap_or(bin);
+    match base {
+        "gnome-terminal" | "ptyxis" | "kgx" => format!("{terminal} -- {args}"),
+        "wezterm" => format!("{terminal} start -- {args}"),
+        _ => format!("{terminal} -e {args}"),
+    }
+}
+
+/// Best available system monitor command (GUI first, else a TUI monitor in the terminal).
+pub fn system_monitor_command() -> String {
+    const GUI: &[&str] = &[
+        "missioncenter",
+        "resources",
+        "gnome-system-monitor",
+        "xfce4-taskmanager",
+        "mate-system-monitor",
+        "lxtask",
+    ];
+    for &c in GUI {
+        if command_in_path(c) {
+            return c.to_string();
+        }
+    }
+    let term = resolve_terminal(&Settings::load().apps.terminal);
+    for &tui in &["btop", "htop", "top"] {
+        if command_in_path(tui) {
+            return terminal_exec(&term, tui);
+        }
+    }
+    terminal_exec(&term, "top")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -538,6 +773,7 @@ pub struct Settings {
     pub dock: DockSettings,
     pub menu_bar: MenuBarSettings,
     pub windows: WindowSettings,
+    pub tiling: TilingSettings,
     pub keyboard: KeyboardSettings,
     pub pointer: PointerSettings,
     pub desktop: DesktopSettings,
@@ -774,5 +1010,33 @@ mod tests {
         s.performance.apply_preset(PerformancePreset::PowerSaver);
         assert!(!s.performance.live_blur);
         assert!(s.performance.battery_saver);
+    }
+
+    #[test]
+    fn wallpaper_accent_round_trips_and_resolves() {
+        let mut s = Settings::default();
+        assert_eq!(s.appearance.accent_rgb(), Accent::Blue.rgb());
+
+        s.appearance.accent = Accent::Wallpaper;
+        assert_eq!(s.appearance.accent_rgb(), Accent::Wallpaper.rgb());
+
+        s.appearance.wallpaper_accent = Some([0xE8, 0x5A, 0x3C]);
+        assert_eq!(s.appearance.accent_rgb(), [0xE8, 0x5A, 0x3C]);
+
+        let json = serde_json::to_string(&s).unwrap();
+        let (loaded, problems) = Settings::from_json_lenient(&json);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(loaded.appearance.accent, Accent::Wallpaper);
+        assert_eq!(loaded.appearance.wallpaper_accent, Some([0xE8, 0x5A, 0x3C]));
+        assert_eq!(loaded.appearance.accent_rgb(), [0xE8, 0x5A, 0x3C]);
+    }
+
+    #[test]
+    fn terminal_exec_formats_by_emulator() {
+        assert_eq!(terminal_exec("kitty", "less +G /tmp/log"), "kitty -e less +G /tmp/log");
+        assert_eq!(terminal_exec("ghostty", "htop"), "ghostty -e htop");
+        assert_eq!(terminal_exec("gnome-terminal", "htop"), "gnome-terminal -- htop");
+        assert_eq!(terminal_exec("ptyxis", "htop"), "ptyxis -- htop");
+        assert_eq!(terminal_exec("wezterm", "htop"), "wezterm start -- htop");
     }
 }

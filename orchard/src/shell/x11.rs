@@ -87,7 +87,11 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
             if !window.is_override_redirect() {
                 self.animate_close(&elem);
             }
-            self.space.unmap_elem(&elem)
+            self.space.unmap_elem(&elem);
+            if !window.is_override_redirect() && self.is_tiling_mode() {
+                self.dwindle.remove_everywhere(elem.ipc_id().0);
+                self.retile_all();
+            }
         }
         self.minimized
             .retain(|e| !matches!(e.0.x11_surface(), Some(w) if w == &window));

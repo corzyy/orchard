@@ -48,14 +48,14 @@ use crate::{
 };
 
 const VERSION: u32 = 3;
-/// how often pending `copy_with_damage` requests look for new damage
-const POLL: Duration = Duration::from_millis(8);
 
 pub struct ScreencopyState {
     _global: GlobalId,
     pending: Vec<PendingCopy>,
     /// one damage tracker per (output, client): damage since that client's last frame
     trackers: HashMap<(String, ClientId), OutputDamageTracker>,
+    /// reusable offscreen texture for SHM readbacks (avoids 33 MB VRAM alloc/free per frame)
+    shm_tex: Option<(Size<i32, smithay::utils::Buffer>, GlesTexture)>,
     polling: bool,
 }
 
@@ -72,6 +72,7 @@ impl ScreencopyState {
             _global: global,
             pending: Vec::new(),
             trackers: HashMap::new(),
+            shm_tex: None,
             polling: false,
         }
     }
@@ -248,7 +249,7 @@ fn buffer_fits(buffer: &WlBuffer, info: &FrameInfo) -> bool {
 // ---- rendering --------------------------------------------------------------
 
 /// Cursor elements for a recording of `output` (if the pointer is on it).
-fn cursor_elements(
+pub(crate) fn cursor_elements(
     space_geo: Option<Rectangle<i32, Logical>>,
     pos: Point<f64, Logical>,
     status: &CursorImageStatus,
@@ -284,6 +285,13 @@ fn cursor_elements(
 }
 
 impl<B: Backend + 'static> OrchardState<B> {
+    /// Notify pending `copy_with_damage` requests after an output renders.
+    pub fn screencopy_notify_damage(&mut self) {
+        if self.screencopy.as_ref().is_some_and(|sc| !sc.pending.is_empty()) {
+            self.screencopy_process();
+        }
+    }
+
     fn screencopy_queue(&mut self, copy: PendingCopy) {
         let Some(sc) = self.screencopy.as_mut() else {
             copy.frame.failed();
@@ -294,9 +302,11 @@ impl<B: Backend + 'static> OrchardState<B> {
             sc.polling = true;
             let res = self.handle.insert_source(Timer::immediate(), |_, _, state| {
                 state.screencopy_process();
+                // `copy_with_damage` waits for compositor damage notifications instead of
+                // polling at 125 Hz; only keep a gentle fallback timer if any remain.
                 let more = state.screencopy.as_ref().map(|s| !s.pending.is_empty()).unwrap_or(false);
                 if more {
-                    TimeoutAction::ToDuration(POLL)
+                    TimeoutAction::ToDuration(Duration::from_millis(250))
                 } else {
                     if let Some(sc) = state.screencopy.as_mut() {
                         sc.polling = false;
@@ -391,6 +401,7 @@ impl<B: Backend + 'static> OrchardState<B> {
             locked: self.protocols.locked,
             lock_surface: crate::protocols::lock_surface_of(&output),
         };
+        let mut shm_tex = self.screencopy.as_mut().and_then(|sc| sc.shm_tex.take());
         let info = copy.info.clone();
         let buffer = copy.buffer.clone();
         let result = self.backend_data.with_renderer(|renderer: &mut GlesRenderer| -> Result<Option<Vec<Rectangle<i32, Physical>>>, String> {
@@ -432,10 +443,17 @@ impl<B: Backend + 'static> OrchardState<B> {
                 return Ok(Some(damage));
             }
 
-            // shm: render offscreen, read back, swizzle RGBA -> XRGB (BGRX bytes)
-            let size = (info.output_size.w, info.output_size.h).into();
-            let mut texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size).map_err(|e| e.to_string())?;
-            let mut target = renderer.bind(&mut texture).map_err(|e| e.to_string())?;
+            // shm: render offscreen into reusable texture, read back, swizzle RGBA -> XRGB (BGRX bytes)
+            let size: Size<i32, smithay::utils::Buffer> = (info.output_size.w, info.output_size.h).into();
+            let texture = match shm_tex.as_mut() {
+                Some((sz, tex)) if *sz == size => tex,
+                _ => {
+                    let tex: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, size).map_err(|e| e.to_string())?;
+                    shm_tex = Some((size, tex));
+                    &mut shm_tex.as_mut().unwrap().1
+                }
+            };
+            let mut target = renderer.bind(texture).map_err(|e| e.to_string())?;
             let mut t = OutputDamageTracker::new(info.output_size, scale, Transform::Normal);
             t.render_output(renderer, &mut target, 0, &elements, clear)
                 .map_err(|e| format!("render: {e:?}"))?;
@@ -469,6 +487,9 @@ impl<B: Backend + 'static> OrchardState<B> {
             Ok(Some(damage))
         });
 
+        if let Some(sc) = self.screencopy.as_mut() {
+            sc.shm_tex = shm_tex;
+        }
         if let (Some(key), Some(t)) = (tracker_key, tracker) {
             if let Some(sc) = self.screencopy.as_mut() {
                 sc.trackers.insert(key, t);

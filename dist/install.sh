@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build Orchard in release mode and install it as a login session.
-# Plasma stays available; pick "Orchard" in the SDDM session menu.
+# Pick "Orchard" in your display manager's session menu.
 #
 #   dist/install.sh        copy the binaries to /usr/local/bin
 #   dist/install.sh --dev  symlink /usr/local/bin/orchard* to target/release,

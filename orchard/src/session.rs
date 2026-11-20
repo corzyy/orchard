@@ -13,11 +13,11 @@
 //! and undo 1 + 2 on a clean exit. Headless / nested runs never touch the user's
 //! session (they could be running inside Plasma).
 //!
-//! Apps are themed from Orchard's settings, not Plasma's: the session gets its
-//! own dconf database (`DCONF_PROFILE`, seeded once from the user database), so
-//! the icon / pointer theme and dark mode Orchard writes there reach GTK apps and
-//! the settings portal without changing Plasma; Qt apps use the GTK platform
-//! theme (which reads the same settings) with the Breeze widget style.
+//! Apps are themed from Orchard's settings: the session gets its own dconf
+//! database (`DCONF_PROFILE`, seeded once from the user database), so the icon /
+//! pointer theme and dark mode Orchard writes there reach GTK apps and the
+//! settings portal without changing other sessions; Qt apps use the GTK platform
+//! theme (which reads the same settings).
 
 use std::{
     collections::HashSet,
@@ -45,18 +45,18 @@ After=graphical-session-pre.target
 PropagatesStopTo=graphical-session.target
 ";
 
-/// Portal backends for XDG_CURRENT_DESKTOP=Orchard. KDE's backend gives the
-/// Qt file dialog etc.; GTK reads `org.gnome.desktop.interface color-scheme`,
-/// which Orchard keeps in sync, so it answers the appearance setting first.
+/// Portal backends for XDG_CURRENT_DESKTOP=Orchard. GTK handles file dialogs
+/// and `org.gnome.desktop.interface color-scheme` (which Orchard keeps in sync);
+/// Hyprland's portal handles ScreenCast/Screenshot via wlr-screencopy.
 /// First line of a portal config Orchard may replace with a newer version.
 const MANAGED: &str = "# Written by Orchard (managed: delete this line to keep your edits).";
 
 const PORTALS_CONF: &str = "\
 # Written by Orchard (managed: delete this line to keep your edits).
 [preferred]
-default=kde;gtk
-org.freedesktop.impl.portal.Settings=gtk;kde
-org.freedesktop.impl.portal.Secret=kwallet
+default=gtk
+org.freedesktop.impl.portal.Settings=gtk
+org.freedesktop.impl.portal.Secret=gnome-keyring
 org.freedesktop.impl.portal.ScreenCast=hyprland
 org.freedesktop.impl.portal.Screenshot=hyprland
 ";
@@ -200,9 +200,8 @@ pub fn set_env_defaults() {
     // Apps follow Orchard's settings, kept in Orchard's own dconf database.
     let own_dconf = std::env::var_os("DCONF_PROFILE").is_none() && setup_dconf();
     set_cursor_env(&crate::settings::get());
-    // Qt: the GTK platform theme reads icon theme, dark mode and fonts from that
-    // database (the Plasma platform theme would read Plasma's kdeglobals instead);
-    // keep the Breeze widget style.
+    // Qt: the GTK platform theme reads icon theme, dark mode and fonts from
+    // Orchard's dconf database without needing any KDE theme packages.
     let plugin = |dir: &str, file: &str| {
         ["/usr/lib64/qt6/plugins", "/usr/lib/qt6/plugins"]
             .iter()
@@ -210,9 +209,6 @@ pub fn set_env_defaults() {
     };
     if own_dconf && std::env::var_os("QT_QPA_PLATFORMTHEME").is_none() && plugin("platformthemes", "libqgtk3.so") {
         std::env::set_var("QT_QPA_PLATFORMTHEME", "gtk3");
-        if std::env::var_os("QT_STYLE_OVERRIDE").is_none() && plugin("styles", "breeze6.so") {
-            std::env::set_var("QT_STYLE_OVERRIDE", "Breeze");
-        }
     }
 }
 

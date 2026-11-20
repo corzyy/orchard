@@ -6,11 +6,12 @@ use orchard_config::{
     CornerAction, DockAutohide, DockPosition, MinimizeEffect, Settings, TitlebarDoubleClick,
 };
 
+use iced::widget::column;
+use orchard_ui::{choices, form};
+
 use crate::{
-    pages::appearance::draw_mini_desktop,
+    pages::{art, edit, act, loading, some, El},
     sys::{Bg, Wake},
-    theme::{rgb, Weight},
-    ui::{Rect, Ui},
 };
 
 #[derive(Default)]
@@ -40,167 +41,215 @@ fn corner_from_key(k: &str) -> CornerAction {
     }
 }
 
-pub fn desktop_dock(ui: &mut Ui, s: &mut Settings) {
-    ui.section("Dock");
-    ui.group("dock-main", |ui| {
-        let mut size = s.dock.icon_size as f64;
-        if ui.row_slider("dock-size", "Size", None, &mut size, 32.0, 96.0, "Small", "Large") {
-            s.dock.icon_size = size.round() as f32;
-            s.dock.magnified_size = s.dock.magnified_size.max(s.dock.icon_size);
-        }
-        ui.row_toggle("Magnification", None, &mut s.dock.magnification);
-        if s.dock.magnification {
-            let mut mag = s.dock.magnified_size as f64;
-            let lo = s.dock.icon_size as f64;
-            if ui.row_slider("dock-mag", "Magnified size", None, &mut mag, lo, 128.0, "Small", "Large") {
-                s.dock.magnified_size = mag.round() as f32;
-            }
-        }
-
-        let pos_opts = vec![
-            ("left".into(), "Left".into()),
-            ("bottom".into(), "Bottom".into()),
-            ("right".into(), "Right".into()),
-        ];
-        let cur_pos = match s.dock.position {
-            DockPosition::Left => "left",
-            DockPosition::Bottom => "bottom",
-            DockPosition::Right => "right",
-        };
-        if let Some(v) = ui.row_popup("dock-pos", "Position on screen", None, cur_pos, &pos_opts) {
-            s.dock.position = match v.as_str() {
-                "left" => DockPosition::Left,
-                "right" => DockPosition::Right,
-                _ => DockPosition::Bottom,
-            };
-        }
-
-        let eff_opts = vec![
-            ("genie".into(), "Genie Effect".into()),
-            ("scale".into(), "Scale Effect".into()),
-        ];
-        let cur_eff = match s.dock.minimize_effect {
-            MinimizeEffect::Genie => "genie",
-            MinimizeEffect::Scale => "scale",
-        };
-        if let Some(v) = ui.row_popup("min-eff", "Minimise windows using", None, cur_eff, &eff_opts) {
-            s.dock.minimize_effect = if v == "scale" { MinimizeEffect::Scale } else { MinimizeEffect::Genie };
-        }
-
-        let hide_opts = vec![
-            ("never".into(), "Never".into()),
-            ("avoid".into(), "Avoid windows".into()),
-            ("always".into(), "Always".into()),
-        ];
-        let cur_hide = match s.dock.autohide {
-            DockAutohide::Never => "never",
-            DockAutohide::AvoidWindows => "avoid",
-            DockAutohide::Always => "always",
-        };
-        if let Some(v) = ui.row_popup("dock-hide", "Hide the Dock", None, cur_hide, &hide_opts) {
-            s.dock.autohide = match v.as_str() {
-                "avoid" => DockAutohide::AvoidWindows,
-                "always" => DockAutohide::Always,
-                _ => DockAutohide::Never,
-            };
-        }
-
-        ui.row_toggle("Animate opening applications", None, &mut s.dock.animate_launch);
-        ui.row_toggle("Show indicators for open applications", None, &mut s.dock.show_indicators);
-        ui.row_toggle("Show items on desktop", None, &mut s.windows.show_desktop_icons);
-    });
-
-    ui.section("Windows");
-    ui.group("dock-win", |ui| {
-        let dbl_opts = vec![
-            ("zoom".into(), "Zoom".into()),
-            ("minimize".into(), "Minimise".into()),
-            ("nothing".into(), "Do Nothing".into()),
-        ];
-        let cur_dbl = match s.windows.double_click_titlebar {
-            TitlebarDoubleClick::Zoom => "zoom",
-            TitlebarDoubleClick::Minimize => "minimize",
-            TitlebarDoubleClick::Nothing => "nothing",
-        };
-        if let Some(v) = ui.row_popup("titlebar-dbl", "Double-click a window's title bar to", None, cur_dbl, &dbl_opts) {
-            s.windows.double_click_titlebar = match v.as_str() {
-                "minimize" => TitlebarDoubleClick::Minimize,
-                "nothing" => TitlebarDoubleClick::Nothing,
-                _ => TitlebarDoubleClick::Zoom,
-            };
-        }
-        ui.row_toggle(
-            "Focus follows pointer",
-            Some("Keyboard focus moves to the window under the pointer"),
-            &mut s.windows.focus_follows_mouse,
-        );
-    });
-
-    ui.section("Mission Control");
-    ui.group("dock-mc", |ui| {
-        ui.row_toggle(
-            "When switching to an application, switch to a Space with open windows for the application",
+pub fn desktop_dock(s: &Settings) -> El {
+    let d = &s.dock;
+    let mut dock_rows = vec![
+        form::slider_row("Size", None, 32.0..=96.0, d.icon_size as f64, 1.0, Some(("Small", "Large")), |v| {
+            edit(move |s| {
+                s.dock.icon_size = v.round() as f32;
+                s.dock.magnified_size = s.dock.magnified_size.max(s.dock.icon_size);
+            })
+        }),
+        form::toggle_row("Magnification", None, d.magnification, |v| edit(move |s| s.dock.magnification = v)),
+    ];
+    if d.magnification {
+        let lo = d.icon_size as f64;
+        dock_rows.push(form::slider_row(
+            "Magnified size",
             None,
-            &mut s.desktop.switch_space_on_activate,
-        );
-    });
+            lo..=128.0_f64.max(lo),
+            (d.magnified_size as f64).clamp(lo, 128.0_f64.max(lo)),
+            1.0,
+            Some(("Small", "Large")),
+            |v| edit(move |s| s.dock.magnified_size = v.round() as f32),
+        ));
+    }
+    let cur_pos = match d.position {
+        DockPosition::Left => "left",
+        DockPosition::Bottom => "bottom",
+        DockPosition::Right => "right",
+    };
+    let cur_eff = match d.minimize_effect {
+        MinimizeEffect::Genie => "genie",
+        MinimizeEffect::Scale => "scale",
+    };
+    let cur_hide = match d.autohide {
+        DockAutohide::Never => "never",
+        DockAutohide::AvoidWindows => "avoid",
+        DockAutohide::Always => "always",
+    };
+    dock_rows.extend([
+        form::popup_row(
+            "Position on screen",
+            None,
+            choices([("left", "Left"), ("bottom", "Bottom"), ("right", "Right")]),
+            cur_pos,
+            |v| {
+                edit(move |s| {
+                    s.dock.position = match v.as_str() {
+                        "left" => DockPosition::Left,
+                        "right" => DockPosition::Right,
+                        _ => DockPosition::Bottom,
+                    }
+                })
+            },
+        ),
+        form::popup_row(
+            "Minimise windows using",
+            None,
+            choices([("genie", "Genie Effect"), ("scale", "Scale Effect")]),
+            cur_eff,
+            |v| {
+                edit(move |s| {
+                    s.dock.minimize_effect = if v == "scale" { MinimizeEffect::Scale } else { MinimizeEffect::Genie }
+                })
+            },
+        ),
+        form::popup_row(
+            "Hide the Dock",
+            None,
+            choices([("never", "Never"), ("avoid", "Avoid windows"), ("always", "Always")]),
+            cur_hide,
+            |v| {
+                edit(move |s| {
+                    s.dock.autohide = match v.as_str() {
+                        "avoid" => DockAutohide::AvoidWindows,
+                        "always" => DockAutohide::Always,
+                        _ => DockAutohide::Never,
+                    }
+                })
+            },
+        ),
+        form::toggle_row("Animate opening applications", None, d.animate_launch, |v| {
+            edit(move |s| s.dock.animate_launch = v)
+        }),
+        form::toggle_row("Show indicators for open applications", None, d.show_indicators, |v| {
+            edit(move |s| s.dock.show_indicators = v)
+        }),
+        form::toggle_row("Show items on desktop", None, s.windows.show_desktop_icons, |v| {
+            edit(move |s| s.windows.show_desktop_icons = v)
+        }),
+    ]);
 
-    ui.section("Hot Corners");
-    let c_opts: Vec<(String, String)> = CornerAction::ALL
-        .iter()
-        .map(|a| (corner_key(*a).to_string(), a.label().to_string()))
-        .collect();
-    ui.group("hot-corners", |ui| {
-        let hc = &mut s.desktop.hot_corners;
-        if let Some(v) = ui.row_popup("hc-tl", "Top-left corner", None, corner_key(hc.top_left), &c_opts) {
-            hc.top_left = corner_from_key(&v);
-        }
-        if let Some(v) = ui.row_popup("hc-tr", "Top-right corner", None, corner_key(hc.top_right), &c_opts) {
-            hc.top_right = corner_from_key(&v);
-        }
-        if let Some(v) = ui.row_popup("hc-bl", "Bottom-left corner", None, corner_key(hc.bottom_left), &c_opts) {
-            hc.bottom_left = corner_from_key(&v);
-        }
-        if let Some(v) = ui.row_popup("hc-br", "Bottom-right corner", None, corner_key(hc.bottom_right), &c_opts) {
-            hc.bottom_right = corner_from_key(&v);
-        }
-    });
+    let cur_dbl = match s.windows.double_click_titlebar {
+        TitlebarDoubleClick::Zoom => "zoom",
+        TitlebarDoubleClick::Minimize => "minimize",
+        TitlebarDoubleClick::Nothing => "nothing",
+    };
+    let windows = form::group([
+        form::popup_row(
+            "Double-click a window's title bar to",
+            None,
+            choices([("zoom", "Zoom"), ("minimize", "Minimise"), ("nothing", "Do Nothing")]),
+            cur_dbl,
+            |v| {
+                edit(move |s| {
+                    s.windows.double_click_titlebar = match v.as_str() {
+                        "minimize" => TitlebarDoubleClick::Minimize,
+                        "nothing" => TitlebarDoubleClick::Nothing,
+                        _ => TitlebarDoubleClick::Zoom,
+                    }
+                })
+            },
+        ),
+        form::toggle_row(
+            "Focus follows pointer",
+            some("Keyboard focus moves to the window under the pointer"),
+            s.windows.focus_follows_mouse,
+            |v| edit(move |s| s.windows.focus_follows_mouse = v),
+        ),
+    ]);
+
+    let mission = form::group([form::toggle_row(
+        "When switching to an application, switch to a Space with open windows for the application",
+        None,
+        s.desktop.switch_space_on_activate,
+        |v| edit(move |s| s.desktop.switch_space_on_activate = v),
+    )]);
+
+    let c_opts = choices(CornerAction::ALL.iter().map(|a| (corner_key(*a), a.label())));
+    let hc = &s.desktop.hot_corners;
+    type Pick = fn(&mut orchard_config::HotCorners) -> &mut CornerAction;
+    let corner = |label: &'static str, cur: CornerAction, pick: Pick| {
+        form::popup_row(label, None, c_opts.clone(), corner_key(cur), move |v| {
+            edit(move |s| *pick(&mut s.desktop.hot_corners) = corner_from_key(&v))
+        })
+    };
+    let corners = form::group([
+        corner("Top-left corner", hc.top_left, |h| &mut h.top_left),
+        corner("Top-right corner", hc.top_right, |h| &mut h.top_right),
+        corner("Bottom-left corner", hc.bottom_left, |h| &mut h.bottom_left),
+        corner("Bottom-right corner", hc.bottom_right, |h| &mut h.bottom_right),
+    ]);
+
+    column![
+        form::section("Dock"),
+        form::group(dock_rows),
+        form::section("Windows"),
+        windows,
+        form::section("Mission Control"),
+        mission,
+        form::section("Hot Corners"),
+        corners,
+    ]
+    .into()
 }
 
 // ---------------------------------------------------------------- Menu Bar
 
-pub fn menu_bar(ui: &mut Ui, s: &mut Settings) {
-    ui.section("Status Icons");
-    ui.group("mb-icons", |ui| {
-        ui.row_toggle("Network", Some("Show Wi‑Fi or Ethernet in Menu Bar"), &mut s.menu_bar.show_network);
-        ui.row_toggle("Sound", Some("Show Volume in Menu Bar"), &mut s.menu_bar.show_volume);
-        ui.row_toggle("Battery", Some("Show Battery in Menu Bar"), &mut s.menu_bar.show_battery);
-        ui.row_toggle("Show battery percentage", None, &mut s.menu_bar.battery_percentage);
-    });
-
-    ui.section("Clock");
-    ui.group("mb-clock", |ui| {
-        let fmt_opts = vec![
-            ("auto".into(), "Automatic (from region)".into()),
-            ("12".into(), "12-hour".into()),
-            ("24".into(), "24-hour".into()),
-        ];
-        let cur = match s.menu_bar.clock_24h {
-            None => "auto",
-            Some(false) => "12",
-            Some(true) => "24",
-        };
-        if let Some(v) = ui.row_popup("clock-24h", "Time format", None, cur, &fmt_opts) {
-            s.menu_bar.clock_24h = match v.as_str() {
-                "12" => Some(false),
-                "24" => Some(true),
-                _ => None,
-            };
-        }
-        ui.row_toggle("Show date", None, &mut s.menu_bar.show_date);
-        ui.row_toggle("Show day of the week", None, &mut s.menu_bar.show_weekday);
-        ui.row_toggle("Display time with seconds", None, &mut s.menu_bar.show_seconds);
-    });
+pub fn menu_bar(s: &Settings) -> El {
+    let m = &s.menu_bar;
+    let cur = match m.clock_24h {
+        None => "auto",
+        Some(false) => "12",
+        Some(true) => "24",
+    };
+    column![
+        form::section("Status Icons"),
+        form::group([
+            form::toggle_row("Tiling", some("Show Floating / Tiling switcher in Menu Bar"), m.show_tiling, |v| {
+                edit(move |s| s.menu_bar.show_tiling = v)
+            }),
+            form::toggle_row("Network", some("Show Wi‑Fi or Ethernet in Menu Bar"), m.show_network, |v| {
+                edit(move |s| s.menu_bar.show_network = v)
+            }),
+            form::toggle_row("Sound", some("Show Volume in Menu Bar"), m.show_volume, |v| {
+                edit(move |s| s.menu_bar.show_volume = v)
+            }),
+            form::toggle_row("Battery", some("Show Battery in Menu Bar"), m.show_battery, |v| {
+                edit(move |s| s.menu_bar.show_battery = v)
+            }),
+            form::toggle_row("Show battery percentage", None, m.battery_percentage, |v| {
+                edit(move |s| s.menu_bar.battery_percentage = v)
+            }),
+        ]),
+        form::section("Clock"),
+        form::group([
+            form::popup_row(
+                "Time format",
+                None,
+                choices([("auto", "Automatic (from region)"), ("12", "12-hour"), ("24", "24-hour")]),
+                cur,
+                |v| {
+                    edit(move |s| {
+                        s.menu_bar.clock_24h = match v.as_str() {
+                            "12" => Some(false),
+                            "24" => Some(true),
+                            _ => None,
+                        }
+                    })
+                },
+            ),
+            form::toggle_row("Show date", None, m.show_date, |v| edit(move |s| s.menu_bar.show_date = v)),
+            form::toggle_row("Show day of the week", None, m.show_weekday, |v| {
+                edit(move |s| s.menu_bar.show_weekday = v)
+            }),
+            form::toggle_row("Display time with seconds", None, m.show_seconds, |v| {
+                edit(move |s| s.menu_bar.show_seconds = v)
+            }),
+        ]),
+    ]
+    .into()
 }
 
 // ---------------------------------------------------------------- Displays
@@ -260,113 +309,100 @@ fn load_outputs() -> Vec<Output> {
         .unwrap_or_default()
 }
 
-pub fn displays(ui: &mut Ui, s: &mut Settings, st: &mut DesktopState, wake: &Wake) {
+pub fn displays(s: &Settings, st: &mut DesktopState, wake: &Wake) -> El {
     st.outputs.ensure(wake, Duration::from_secs(5), load_outputs);
     let Some(outputs) = st.outputs.value.clone() else {
-        ui.group("disp-load", |ui| {
-            ui.row_value("Displays", "Loading…");
-        });
-        return;
+        return loading("Displays");
     };
     if outputs.is_empty() {
-        ui.group("disp-none", |ui| {
-            ui.row_base("No displays reported", Some("Display settings require the Orchard compositor."), None);
-        });
-        return;
+        return form::group([form::row(
+            "No displays reported",
+            some("Display settings require the Orchard compositor."),
+            iced::widget::Space::new(0, 0),
+        )]);
     }
 
-    // Arrangement preview
-    ui.group("disp-arr", |ui| {
-        let r = ui.custom_row(138.0);
-        let total_w: f32 = outputs.iter().map(|o| o.w.max(1) as f32).sum::<f32>()
-            + 20.0 * (outputs.len().saturating_sub(1) as f32);
-        let max_h = outputs.iter().map(|o| o.h.max(1)).max().unwrap_or(1) as f32;
-        let k = ((r.w - 48.0) / total_w).min((r.h - 36.0) / max_h);
-        let mut x = r.cx() - total_w * k * 0.5;
-        for o in &outputs {
-            let sw = o.w.max(1) as f32 * k;
-            let sh = o.h.max(1) as f32 * k;
-            let rr = Rect::new(x, r.cy() - sh * 0.5 - 8.0, sw, sh);
-            ui.fill_rect(rr, 6.0, rgb([0x2C, 0x2C, 0x2E]));
-            draw_mini_desktop(ui, rr.inset(3.5), Some(ui.pal.dark));
-            if o.primary && outputs.len() > 1 {
-                let inner = rr.inset(3.5);
-                ui.fill_rect(Rect::new(inner.x, inner.y, inner.w, 4.5), 2.0, [255, 255, 255, 210]);
-            }
-            ui.text_center(&o.name, rr.cx(), rr.bottom() + 12.0, 11.5, Weight::Regular, ui.pal.text2);
-            x += sw + 20.0 * k;
-        }
-    });
+    let screens = outputs
+        .iter()
+        .map(|o| art::Screen { name: o.name.clone(), w: o.w, h: o.h, primary: o.primary })
+        .collect();
+    let mut col = column![form::group([form::custom_row(art::arrangement(screens))])];
 
+    let multi = outputs.len() > 1;
     for o in &outputs {
-        ui.section(&o.name);
-        ui.group(&format!("disp-{}", o.name), |ui| {
-            let cur = s.displays.scale.get(&o.name).copied().unwrap_or(o.scale);
-            let cur_pct = (cur * 100.0).round() as i32;
-            let opts: Vec<(String, String)> = [100, 125, 150, 175, 200, 250, 300]
-                .iter()
-                .map(|pct| {
-                    let lw = (o.w as f64 * o.scale / (*pct as f64 / 100.0)).round();
-                    let lh = (o.h as f64 * o.scale / (*pct as f64 / 100.0)).round();
-                    (pct.to_string(), format!("{pct}%  — {lw} × {lh}"))
+        let cur = s.displays.scale.get(&o.name).copied().unwrap_or(o.scale);
+        let cur_pct = (cur * 100.0).round() as i32;
+        let opts = choices([100, 125, 150, 175, 200, 250, 300].iter().map(|pct| {
+            let lw = (o.w as f64 * o.scale / (*pct as f64 / 100.0)).round();
+            let lh = (o.h as f64 * o.scale / (*pct as f64 / 100.0)).round();
+            (pct.to_string(), format!("{pct}%  — {lw} × {lh}"))
+        }));
+        let name = o.name.clone();
+        let mut rows = vec![form::popup_row(
+            "Scale",
+            some("Larger text and controls on high-resolution displays"),
+            opts,
+            &cur_pct.to_string(),
+            move |v| {
+                let name = name.clone();
+                act(move |s, st, _| {
+                    if let Ok(pct) = v.parse::<i32>() {
+                        s.displays.scale.insert(name.clone(), pct as f64 / 100.0);
+                        st.desktop.outputs.invalidate();
+                    }
                 })
-                .collect();
-            if let Some(v) = ui.row_popup(
-                &format!("scale-{}", o.name),
-                "Scale",
-                Some("Larger text and controls on high-resolution displays"),
-                &cur_pct.to_string(),
-                &opts,
-            ) {
-                if let Ok(pct) = v.parse::<i32>() {
-                    s.displays.scale.insert(o.name.clone(), pct as f64 / 100.0);
-                    st.outputs.invalidate();
-                }
-            }
+            },
+        )];
 
-            let (pw, ph) = if o.mode_w > 0 {
-                (o.mode_w as f64, o.mode_h as f64)
-            } else {
-                ((o.w as f64 * o.scale).round(), (o.h as f64 * o.scale).round())
-            };
-            ui.row_value("Resolution", &format!("{pw} × {ph}"));
+        let (pw, ph) = if o.mode_w > 0 {
+            (o.mode_w as f64, o.mode_h as f64)
+        } else {
+            ((o.w as f64 * o.scale).round(), (o.h as f64 * o.scale).round())
+        };
+        rows.push(form::value_row("Resolution", format!("{pw} × {ph}")));
 
-            if o.refresh_rates.len() > 1 {
-                let saved = s.displays.refresh.get(&o.name).copied();
-                let cur_r = saved
-                    .and_then(|want| o.refresh_rates.iter().copied().min_by_key(|r| (r - want).abs()))
-                    .unwrap_or(o.refresh);
-                let ropts: Vec<(String, String)> = o.refresh_rates.iter().map(|r| (r.to_string(), hz(*r))).collect();
-                if let Some(v) = ui.row_popup(&format!("hz-{}", o.name), "Refresh rate", None, &cur_r.to_string(), &ropts) {
+        if o.refresh_rates.len() > 1 {
+            let saved = s.displays.refresh.get(&o.name).copied();
+            let cur_r = saved
+                .and_then(|want| o.refresh_rates.iter().copied().min_by_key(|r| (r - want).abs()))
+                .unwrap_or(o.refresh);
+            let ropts = choices(o.refresh_rates.iter().map(|r| (r.to_string(), hz(*r))));
+            let name = o.name.clone();
+            rows.push(form::popup_row("Refresh rate", None, ropts, &cur_r.to_string(), move |v| {
+                let name = name.clone();
+                act(move |s, st, _| {
                     if let Ok(mhz) = v.parse() {
-                        s.displays.refresh.insert(o.name.clone(), mhz);
-                        st.outputs.invalidate();
+                        s.displays.refresh.insert(name.clone(), mhz);
+                        st.desktop.outputs.invalidate();
                     }
-                }
-            } else if o.refresh > 0 {
-                ui.row_value("Refresh rate", &hz(o.refresh));
-            }
+                })
+            }));
+        } else if o.refresh > 0 {
+            rows.push(form::value_row("Refresh rate", hz(o.refresh)));
+        }
 
-            let vrr_status = if o.vrr_enabled {
-                "Active"
-            } else if o.vrr_supported {
-                "Supported"
-            } else {
-                "Not supported"
-            };
-            ui.row_value("Adaptive Sync (VRR)", vrr_status);
+        let vrr_status = if o.vrr_enabled {
+            "Active"
+        } else if o.vrr_supported {
+            "Supported"
+        } else {
+            "Not supported"
+        };
+        rows.push(form::value_row("Adaptive Sync (VRR)", vrr_status));
 
-            if outputs.len() > 1 {
-                let mut main = o.primary;
-                if ui.row_toggle("Main display", Some("Shows the menu bar and Dock"), &mut main) {
-                    if main {
-                        s.displays.primary = Some(o.name.clone());
-                    } else {
-                        s.displays.primary = outputs.iter().find(|x| x.name != o.name).map(|x| x.name.clone());
-                    }
-                    st.outputs.invalidate();
-                }
-            }
-        });
+        if multi {
+            let name = o.name.clone();
+            let other = outputs.iter().find(|x| x.name != o.name).map(|x| x.name.clone());
+            rows.push(form::toggle_row("Main display", some("Shows the menu bar and Dock"), o.primary, move |main| {
+                let (name, other) = (name.clone(), other.clone());
+                act(move |s, st, _| {
+                    s.displays.primary = if main { Some(name.clone()) } else { other.clone() };
+                    st.desktop.outputs.invalidate();
+                })
+            }));
+        }
+
+        col = col.push(form::section(o.name.clone())).push(form::group(rows));
     }
+    col.into()
 }

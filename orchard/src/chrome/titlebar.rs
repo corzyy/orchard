@@ -1,6 +1,9 @@
 //! CPU painter for the macOS-style title bar (traffic lights + centered title).
 
-use tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LineCap, LinearGradient, Paint, PathBuilder, Pixmap, Point,
+    Rect, SpreadMode, Stroke, Transform,
+};
 
 use super::{
     font::title_font,
@@ -96,40 +99,83 @@ fn darken(c: Rgba, f: f32) -> Rgba {
 /// Paint the title bar. Returns the pixmap (premultiplied RGBA) in physical pixels.
 pub fn paint_titlebar(p: &TitlebarParams) -> Option<Pixmap> {
     let s = p.scale as f32;
-    let w = ((p.width as f32) * s).ceil().max(1.0) as u32;
-    let h = ((TITLEBAR_HEIGHT as f32) * s).ceil() as u32;
+    let w = ((p.width as f32) * s).round().max(1.0) as u32;
+    let h = ((TITLEBAR_HEIGHT as f32) * s).round().max(1.0) as u32;
     let mut pm = Pixmap::new(w, h)?;
     let pal = palette(p.appearance);
     let ts = Transform::from_scale(s, s);
-    let lw = p.width as f32;
-    let lh = TITLEBAR_HEIGHT as f32;
+    let lw = w as f32 / s;
+    let lh = h as f32 / s;
+    let px_unit = 1.0 / s;
 
-    // background with rounded top corners
-    let r = p.radius;
-    let mut pb = PathBuilder::new();
-    pb.move_to(0.0, lh);
-    pb.line_to(0.0, r);
-    pb.quad_to(0.0, 0.0, r, 0.0);
-    pb.line_to(lw - r, 0.0);
-    pb.quad_to(lw, 0.0, lw, r);
-    pb.line_to(lw, lh);
-    pb.close();
-    let bg_path = pb.finish()?;
-    let bg = if p.active {
-        pal.titlebar_active
+    // Background with continuous superellipse top corners matching rounded.frag
+    let r = p.radius.clamp(0.0, (lw * 0.5).min(lh));
+    let bg_path = super::squircle_top_path(0.0, 0.0, lw, lh, r, true)?;
+    if p.active {
+        let mut bg_paint = Paint::default();
+        bg_paint.anti_alias = true;
+        if let Some(grad) = LinearGradient::new(
+            Point::from_xy(0.0, 0.0),
+            Point::from_xy(0.0, lh),
+            vec![
+                GradientStop::new(0.0, color(pal.titlebar_active_top)),
+                GradientStop::new(1.0, color(pal.titlebar_active_bottom)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            bg_paint.shader = grad;
+        } else {
+            bg_paint.set_color(color(pal.titlebar_active_top));
+        }
+        pm.fill_path(&bg_path, &bg_paint, FillRule::Winding, ts, None);
     } else {
-        pal.titlebar_inactive
+        pm.fill_path(&bg_path, &paint(pal.titlebar_inactive), FillRule::Winding, ts, None);
+    }
+
+    // Subtle 1px bottom separator between titlebar and client area
+    let sep = if p.active {
+        pal.separator_active
+    } else {
+        pal.separator_inactive
     };
-    pm.fill_path(&bg_path, &paint(bg), FillRule::Winding, ts, None);
+    if let Some(rect) = Rect::from_xywh(0.0, lh - px_unit, lw, px_unit) {
+        pm.fill_rect(rect, &paint(sep), ts, None);
+    }
 
-    // subtle top highlight / hairline outline along the rounded top edge
-    let mut hl = Stroke::default();
-    hl.width = 1.0 / s;
-    pm.stroke_path(&bg_path, &paint(pal.hairline), &hl, ts, None);
+    // Crisp 1px inner hairline rim along left, top-left, top, top-right, right
+    // (open at the bottom so it seamlessly meets RoundedElement's rim without
+    // drawing a dark bar across the bottom seam).
+    if !p.fullscreen {
+        let inset = 0.5 * px_unit;
+        if let Some(rim_path) =
+            super::squircle_top_path(inset, inset, lw - inset, lh, (r - inset).max(0.0), false)
+        {
+            let rim = if p.active {
+                pal.rim_active
+            } else {
+                pal.rim_inactive
+            };
+            let mut st = Stroke::default();
+            st.width = px_unit;
+            pm.stroke_path(&rim_path, &paint(rim), &st, ts, None);
+        }
 
-    // bottom separator
-    if let Some(rect) = Rect::from_xywh(0.0, lh - 1.0 / s, lw, 1.0 / s) {
-        pm.fill_rect(rect, &paint(pal.separator), ts, None);
+        // Subtle inner top specular highlight on active light titlebars
+        if p.active && pal.top_highlight[3] > 0 {
+            let hi_inset = 1.5 * px_unit;
+            let hi_r = (r - hi_inset).max(0.0);
+            if lw > 2.0 * hi_inset + 2.0 * hi_r {
+                let mut pb = PathBuilder::new();
+                pb.move_to(hi_inset + hi_r, hi_inset);
+                pb.line_to(lw - hi_inset - hi_r, hi_inset);
+                if let Some(hi_path) = pb.finish() {
+                    let mut st = Stroke::default();
+                    st.width = px_unit;
+                    pm.stroke_path(&hi_path, &paint(pal.top_highlight), &st, ts, None);
+                }
+            }
+        }
     }
 
     // traffic lights

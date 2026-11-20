@@ -424,7 +424,7 @@ fn icon_by_name_or_path(apps: &Apps, name: &str, px: u32) -> Option<std::rc::Rc<
     }
     let path = name.strip_prefix("file://").unwrap_or(name);
     if path.starts_with('/') {
-        return crate::apps::render_icon(std::path::Path::new(path), px).map(std::rc::Rc::new);
+        return apps.icon_by_path(path, px);
     }
     apps.icon(name, px)
 }
@@ -570,6 +570,22 @@ fn hint_image(hints: &HashMap<String, OwnedValue>) -> Option<Pixmap> {
                 data[dst + k] = (bytes[src + k] as u32 * a / 255) as u8;
             }
             data[dst + 3] = a as u8;
+        }
+    }
+    // Downscale immediately so notification history never retains multi-MB bitmaps
+    const MAX_DIM: u32 = 128;
+    let (uw, uh) = (w as u32, h as u32);
+    if uw > MAX_DIM || uh > MAX_DIM {
+        let k = MAX_DIM as f32 / uw.max(uh) as f32;
+        let nw = (uw as f32 * k).round().max(1.0) as u32;
+        let nh = (uh as f32 * k).round().max(1.0) as u32;
+        if let Some(mut small) = Pixmap::new(nw, nh) {
+            let paint = tiny_skia::PixmapPaint {
+                quality: tiny_skia::FilterQuality::Bicubic,
+                ..Default::default()
+            };
+            small.draw_pixmap(0, 0, pm.as_ref(), &paint, Transform::from_scale(nw as f32 / uw as f32, nh as f32 / uh as f32), None);
+            return Some(small);
         }
     }
     Some(pm)

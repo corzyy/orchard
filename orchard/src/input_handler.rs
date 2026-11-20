@@ -1761,7 +1761,7 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::ForceQuit)
     } else if cmd && modifiers.alt && !modifiers.shift && keysym == Keysym::Escape {
         // macOS shows its Force Quit window here; the closest thing is the system monitor
-        Some(KeyAction::Run("plasma-systemmonitor || ksysguard".into()))
+        Some(KeyAction::Run(orchard_config::system_monitor_command()))
     } else if cmd && modifiers.alt && modifiers.shift && (keysym == Keysym::q || keysym == Keysym::Q) {
         // log out without asking (⌥⇧⌘Q on macOS)
         Some(KeyAction::Quit)

@@ -94,6 +94,15 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// Show / hide / track the reveal for a new pointer position.
     pub fn update_fs_reveal(&mut self, pos: Point<f64, Logical>) {
+        // Fast path: skip allocating `Vec<Output>` on every raw pointer motion
+        // when no output has a fullscreen window or active reveal.
+        let any_relevant = self.space.outputs().any(|o| {
+            o.user_data().get::<FullscreenSurface>().and_then(|f| f.get()).is_some()
+                || with_reveal(o, |_| ()).is_some()
+        });
+        if !any_relevant {
+            return;
+        }
         let outputs: Vec<Output> = self.space.outputs().cloned().collect();
         for output in outputs {
             let Some(geo) = self.space.output_geometry(&output) else { continue };

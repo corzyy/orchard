@@ -4,7 +4,7 @@
 //! approximations, not Apple assets.
 
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU32, AtomicU8, Ordering},
     OnceLock,
 };
 
@@ -19,9 +19,11 @@ pub type Rgba = [u8; 4];
 
 #[derive(Debug, Clone)]
 pub struct Palette {
-    pub titlebar_active: Rgba,
+    pub titlebar_active_top: Rgba,
+    pub titlebar_active_bottom: Rgba,
     pub titlebar_inactive: Rgba,
-    pub separator: Rgba,
+    pub separator_active: Rgba,
+    pub separator_inactive: Rgba,
     pub title_active: Rgba,
     pub title_inactive: Rgba,
     pub button_inactive_fill: Rgba,
@@ -32,7 +34,9 @@ pub struct Palette {
     pub close_glyph: Rgba,
     pub minimize_glyph: Rgba,
     pub zoom_glyph: Rgba,
-    pub hairline: Rgba,
+    pub rim_active: Rgba,
+    pub rim_inactive: Rgba,
+    pub top_highlight: Rgba,
 }
 
 /// Title bar height in logical pixels (standard macOS title bar).
@@ -44,9 +48,19 @@ pub const BUTTON_FIRST_CENTER_X: f32 = 14.0;
 /// Distance between traffic light centers.
 pub const BUTTON_SPACING: f32 = 20.0;
 
+static CORNER_RADIUS: AtomicU32 = AtomicU32::new(u32::MAX);
+
 /// Window corner radius in logical pixels (Settings ▸ Appearance).
+/// Cached in an atomic so the render hot path never acquires the settings RwLock.
 pub fn corner_radius() -> f32 {
-    crate::settings::get().appearance.corner_radius.clamp(0.0, 24.0)
+    let bits = CORNER_RADIUS.load(Ordering::Relaxed);
+    if bits == u32::MAX {
+        let r = crate::settings::get().appearance.corner_radius.clamp(0.0, 24.0);
+        CORNER_RADIUS.store(r.to_bits(), Ordering::Relaxed);
+        r
+    } else {
+        f32::from_bits(bits)
+    }
 }
 
 static APPEARANCE: AtomicU8 = AtomicU8::new(0);
@@ -65,8 +79,10 @@ fn resolve_appearance() -> Appearance {
     }
 }
 
-/// Re-evaluate light/dark (after a settings reload).
+/// Re-evaluate light/dark and cached appearance metrics (after a settings reload).
 pub fn refresh_appearance() {
+    let r = crate::settings::get().appearance.corner_radius.clamp(0.0, 24.0);
+    CORNER_RADIUS.store(r.to_bits(), Ordering::Relaxed);
     let a = resolve_appearance();
     APPEARANCE.store(if a == Appearance::Dark { 2 } else { 1 }, Ordering::Relaxed);
 }
@@ -98,11 +114,13 @@ pub fn palette(appearance: Appearance) -> &'static Palette {
     static DARK: OnceLock<Palette> = OnceLock::new();
     match appearance {
         Appearance::Light => LIGHT.get_or_init(|| Palette {
-            titlebar_active: [0xE8, 0xE6, 0xE8, 0xFF],
+            titlebar_active_top: [0xF0, 0xF0, 0xF0, 0xFF],
+            titlebar_active_bottom: [0xE5, 0xE5, 0xE5, 0xFF],
             titlebar_inactive: [0xF6, 0xF6, 0xF6, 0xFF],
-            separator: [0x00, 0x00, 0x00, 0x1F],
+            separator_active: [0x00, 0x00, 0x00, 0x18],
+            separator_inactive: [0x00, 0x00, 0x00, 0x10],
             title_active: [0x26, 0x26, 0x26, 0xFF],
-            title_inactive: [0xA8, 0xA8, 0xA8, 0xFF],
+            title_inactive: [0x9E, 0x9E, 0x9E, 0xFF],
             button_inactive_fill: [0xDC, 0xDC, 0xDC, 0xFF],
             button_inactive_stroke: [0xC8, 0xC8, 0xC8, 0xFF],
             close: ([0xFF, 0x5F, 0x57, 0xFF], [0xE2, 0x46, 0x3F, 0xFF]),
@@ -111,12 +129,16 @@ pub fn palette(appearance: Appearance) -> &'static Palette {
             close_glyph: [0x4D, 0x00, 0x00, 0xD0],
             minimize_glyph: [0x99, 0x57, 0x00, 0xE0],
             zoom_glyph: [0x00, 0x65, 0x00, 0xE0],
-            hairline: [0x00, 0x00, 0x00, 0x30],
+            rim_active: [0x00, 0x00, 0x00, 0x1A],
+            rim_inactive: [0x00, 0x00, 0x00, 0x0F],
+            top_highlight: [0xFF, 0xFF, 0xFF, 0x80],
         }),
         Appearance::Dark => DARK.get_or_init(|| Palette {
-            titlebar_active: [0x38, 0x38, 0x3A, 0xFF],
+            titlebar_active_top: [0x3D, 0x3D, 0x3F, 0xFF],
+            titlebar_active_bottom: [0x34, 0x34, 0x36, 0xFF],
             titlebar_inactive: [0x2C, 0x2C, 0x2E, 0xFF],
-            separator: [0x00, 0x00, 0x00, 0x80],
+            separator_active: [0x00, 0x00, 0x00, 0x42],
+            separator_inactive: [0x00, 0x00, 0x00, 0x2E],
             title_active: [0xE6, 0xE6, 0xE6, 0xFF],
             title_inactive: [0x80, 0x80, 0x80, 0xFF],
             button_inactive_fill: [0x4A, 0x4A, 0x4C, 0xFF],
@@ -127,7 +149,9 @@ pub fn palette(appearance: Appearance) -> &'static Palette {
             close_glyph: [0x4D, 0x00, 0x00, 0xD0],
             minimize_glyph: [0x99, 0x57, 0x00, 0xE0],
             zoom_glyph: [0x00, 0x65, 0x00, 0xE0],
-            hairline: [0x00, 0x00, 0x00, 0x90],
+            rim_active: [0xFF, 0xFF, 0xFF, 0x24],
+            rim_inactive: [0xFF, 0xFF, 0xFF, 0x12],
+            top_highlight: [0xFF, 0xFF, 0xFF, 0x00],
         }),
     }
 }

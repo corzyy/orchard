@@ -291,6 +291,21 @@ impl Backend for UdevData {
         }
     }
 
+    fn output_vrr_info(&self, output: &Output) -> (bool, bool) {
+        let Some(id) = output.user_data().get::<UdevOutputId>() else {
+            return (false, false);
+        };
+        let Some(surface) = self
+            .backends
+            .get(&id.device_id)
+            .and_then(|gpu| gpu.surfaces.get(&id.crtc))
+        else {
+            return (false, false);
+        };
+        let enabled = surface.vrr_supported && surface.drm_output.with_compositor(|c| c.vrr_enabled());
+        (surface.vrr_supported, enabled)
+    }
+
     fn early_import(&mut self, surface: &wl_surface::WlSurface) {
         if let Err(err) = self.gpus.early_import(self.primary_gpu, surface) {
             warn!("Early buffer import failed: {}", err);
@@ -772,6 +787,8 @@ struct SurfaceData {
     is_nvidia: bool,
     /// true when parked waiting for the next compositor event instead of polling at refresh rate
     idle: bool,
+    /// true when the connector supports seamless VRR (without a modeset)
+    vrr_supported: bool,
 }
 
 /// Damages the whole output for the next few frames by placing an invisible
@@ -1237,6 +1254,14 @@ impl OrchardState<UdevData> {
                 )
             });
 
+            let vrr_supported = matches!(
+                drm_output.with_compositor(|c| c.vrr_supported(connector.handle())),
+                Ok(smithay::backend::drm::VrrSupport::Supported)
+            );
+            if vrr_supported {
+                info!("Output {} supports seamless VRR (Adaptive Sync)", output.name());
+            }
+
             let surface = SurfaceData {
                 dh: self.display_handle.clone(),
                 device_id: node,
@@ -1255,6 +1280,7 @@ impl OrchardState<UdevData> {
                 full_damage: FullDamage::default(),
                 is_nvidia,
                 idle: false,
+                vrr_supported,
             };
 
             device.surfaces.insert(crtc, surface);
@@ -1549,16 +1575,19 @@ impl OrchardState<UdevData> {
             //
             // A more complete solution could work on a sliding window analyzing past repaints
             // and do some prediction for the next repaint.
-            let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * 0.6f64);
+            let vrr_active = surface.vrr_supported && surface.drm_output.with_compositor(|c| c.vrr_enabled());
+            let low_latency = crate::settings::effective_low_latency();
+            let delay_factor = if low_latency { 0.25f64 } else { 0.6f64 };
+            let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * delay_factor);
 
-            let timer = if surface
-                .render_node
-                .map(|render_node| render_node != self.backend_data.primary_gpu)
-                .unwrap_or(true)
+            let timer = if vrr_active
+                || surface
+                    .render_node
+                    .map(|render_node| render_node != self.backend_data.primary_gpu)
+                    .unwrap_or(true)
             {
-                // However, if we need to do a copy, that might not be enough.
-                // (And without actual comparision to previous frames we cannot really know.)
-                // So lets ignore that in those cases to avoid thrashing performance.
+                // With VRR active (or on a multi-GPU copy path) submit immediately rather than
+                // holding back a fraction of the nominal refresh interval.
                 trace!("scheduling repaint timer immediately on {:?}", crtc);
                 Timer::immediate()
             } else {
@@ -1936,8 +1965,32 @@ fn render_surface(
         elements.insert(0, el);
     }
 
-    let frame_mode = if surface.disable_direct_scanout {
+    let settings = crate::settings::get();
+    let perf = &settings.performance;
+    if surface.vrr_supported {
+        let has_fullscreen = output
+            .user_data()
+            .get::<crate::shell::FullscreenSurface>()
+            .and_then(|f| f.get())
+            .is_some();
+        let want_vrr = match perf.vrr {
+            orchard_config::VrrMode::Off => false,
+            orchard_config::VrrMode::Fullscreen => has_fullscreen,
+            orchard_config::VrrMode::On => true,
+        };
+        let cur_vrr = surface.drm_output.with_compositor(|c| c.vrr_enabled());
+        if want_vrr != cur_vrr {
+            if let Err(err) = surface.drm_output.with_compositor(|c| c.use_vrr(want_vrr)) {
+                warn!(want_vrr, "failed to toggle VRR on {}: {err}", output.name());
+            }
+        }
+    }
+
+    let allow_scanout = !surface.disable_direct_scanout && perf.direct_scanout;
+    let frame_mode = if !allow_scanout {
         FrameFlags::empty()
+    } else if crate::settings::effective_low_latency() {
+        FrameFlags::DEFAULT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
     } else {
         FrameFlags::DEFAULT
     };

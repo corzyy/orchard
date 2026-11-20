@@ -92,6 +92,24 @@ pub enum Request {
     },
     /// Restart the menu bar + Dock from the newest `orchard-shell` binary.
     RestartShell,
+    /// Capture requested by the macOS-style screenshot toolbar (`Print` / ⌘⇧5).
+    ScreenshotCapture {
+        /// "screen" | "window" | "area"
+        mode: String,
+        #[serde(default)]
+        output: Option<String>,
+        /// output-relative logical rect for "area"
+        #[serde(default)]
+        rect: Option<Rect>,
+        /// IPC window id for "window"
+        #[serde(default)]
+        window_id: Option<u64>,
+        /// "pictures" | "desktop" | "documents" | "clipboard"
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        include_cursor: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -158,6 +176,19 @@ pub enum Event<'a> {
     MediaKey { key: &'static str, fine: bool },
     /// whether any visible window currently overlaps the Dock's resting rect
     DockObstructed { obstructed: bool },
+    /// macOS-style screenshot toolbar requested (Print / ⌘⇧5)
+    ScreenshotTool { output: String, windows: Vec<ShotWindow> },
+}
+
+/// A visible window on the active output, for the screenshot tool's window picker.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShotWindow {
+    pub id: u64,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub title: String,
 }
 
 /// State of the Cmd+Tab app switcher (drawn by orchard-shell).
@@ -184,6 +215,10 @@ pub struct OutputInfo {
     pub mode_h: i32,
     /// shows the menu bar and Dock
     pub primary: bool,
+    /// output supports seamless Variable Refresh Rate
+    pub vrr_supported: bool,
+    /// Variable Refresh Rate is currently active on this output
+    pub vrr_enabled: bool,
 }
 
 #[derive(Default)]
@@ -243,15 +278,43 @@ impl WindowElement {
 /// Longest accepted IPC request line.
 const MAX_REQUEST_BYTES: usize = 1 << 20;
 
-fn send_line(stream: &mut UnixStream, value: &impl Serialize) -> std::io::Result<()> {
+fn serialize_line(value: &impl Serialize) -> std::io::Result<Vec<u8>> {
     let mut line = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     line.push(b'\n');
-    // small messages; a blocking write with a short timeout keeps things simple
-    stream.set_nonblocking(false)?;
-    stream.set_write_timeout(Some(std::time::Duration::from_millis(50)))?;
-    let res = stream.write_all(&line);
-    stream.set_nonblocking(true)?;
-    res
+    Ok(line)
+}
+
+/// Non-blocking write of a pre-serialized IPC line. Returns `true` to keep the
+/// subscriber (including on transient `WouldBlock` so a brief burst doesn't
+/// disconnect the shell) and `false` if the peer disconnected or errored.
+fn write_nonblocking(stream: &mut UnixStream, line: &[u8]) -> bool {
+    match stream.write(line) {
+        Ok(n) if n == line.len() => true,
+        Ok(0) => false,
+        Ok(mut written) => {
+            // Partial write: try to finish without blocking, else drop to avoid corrupting framing.
+            while written < line.len() {
+                match stream.write(&line[written..]) {
+                    Ok(0) => return false,
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return false,
+                }
+            }
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
+}
+
+fn send_line(stream: &mut UnixStream, value: &impl Serialize) -> std::io::Result<()> {
+    let line = serialize_line(value)?;
+    if write_nonblocking(stream, &line) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "ipc write failed"))
+    }
 }
 
 pub fn socket_path() -> Option<PathBuf> {
@@ -494,6 +557,17 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                     Some(Event::Ok)
                 }
             }
+            Request::ScreenshotCapture {
+                mode,
+                output,
+                rect,
+                window_id,
+                target,
+                include_cursor,
+            } => {
+                self.capture_from_tool(&mode, output.as_deref(), rect, window_id, target.as_deref(), include_cursor);
+                Some(Event::Ok)
+            }
             Request::Outputs => {
                 let primary = self.primary_output();
                 let outputs = self
@@ -511,6 +585,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                             .collect();
                         refresh_rates.sort_unstable_by(|a, b| b.cmp(a));
                         refresh_rates.dedup_by(|a, b| (*a - *b).abs() < 50);
+                        let (vrr_supported, vrr_enabled) = self.backend_data.output_vrr_info(o);
                         Some(OutputInfo {
                             name: o.name(),
                             x: g.loc.x,
@@ -523,6 +598,8 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                             mode_w: cur.map(|m| m.size.w).unwrap_or(0),
                             mode_h: cur.map(|m| m.size.h).unwrap_or(0),
                             primary: primary.as_ref() == Some(o),
+                            vrr_supported,
+                            vrr_enabled,
                         })
                     })
                     .collect();
@@ -538,20 +615,25 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             .elements()
             .rev()
             .filter(|w| w.alive())
-            .map(|w| WindowInfo {
-                id: w.ipc_id().0,
-                app_id: w.app_id(),
-                title: w.title(),
-                focused: Some(w) == focused.as_ref(),
-                minimized: false,
-                zoomed: self.is_zoomed(w),
-                hidden: false,
-                menu: menu_of(w).0,
-                x11_id: menu_of(w).1,
-                output: self.window_output(w).as_ref().map(|o| o.name()),
-                space: self.window_output(w).as_ref()
-                    .map(|o| self.spaces.info(&o.name()).0 + 1),
-                thumb: None,
+            .map(|w| {
+                let (menu, x11_id) = menu_of(w);
+                let out_obj = self.window_output(w);
+                let output = out_obj.as_ref().map(|o| o.name());
+                let space = out_obj.as_ref().map(|o| self.spaces.info(&o.name()).0 + 1);
+                WindowInfo {
+                    id: w.ipc_id().0,
+                    app_id: w.app_id(),
+                    title: w.title(),
+                    focused: Some(w) == focused.as_ref(),
+                    minimized: false,
+                    zoomed: self.is_zoomed(w),
+                    hidden: false,
+                    menu,
+                    x11_id,
+                    output,
+                    space,
+                    thumb: None,
+                }
             })
             .collect();
         for (name, spaces) in &self.spaces.outputs {
@@ -596,9 +678,13 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         out
     }
 
-    /// Send an event to every subscriber.
+    /// Send an event to every subscriber (serialized once, written non-blockingly).
     pub fn ipc_broadcast(&mut self, ev: &Event<'_>) {
-        self.ipc.subscribers.retain(|_, stream| send_line(stream, ev).is_ok());
+        if self.ipc.subscribers.is_empty() {
+            return;
+        }
+        let Ok(line) = serialize_line(ev) else { return };
+        self.ipc.subscribers.retain(|_, stream| write_nonblocking(stream, &line));
     }
 
     /// Apps in most-recently-used order: stacking order of the current Space,
@@ -720,17 +806,17 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         let windows = self.window_infos();
         if windows != self.ipc.last_windows {
             let ev = Event::Windows { windows: &windows };
-            self.ipc
-                .subscribers
-                .retain(|_, stream| send_line(stream, &ev).is_ok());
+            if let Ok(line) = serialize_line(&ev) {
+                self.ipc.subscribers.retain(|_, stream| write_nonblocking(stream, &line));
+            }
             self.ipc.last_windows = windows;
         }
         let obstructed = self.is_dock_obstructed();
         if obstructed != self.ipc.last_dock_obstructed {
             let ev = Event::DockObstructed { obstructed };
-            self.ipc
-                .subscribers
-                .retain(|_, stream| send_line(stream, &ev).is_ok());
+            if let Ok(line) = serialize_line(&ev) {
+                self.ipc.subscribers.retain(|_, stream| write_nonblocking(stream, &line));
+            }
             self.ipc.last_dock_obstructed = obstructed;
         }
     }

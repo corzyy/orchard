@@ -7,9 +7,8 @@ description = "System Settings for the Orchard compositor"
 
 [dependencies]
 orchard-config = { path = "../orchard-config" }
-smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop", "xkbcommon"] }
-tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
-fontdue = "0.9"
-resvg = "0.45"
+orchard-ui = { path = "../../orchard-ui" }
+iced = { version = "0.13", features = ["tokio", "image", "svg", "canvas"] }
+tokio = { version = "1", features = ["time"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 serde_json = "1"

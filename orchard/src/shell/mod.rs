@@ -236,7 +236,9 @@ impl<BackendData: Backend> CompositorHandler for OrchardState<BackendData> {
             });
         }
 
-        ensure_initial_configure(surface, &self.space, &mut self.popups)
+        if let Some(output) = ensure_initial_configure(surface, &self.space, &mut self.popups) {
+            self.refit_windows_on_output(&output);
+        }
     }
 }
 
@@ -270,15 +272,24 @@ impl<BackendData: Backend> WlrLayerShellHandler for OrchardState<BackendData> {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
+        let found = self.space.outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer = map
                 .layers()
                 .find(|&layer| layer.layer_surface() == &surface)
-                .cloned();
-            layer.map(|layer| (map, layer))
-        }) {
-            map.unmap_layer(&layer);
+                .cloned()?;
+            Some((o.clone(), layer))
+        });
+        if let Some((output, layer)) = found {
+            let zone_changed = {
+                let mut map = layer_map_for_output(&output);
+                let before = map.non_exclusive_zone();
+                map.unmap_layer(&layer);
+                map.non_exclusive_zone() != before
+            };
+            if zone_changed {
+                self.refit_windows_on_output(&output);
+            }
         }
     }
 }
@@ -320,7 +331,11 @@ pub struct SurfaceData {
     pub resize_state: ResizeState,
 }
 
-fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, popups: &mut PopupManager) {
+fn ensure_initial_configure(
+    surface: &WlSurface,
+    space: &Space<WindowElement>,
+    popups: &mut PopupManager,
+) -> Option<Output> {
     with_surface_tree_upward(
         surface,
         (),
@@ -368,7 +383,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
             }
         });
 
-        return;
+        return None;
     }
 
     if let Some(popup) = popups.find_popup(surface) {
@@ -376,7 +391,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
             PopupKind::Xdg(ref popup) => popup,
             // Doesn't require configure
             PopupKind::InputMethod(ref _input_popup) => {
-                return;
+                return None;
             }
         };
 
@@ -388,7 +403,7 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
             }
         }
 
-        return;
+        return None;
     };
 
     if let Some(output) = space.outputs().find(|o| {
@@ -407,10 +422,12 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
         });
 
         let mut map = layer_map_for_output(output);
+        let prev_zone = map.non_exclusive_zone();
 
         // arrange the layers before sending the initial configure
         // to respect any size the client may have sent
         map.arrange();
+        let zone_changed = map.non_exclusive_zone() != prev_zone;
         // send the initial configure if relevant
         if !initial_configure_sent {
             let layer = map
@@ -419,7 +436,11 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
 
             layer.layer_surface().send_configure();
         }
+        if zone_changed {
+            return Some(output.clone());
+        }
     };
+    None
 }
 
 fn place_new_window(

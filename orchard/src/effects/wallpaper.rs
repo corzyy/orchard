@@ -70,7 +70,6 @@ pub struct WallpaperTextures {
 
 #[derive(Default)]
 pub struct Wallpaper {
-    source: Option<Option<DynamicImage>>,
     path: Option<PathBuf>,
     cache: HashMap<(i32, i32), WallpaperTextures>,
 }
@@ -81,35 +80,36 @@ impl Wallpaper {
         let path = configured_path();
         if path != self.path {
             self.path = path;
-            self.source = None;
             self.cache.clear();
         }
     }
 
-    fn source(&mut self) -> Option<&DynamicImage> {
-        if self.source.is_none() {
-            self.path = configured_path();
-            let img = self.path.clone().and_then(|p| match image::open(&p) {
-                Ok(img) => {
-                    tracing::info!("wallpaper: {}", p.display());
-                    Some(img)
-                }
-                Err(e) => {
-                    tracing::warn!("failed to load wallpaper {}: {e}", p.display());
-                    None
-                }
-            });
-            self.source = Some(img);
-        }
-        self.source.as_ref().unwrap().as_ref()
+    fn load_source(&mut self) -> Option<DynamicImage> {
+        self.path = configured_path();
+        self.path.clone().and_then(|p| match image::open(&p) {
+            Ok(img) => {
+                tracing::info!("wallpaper: {}", p.display());
+                Some(img)
+            }
+            Err(e) => {
+                tracing::warn!("failed to load wallpaper {}: {e}", p.display());
+                None
+            }
+        })
     }
 
     pub fn textures(&mut self, renderer: &mut GlesRenderer, size: Size<i32, Physical>) -> Option<&WallpaperTextures> {
         let key = (size.w, size.h);
         if !self.cache.contains_key(&key) {
+            // Avoid retaining unbounded old resolution textures after mode changes
+            if self.cache.len() >= 4 {
+                self.cache.clear();
+            }
             let (w, h) = (size.w.max(1) as u32, size.h.max(1) as u32);
-            let sharp_img = match self.source() {
-                Some(src) => fill(src, w, h),
+            // Decode on demand and drop immediately after GPU upload so we don't keep
+            // 30-130 MB of uncompressed wallpaper pixels in CPU RAM permanently.
+            let sharp_img = match self.load_source() {
+                Some(src) => fill(&src, w, h),
                 None => fallback_gradient(w, h),
             };
             let bw = (w / BLUR_DOWNSCALE).max(1);

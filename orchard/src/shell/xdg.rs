@@ -46,6 +46,16 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
         // Do not send a configure here, the initial configure
         // of a xdg_surface has to be sent during the commit if
         // the surface is not already configured
+        if let Some(server_side) = crate::state::kde_decoration_pref(surface.wl_surface()) {
+            use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+            surface.with_pending_state(|state| {
+                state.decoration_mode = Some(if server_side {
+                    Mode::ServerSide
+                } else {
+                    Mode::ClientSide
+                });
+            });
+        }
         let window = WindowElement(Window::new_wayland_window(surface.clone()));
         place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
 
@@ -64,6 +74,10 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
         if let Some(window) = window {
             self.animate_close(&window);
             self.space.unmap_elem(&window);
+            if self.is_tiling_mode() {
+                self.dwindle.remove_everywhere(window.ipc_id().0);
+                self.retile_all();
+            }
         }
         self.minimized
             .retain(|w| w.wl_surface().as_deref() != Some(surface.wl_surface()));

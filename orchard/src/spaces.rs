@@ -233,6 +233,12 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             bounce: false,
         });
         self.backend_data.reset_buffers(output);
+        if self.is_tiling_mode() {
+            self.retile_output(output);
+        } else {
+            self.untile_dwindled_on_output(output);
+            self.refit_windows_on_output(output);
+        }
         self.focus_topmost();
     }
 
@@ -351,6 +357,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         }
         // outputs_for_element is only updated by a refresh
         self.space.refresh();
+        if self.is_tiling_mode() {
+            self.dwindle.remove_everywhere(window.ipc_id().0);
+            self.retile_all();
+        }
         self.backend_data.reset_buffers(output);
         true
     }
@@ -521,6 +531,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             f.set(window.clone());
         }
         self.backend_data.reset_buffers(&output);
+        if self.is_tiling_mode() {
+            self.dwindle.remove_everywhere(window.ipc_id().0);
+            self.retile_all();
+        }
         self.focus_window(window);
     }
 
@@ -577,6 +591,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         }
         if idx == active {
             self.space.map_element(window.clone(), loc, true);
+            if self.is_tiling_mode() {
+                self.retile_all();
+            }
             self.backend_data.reset_buffers(&output);
             self.focus_window(window);
         } else if let Some(slot) = self.spaces.for_output(&name).slots.get_mut(idx) {

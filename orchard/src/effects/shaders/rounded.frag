@@ -42,21 +42,21 @@ uniform float rim_width;
 // Negative inside, 0 on the edge, positive outside.
 float box_sdf(vec2 p) {
     float r = min(radius, min(size.x, size.y) * 0.5);
-    // Superellipse exponent for smooth macOS-style continuous corners (n = 3.2)
-    const float N = 3.2;
-    const float INV_N = 1.0 / 3.2;
+    // Superellipse exponent matching SQUIRCLE_N in chrome/mod.rs
+    const float N = 2.6;
+    const float INV_N = 1.0 / 2.6;
     if (r > 0.5) {
         if (p.x < r && p.y < r && corners.x > 0.5) {
-            vec2 q = vec2(r - p.x, r - p.y);
+            vec2 q = max(vec2(r - p.x, r - p.y), vec2(1e-5));
             return pow(pow(q.x, N) + pow(q.y, N), INV_N) - r;
         } else if (p.x > size.x - r && p.y < r && corners.y > 0.5) {
-            vec2 q = vec2(p.x - (size.x - r), r - p.y);
+            vec2 q = max(vec2(p.x - (size.x - r), r - p.y), vec2(1e-5));
             return pow(pow(q.x, N) + pow(q.y, N), INV_N) - r;
         } else if (p.x > size.x - r && p.y > size.y - r && corners.z > 0.5) {
-            vec2 q = vec2(p.x - (size.x - r), p.y - (size.y - r));
+            vec2 q = max(vec2(p.x - (size.x - r), p.y - (size.y - r)), vec2(1e-5));
             return pow(pow(q.x, N) + pow(q.y, N), INV_N) - r;
         } else if (p.x < r && p.y > size.y - r && corners.w > 0.5) {
-            vec2 q = vec2(r - p.x, p.y - (size.y - r));
+            vec2 q = max(vec2(r - p.x, p.y - (size.y - r)), vec2(1e-5));
             return pow(pow(q.x, N) + pow(q.y, N), INV_N) - r;
         }
     }

@@ -3,16 +3,22 @@
 use chrono::{Datelike, Local, Timelike};
 
 fn german() -> bool {
-    std::env::var("LC_TIME")
-        .or_else(|_| std::env::var("LANG"))
-        .map(|l| l.starts_with("de"))
-        .unwrap_or(false)
+    static GERMAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GERMAN.get_or_init(|| {
+        std::env::var("LC_TIME")
+            .or_else(|_| std::env::var("LANG"))
+            .map(|l| l.starts_with("de"))
+            .unwrap_or(false)
+    })
 }
 
 fn locale_24h() -> bool {
-    let l = std::env::var("LC_TIME").or_else(|_| std::env::var("LANG")).unwrap_or_default();
-    // 12-hour clocks: US, Canada (en), Australia, India, Philippines …
-    !["en_US", "en_CA", "en_AU", "en_IN", "en_PH", "en_NZ"].iter().any(|p| l.starts_with(p))
+    static H24: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *H24.get_or_init(|| {
+        let l = std::env::var("LC_TIME").or_else(|_| std::env::var("LANG")).unwrap_or_default();
+        // 12-hour clocks: US, Canada (en), Australia, India, Philippines …
+        !["en_US", "en_CA", "en_AU", "en_IN", "en_PH", "en_NZ"].iter().any(|p| l.starts_with(p))
+    })
 }
 
 /// macOS style: "Do. 19. Nov. 10:42" (de) or "Thu Nov 19 10:42 AM" (en),

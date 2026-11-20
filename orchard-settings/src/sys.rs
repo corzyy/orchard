@@ -1,24 +1,61 @@
 //! Non-blocking background tasks and system command helpers.
 //!
-//! Workers notify the Wayland `calloop` event loop via a `Wake` channel so
-//! the UI redraws immediately when data arrives — zero polling timers!
+//! Workers notify the UI through a [`Wake`] channel; the app turns each
+//! notification into a `Message::Wake` (see [`wake_subscription`]), so the
+//! UI updates as soon as data arrives without polling.
 
 use std::{
     process::Command,
-    sync::mpsc,
+    sync::{mpsc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
-use smithay_client_toolkit::reexports::calloop::channel::Sender as LoopSender;
+use iced::futures::{
+    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
+    stream::{self, BoxStream, StreamExt},
+};
 
-/// Handle to wake the main event loop from any background thread.
+/// Handle to wake the UI from any background thread.
 #[derive(Clone)]
-pub struct Wake(pub LoopSender<()>);
+pub struct Wake(UnboundedSender<()>);
 
 impl Wake {
     pub fn notify(&self) {
-        let _ = self.0.send(());
+        let _ = self.0.unbounded_send(());
     }
+}
+
+fn receiver() -> &'static Mutex<Option<UnboundedReceiver<()>>> {
+    static RX: OnceLock<Mutex<Option<UnboundedReceiver<()>>>> = OnceLock::new();
+    RX.get_or_init(|| Mutex::new(None))
+}
+
+/// Creates the process-wide wake channel. Call once at startup.
+pub fn wake_channel() -> Wake {
+    let (tx, rx) = unbounded();
+    *receiver().lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+    Wake(tx)
+}
+
+/// Emits `msg` whenever a background worker calls [`Wake::notify`].
+pub fn wake_subscription<M: Clone + Send + 'static>(msg: M) -> iced::Subscription<M> {
+    struct Id;
+    // iced keeps the first stream registered under this id alive; later
+    // calls build an empty stream that is discarded.
+    let rx: BoxStream<'static, ()> = match receiver().lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(rx) => rx.boxed(),
+        None => stream::empty().boxed(),
+    };
+    iced::Subscription::run_with_id(std::any::TypeId::of::<Id>(), rx.map(move |_| msg.clone()))
+}
+
+/// Runs `f` on a new thread and resolves with its result.
+pub fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl std::future::Future<Output = Option<T>> {
+    let (tx, rx) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    async move { rx.await.ok() }
 }
 
 /// stdout of a successful command (C locale).

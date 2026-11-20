@@ -100,7 +100,7 @@ dist/           login session files + installer
 | ⌥⇧⌘Q | log out |
 | volume, brightness, play/pause keys | with an on-screen HUD |
 | ⌃⌘Q | lock screen (`orchard-lock`; another locker via Settings → Lock Screen or `ORCHARD_LOCKER`) |
-| ⌘Return | terminal (`ORCHARD_TERMINAL`, default konsole) |
+| ⌘Return | terminal (`ORCHARD_TERMINAL`, or first installed terminal) |
 | Ctrl+Alt+Backspace | quit Orchard |
 
 Spaces use ⌃⌘ rather than macOS's plain ⌃, so Ctrl+arrow keeps jumping by word in Linux apps.
@@ -110,10 +110,9 @@ Spaces use ⌃⌘ rather than macOS's plain ⌃, so Ctrl+arrow keeps jumping by 
 cargo run -- --nested     # in a window inside your current session
 cargo run -- --headless   # offscreen, no window (automated tests, see below)
 cargo run -- --tty        # real session from a text console (Ctrl+Alt+F3)
-dist/install.sh           # release build + "Orchard" entry in the SDDM session menu
+dist/install.sh           # release build + "Orchard" entry in your display manager's session menu
 dist/autologin.sh enable  # optional: boot straight into Orchard's lock screen, no greeter
 ```
-Plasma stays installed and selectable at login.
 
 ### Live updates while developing
 Install once in dev mode (run as your user, not with `sudo`), then log in again:
@@ -164,9 +163,9 @@ Newline-delimited JSON on `$ORCHARD_SOCKET` (`$XDG_RUNTIME_DIR/orchard-<display>
 When Orchard runs as a login session (`--tty`), it:
 - exports `WAYLAND_DISPLAY`, `DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, `QT_QPA_PLATFORMTHEME` and `ORCHARD_SOCKET` to systemd and D-Bus activation. It waits for Xwayland first.
 - starts `orchard-session.target`, which binds `graphical-session.target`. This lets `xdg-desktop-portal` start, so file dialogs, Flatpak and the dark-mode setting work.
-- writes the unit to `~/.local/share/systemd/user/` and `~/.config/xdg-desktop-portal/orchard-portals.conf` (KDE backend, GTK for appearance). The portal file is only created if it is missing.
-- gives the session its own dconf database (`DCONF_PROFILE` → `~/.config/orchard/dconf-profile`, database `~/.config/dconf/orchard`, seeded once from your user database) and writes Orchard's icon theme, pointer theme/size and Light/Dark into it, so GTK apps and the settings portal follow Orchard while Plasma keeps its own settings;
-- uses the GTK Qt platform theme with the Breeze style (`QT_QPA_PLATFORMTHEME=gtk3`, `QT_STYLE_OVERRIDE=Breeze`) unless you set your own, so Qt/KDE apps read the same settings instead of Plasma's kdeglobals;
+- writes the unit to `~/.local/share/systemd/user/` and `~/.config/xdg-desktop-portal/orchard-portals.conf` (GTK backend for file dialogs/appearance, `gnome-keyring` for secrets, Hyprland portal for ScreenCast/Screenshot). Managed portal configs are updated automatically; delete the first line to keep manual edits.
+- gives the session its own dconf database (`DCONF_PROFILE` → `~/.config/orchard/dconf-profile`, database `~/.config/dconf/orchard`, seeded once from your user database) and writes Orchard's icon theme, pointer theme/size and Light/Dark into it, so GTK apps and the settings portal follow Orchard without affecting other sessions;
+- uses the GTK Qt platform theme (`QT_QPA_PLATFORMTHEME=gtk3`) unless you set your own, so Qt apps read the same settings without requiring any KDE packages;
 - exports `XCURSOR_THEME`/`XCURSOR_SIZE` from Orchard's settings.
 - undoes the environment export and stops the target on a clean exit.
 
