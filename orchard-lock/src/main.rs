@@ -80,6 +80,8 @@ struct Screen {
     pending: Vec<Rect>,
     dirty: u8,
     frame_pending: bool,
+    /// commits so far (matches a fallback timer to its commit)
+    commits: u64,
     configured: bool,
     primary: bool,
     avatar: Option<(i32, Pixmap)>,
@@ -465,6 +467,33 @@ impl App {
             return;
         }
         present(screen, &qh);
+        if screen.frame_pending {
+            // A compositor that sends no frame callbacks to lock surfaces would
+            // otherwise freeze the lock screen on its first (transparent) frame.
+            let (surface, commit) = (screen.surface.wl_surface().clone(), screen.commits);
+            let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(40)), move |_, _, app| {
+                if app.screens.iter().any(|s| s.surface.wl_surface() == &surface && s.frame_pending && s.commits == commit) {
+                    app.frame_done(&surface);
+                }
+                TimeoutAction::Drop
+            });
+        }
+    }
+
+    /// The compositor showed our last commit (or the fallback timer fired).
+    fn frame_done(&mut self, surface: &wl_surface::WlSurface) {
+        if let Phase::Unlocking(t) = self.phase {
+            if t.elapsed() >= FADE_OUT {
+                self.unlock();
+                return;
+            }
+        }
+        let anim = self.animating();
+        if let Some(s) = self.screens.iter_mut().find(|s| s.surface.wl_surface() == surface) {
+            s.frame_pending = false;
+            s.dirty |= anim;
+        }
+        self.flush();
     }
 
     // ---- input ---------------------------------------------------------------
@@ -617,6 +646,7 @@ impl App {
             pending: Vec::new(),
             dirty: BAND_ALL,
             frame_pending: false,
+            commits: 0,
             configured: false,
             primary: false,
             avatar: None,
@@ -679,6 +709,7 @@ fn present(screen: &mut Screen, qh: &QueueHandle<App>) {
     surface.frame(qh, surface.clone());
     surface.commit();
     screen.frame_pending = true;
+    screen.commits += 1;
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| {
         let ms = START.get().map(|t| t.elapsed().as_millis()).unwrap_or(0);
@@ -735,18 +766,7 @@ impl CompositorHandler for App {
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
-        if let Phase::Unlocking(t) = self.phase {
-            if t.elapsed() >= FADE_OUT {
-                self.unlock();
-                return;
-            }
-        }
-        let anim = self.animating();
-        if let Some(s) = self.screens.iter_mut().find(|s| s.surface.wl_surface() == surface) {
-            s.frame_pending = false;
-            s.dirty |= anim;
-        }
-        self.flush();
+        self.frame_done(surface);
     }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
