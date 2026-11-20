@@ -27,6 +27,12 @@ pub struct WindowInfo {
     /// X11 window id (X11 apps register their menu with us by id)
     #[serde(default)]
     pub x11_id: Option<u32>,
+    /// global menu of a GTK app
+    #[serde(default)]
+    pub gtk_menu: Option<crate::gtkmenu::GtkMenuAddr>,
+    /// the window's process (Electron menus are registered per process)
+    #[serde(default)]
+    pub pid: Option<u32>,
     /// minimized: PNG of the window for its Dock tile
     #[serde(default)]
     pub thumb: Option<String>,

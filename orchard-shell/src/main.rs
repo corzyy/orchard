@@ -12,6 +12,7 @@ mod dialog;
 mod dock;
 mod draw;
 mod globalmenu;
+mod gtkmenu;
 mod ipc;
 mod launcher;
 mod launchpad;
@@ -232,9 +233,9 @@ struct App {
     /// global app menus
     gmenu: Option<globalmenu::GlobalMenu>,
     /// menu address of the focused window and the ids of its top-level menus
-    menu_addr: Option<(String, String)>,
+    menu_addr: Option<globalmenu::MenuSource>,
     app_menu_ids: Vec<i32>,
-    gmenu_tx: Sender<(Option<(String, String)>, Vec<(i32, String)>)>,
+    gmenu_tx: Sender<(Option<globalmenu::MenuSource>, Vec<(i32, String)>)>,
 
     /// power / session confirmation dialog
     dialog: Option<dialog::ConfirmDialog>,
@@ -314,7 +315,7 @@ fn main() {
         .expect("polkit channel");
     let polkit_agent = polkit::start(polkit_tx.clone());
     let gmenu = globalmenu::GlobalMenu::start();
-    let (gmenu_tx, gmenu_rx) = channel::channel::<(Option<(String, String)>, Vec<(i32, String)>)>();
+    let (gmenu_tx, gmenu_rx) = channel::channel::<(Option<globalmenu::MenuSource>, Vec<(i32, String)>)>();
     loop_handle
         .insert_source(gmenu_rx, |ev, _, app: &mut App| {
             if let channel::Event::Msg((addr, tops)) = ev {
@@ -1375,13 +1376,29 @@ impl App {
     }
 
     /// Menu address of the focused window (Wayland: from the compositor, X11: registrar).
-    fn focused_menu_address(&self) -> Option<(String, String)> {
+    fn focused_menu_address(&self) -> Option<globalmenu::MenuSource> {
+        use globalmenu::MenuSource;
         let w = self.windows.iter().find(|w| w.focused)?;
         if let Some(m) = &w.menu {
-            return Some((m.service.clone(), m.path.clone()));
+            return Some(MenuSource::DbusMenu { service: m.service.clone(), path: m.path.clone() });
         }
-        let id = w.x11_id?;
-        self.gmenu.as_ref()?.x11_menu(id)
+        if let Some(g) = &w.gtk_menu {
+            return Some(MenuSource::Gtk(g.clone()));
+        }
+        let gmenu = self.gmenu.as_ref()?;
+        let found = match (w.x11_id, w.pid) {
+            (Some(id), _) => gmenu.x11_menu(id),
+            // Wayland Electron: registered for its process, not a window
+            (None, Some(pid)) => {
+                let mut siblings: Vec<u64> =
+                    self.windows.iter().filter(|o| o.pid == Some(pid) && o.x11_id.is_none()).map(|o| o.id).collect();
+                siblings.sort_unstable();
+                let nth = siblings.iter().position(|id| *id == w.id).unwrap_or(0);
+                gmenu.process_menu(pid, nth)
+            }
+            _ => None,
+        };
+        found.map(|(service, path)| MenuSource::DbusMenu { service, path })
     }
 
     /// Load the focused app's menu titles if its menu changed (on a helper thread:
@@ -1399,22 +1416,12 @@ impl App {
         let Some(conn) = self.gmenu.as_ref().map(|g| g.conn.clone()) else { return };
         let tx = self.gmenu_tx.clone();
         let _ = std::thread::Builder::new().name("app-menu".into()).spawn(move || {
-            let tops = addr
-                .as_ref()
-                .and_then(|(s, p)| globalmenu::fetch(&conn, s, p, 0))
-                .map(|root| {
-                    root.children
-                        .into_iter()
-                        .filter(|c| c.visible && !c.separator && !c.label.is_empty())
-                        .map(|c| (c.id, c.label))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let tops = addr.as_ref().map(|a| a.tops(&conn)).unwrap_or_default();
             let _ = tx.send((addr, tops));
         });
     }
 
-    fn on_app_menu(&mut self, addr: Option<(String, String)>, tops: Vec<(i32, String)>) {
+    fn on_app_menu(&mut self, addr: Option<globalmenu::MenuSource>, tops: Vec<(i32, String)>) {
         if addr != self.menu_addr {
             return; // focus moved on meanwhile
         }
@@ -2393,9 +2400,7 @@ impl App {
             BarItem::Dev => self.menubar.dev.as_ref().map(|d| d.menu()).unwrap_or_default(),
             BarItem::AppMenu(i) => {
                 let items = match (&self.menu_addr, self.app_menu_ids.get(i as usize), &self.gmenu) {
-                    (Some((service, path)), Some(id), Some(g)) => {
-                        g.fetch(service, path, *id).map(|n| globalmenu::to_items(&n, service, path)).unwrap_or_default()
-                    }
+                    (Some(source), Some(id), Some(g)) => source.items(&g.conn, *id),
                     _ => Vec::new(),
                 };
                 if items.is_empty() {
@@ -2515,6 +2520,13 @@ impl App {
                     let _ = std::thread::Builder::new()
                         .name("menu-click".into())
                         .spawn(move || globalmenu::click(&conn, &service, &path, id));
+                }
+            }
+            Action::GtkMenu { bus, act } => {
+                if let Some(conn) = self.gmenu.as_ref().map(|g| g.conn.clone()) {
+                    let _ = std::thread::Builder::new()
+                        .name("menu-click".into())
+                        .spawn(move || gtkmenu::activate(&conn, &bus, &act));
                 }
             }
             Action::LogOut => {

@@ -128,6 +128,12 @@ pub struct WindowInfo {
     /// X11 window id (X11 apps register their menu by window id)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x11_id: Option<u32>,
+    /// global menu of a GTK app (gtk_shell1, org.gtk.Menus)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtk_menu: Option<crate::gtk_shell::GtkMenu>,
+    /// process id (Electron registers its menu for a process, not a window)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     /// output and Space (1-based) the window is on; none while minimized
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
@@ -142,6 +148,20 @@ pub struct WindowInfo {
 pub struct MenuAddress {
     pub service: String,
     pub path: String,
+}
+
+fn gtk_menu_and_pid(w: &WindowElement, dh: &smithay::reexports::wayland_server::DisplayHandle) -> (Option<crate::gtk_shell::GtkMenu>, Option<u32>) {
+    use smithay::desktop::WindowSurface;
+    match w.0.underlying_surface() {
+        WindowSurface::Wayland(t) => {
+            let pid = smithay::reexports::wayland_server::Resource::client(t.wl_surface())
+                .and_then(|c| c.get_credentials(dh).ok())
+                .map(|c| c.pid as u32);
+            (crate::gtk_shell::menu(t.wl_surface()), pid)
+        }
+        #[cfg(feature = "xwayland")]
+        WindowSurface::X11(x) => (None, x.pid()),
+    }
 }
 
 fn menu_of(w: &WindowElement) -> (Option<MenuAddress>, Option<u32>) {
@@ -617,6 +637,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             .filter(|w| w.alive())
             .map(|w| {
                 let (menu, x11_id) = menu_of(w);
+                let (gtk_menu, pid) = gtk_menu_and_pid(w, &self.display_handle);
                 let out_obj = self.window_output(w);
                 let output = out_obj.as_ref().map(|o| o.name());
                 let space = out_obj.as_ref().map(|o| self.spaces.info(&o.name()).0 + 1);
@@ -630,6 +651,8 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                     hidden: false,
                     menu,
                     x11_id,
+                    gtk_menu,
+                    pid,
                     output,
                     space,
                     thumb: None,
@@ -650,6 +673,8 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                             hidden: false,
                             menu: None,
                             x11_id: None,
+                            gtk_menu: None,
+                            pid: None,
                             output: Some(name.clone()),
                             space: Some(i + 1),
                             thumb: None,
@@ -670,6 +695,8 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 hidden,
                 menu: None,
                 x11_id: None,
+                gtk_menu: None,
+                pid: None,
                 output: None,
                 space: None,
                 thumb: (!hidden).then(|| crate::wm::thumb_path_of(w)).flatten(),

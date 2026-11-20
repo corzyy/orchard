@@ -24,6 +24,8 @@ pub enum Action {
     Confirm(crate::dialog::DialogKind),
     /// click an item of an app's global menu
     DbusMenu { service: String, path: String, id: i32 },
+    /// run a GTK app's menu action (org.gtk.Actions)
+    GtkMenu { bus: String, act: crate::gtkmenu::Activate },
     /// desktop icon actions
     DesktopOpen(std::path::PathBuf),
     DesktopTrash(std::path::PathBuf),

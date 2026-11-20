@@ -15,6 +15,7 @@ pub mod drawing;
 pub mod effects;
 pub mod focus;
 pub mod fs_reveal;
+pub mod gtk_shell;
 #[cfg(feature = "headless")]
 pub mod headless;
 pub mod input_handler;

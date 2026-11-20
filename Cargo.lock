@@ -2898,6 +2898,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "x11rb",
  "xcursor",
  "xkbcommon 0.8.0",

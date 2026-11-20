@@ -7,6 +7,10 @@
 //!   (`org_kde_kwin_appmenu`), which passes it on in the window list.
 //! * Menus are read with `com.canonical.dbusmenu` (GetLayout / AboutToShow) and
 //!   clicks are sent back as `Event(id, "clicked")`.
+//! * Wayland Electron apps register with the Registrar too, but with an id that
+//!   is no X11 window: those menus are matched to windows by process (the D-Bus
+//!   sender's pid, or the Flatpak sandbox it runs in).
+//! * GTK apps export `GMenuModel` menus instead (see `gtkmenu`).
 
 use std::{
     collections::HashMap,
@@ -36,43 +40,149 @@ pub struct Node {
     pub toggle: Option<bool>,
     pub shortcut: String,
     pub children: Vec<Node>,
+    /// GTK items: the action to run (dbusmenu items are clicked by id)
+    pub gtk: Option<crate::gtkmenu::Activate>,
 }
 
-/// window id -> (sender, menu object path), for X11 apps
-type Windows = Arc<Mutex<HashMap<u32, (String, String)>>>;
+/// Where the focused window's menu comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MenuSource {
+    DbusMenu { service: String, path: String },
+    Gtk(crate::gtkmenu::GtkMenuAddr),
+}
+
+impl MenuSource {
+    /// The menu bar's top-level menus `(id, title)`.
+    pub fn tops(&self, conn: &Connection) -> Vec<(i32, String)> {
+        let root = match self {
+            MenuSource::DbusMenu { service, path } => fetch(conn, service, path, 0),
+            MenuSource::Gtk(addr) => crate::gtkmenu::fetch(conn, addr),
+        };
+        root.map(|r| {
+            r.children
+                .into_iter()
+                .filter(|c| c.visible && !c.separator && !c.label.is_empty())
+                .map(|c| (c.id, c.label))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Items of the top-level menu `id`, freshly read (check marks, recent files …).
+    pub fn items(&self, conn: &Connection, id: i32) -> Vec<MenuItem> {
+        match self {
+            MenuSource::DbusMenu { service, path } => {
+                fetch(conn, service, path, id).map(|n| to_items(&n, service, path)).unwrap_or_default()
+            }
+            MenuSource::Gtk(addr) => crate::gtkmenu::fetch(conn, addr)
+                .and_then(|root| root.children.into_iter().find(|c| c.id == id))
+                .map(|n| to_items(&n, &addr.bus, ""))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// One `RegisterWindow` call.
+#[derive(Debug, Clone)]
+struct Registration {
+    window_id: u32,
+    sender: String,
+    path: String,
+    /// sender's process (for Wayland Electron apps, matched by process)
+    pid: Option<u32>,
+    seq: u64,
+}
+
+type Windows = Arc<Mutex<Vec<Registration>>>;
 
 struct Registrar {
     windows: Windows,
+    seq: std::sync::atomic::AtomicU64,
 }
 
 #[zbus::interface(name = "com.canonical.AppMenu.Registrar")]
 impl Registrar {
-    fn register_window(&self, #[zbus(header)] hdr: zbus::message::Header<'_>, window_id: u32, menu_object_path: OwnedObjectPath) {
+    async fn register_window(
+        &self,
+        #[zbus(header)] hdr: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        window_id: u32,
+        menu_object_path: OwnedObjectPath,
+    ) {
         let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
-        tracing::debug!(window_id, sender, path = %menu_object_path.as_str(), "menu registered");
+        let pid = match (zbus::fdo::DBusProxy::new(conn).await, hdr.sender()) {
+            (Ok(proxy), Some(s)) => proxy.get_connection_unix_process_id(s.clone().into()).await.ok(),
+            _ => None,
+        };
+        tracing::debug!(window_id, sender, ?pid, path = %menu_object_path.as_str(), "menu registered");
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut w) = self.windows.lock() {
-            w.insert(window_id, (sender, menu_object_path.as_str().to_string()));
+            w.retain(|r| !(r.window_id == window_id && r.sender == sender));
+            w.push(Registration { window_id, sender, path: menu_object_path.as_str().to_string(), pid, seq });
         }
     }
 
-    fn unregister_window(&self, window_id: u32) {
+    fn unregister_window(&self, #[zbus(header)] hdr: zbus::message::Header<'_>, window_id: u32) {
+        let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
         if let Ok(mut w) = self.windows.lock() {
-            w.remove(&window_id);
+            w.retain(|r| !(r.window_id == window_id && r.sender == sender));
         }
     }
 
     fn get_menu_for_window(&self, window_id: u32) -> zbus::fdo::Result<(String, OwnedObjectPath)> {
         let w = self.windows.lock().map_err(|_| zbus::fdo::Error::Failed("lock".into()))?;
-        match w.get(&window_id) {
-            Some((s, p)) => Ok((s.clone(), OwnedObjectPath::try_from(p.as_str()).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?)),
+        match w.iter().rev().find(|r| r.window_id == window_id) {
+            Some(r) => Ok((
+                r.sender.clone(),
+                OwnedObjectPath::try_from(r.path.as_str()).map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?,
+            )),
             None => Err(zbus::fdo::Error::Failed("no menu for this window".into())),
         }
     }
 }
 
+/// The `xdg-dbus-proxy` that carries a Flatpak app's session bus.
+///
+/// A sandboxed app talks to D-Bus through its own proxy, so the Registrar
+/// sees the proxy as the sender. Flatpak daemonizes the proxy (it shares no
+/// parent with the app), but the app's sandbox bind-mounts the proxy's socket
+/// (`…/.dbus-proxy/session-bus-proxy-XXXX` at `/run/flatpak/bus`), and the
+/// proxy is the process holding that listening socket.
+pub fn flatpak_session_proxy(app_pid: u32) -> Option<u32> {
+    let mounts = std::fs::read_to_string(format!("/proc/{app_pid}/mountinfo")).ok()?;
+    let name = mounts.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (root, at) = (f.get(3)?, f.get(4)?);
+        (*at == "/run/flatpak/bus").then(|| root.rsplit('/').next()).flatten()
+    })?;
+    if !name.starts_with("session-bus-proxy-") {
+        return None;
+    }
+    let unix = std::fs::read_to_string("/proc/net/unix").ok()?;
+    let inode = unix.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let path = f.get(7)?;
+        (path.rsplit('/').next() == Some(name)).then(|| f.get(6).map(|s| s.to_string())).flatten()
+    })?;
+    let needle = format!("socket:[{inode}]");
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        if std::fs::read_to_string(format!("/proc/{pid}/comm")).map(|c| c.trim() != "xdg-dbus-proxy").unwrap_or(true) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+        if fds.flatten().any(|fd| std::fs::read_link(fd.path()).map(|t| t.to_string_lossy() == needle).unwrap_or(false)) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 pub struct GlobalMenu {
     pub conn: Connection,
     windows: Windows,
+    /// window process -> its Flatpak D-Bus proxy (None: not sandboxed)
+    proxies: Mutex<HashMap<u32, Option<u32>>>,
 }
 
 impl GlobalMenu {
@@ -82,9 +192,10 @@ impl GlobalMenu {
             return None;
         }
         let windows: Windows = Default::default();
+        let registrar = Registrar { windows: windows.clone(), seq: Default::default() };
         let conn = zbus::blocking::connection::Builder::session()
             .map(|b| b.method_timeout(Duration::from_millis(800)))
-            .and_then(|b| b.serve_at("/com/canonical/AppMenu/Registrar", Registrar { windows: windows.clone() }))
+            .and_then(|b| b.serve_at("/com/canonical/AppMenu/Registrar", registrar))
             .and_then(|b| b.build())
             .map_err(|e| tracing::warn!("global menu: no session bus: {e}"))
             .ok()?;
@@ -98,12 +209,42 @@ impl GlobalMenu {
                 tracing::info!("global menu: {REGISTRAR} not acquired ({other:?})");
             }
         }
-        Some(GlobalMenu { conn, windows })
+        Some(GlobalMenu { conn, windows, proxies: Default::default() })
     }
 
     /// Menu address registered for an X11 window.
     pub fn x11_menu(&self, window_id: u32) -> Option<(String, String)> {
-        self.windows.lock().ok()?.get(&window_id).cloned()
+        let w = self.windows.lock().ok()?;
+        w.iter().rev().find(|r| r.window_id == window_id).map(|r| (r.sender.clone(), r.path.clone()))
+    }
+
+    /// Menu registered by the process of a Wayland window that has no menu
+    /// address of its own (Electron). `nth` is the window's position among the
+    /// app's windows (oldest first); registrations are matched in the same order.
+    pub fn process_menu(&self, pid: u32, nth: usize) -> Option<(String, String)> {
+        let mut w = self.windows.lock().ok()?;
+        // senders that exited (their windows closed without unregistering)
+        w.retain(|r| r.pid.map(|p| std::path::Path::new(&format!("/proc/{p}")).exists()).unwrap_or(true));
+        let proxy = self.proxy_of(pid);
+        let mut mine: Vec<&Registration> =
+            w.iter().filter(|r| r.pid.is_some_and(|p| p == pid || Some(p) == proxy)).collect();
+        mine.sort_by_key(|r| r.seq);
+        let r = mine.get(nth).or(mine.last())?;
+        Some((r.sender.clone(), r.path.clone()))
+    }
+
+    /// The Flatpak D-Bus proxy of a window's process (cached; looked up once).
+    fn proxy_of(&self, pid: u32) -> Option<u32> {
+        let mut cache = self.proxies.lock().ok()?;
+        if let Some(p) = cache.get(&pid) {
+            // a proxy that went away (app restarted under a reused pid)
+            if p.is_none_or(|p| std::path::Path::new(&format!("/proc/{p}")).exists()) {
+                return *p;
+            }
+        }
+        let p = flatpak_session_proxy(pid);
+        cache.insert(pid, p);
+        p
     }
 
     /// Children of `parent` (0 = the menu bar itself).
@@ -288,6 +429,9 @@ pub fn to_items(node: &Node, service: &str, path: &str) -> Vec<MenuItem> {
         } else {
             MenuItem::disabled(c.label.clone())
         };
+        if let (Some(act), true) = (&c.gtk, c.enabled && c.children.is_empty()) {
+            item.action = Some(Action::GtkMenu { bus: service.to_string(), act: act.clone() });
+        }
         item.shortcut = c.shortcut.clone();
         item.checked = c.toggle;
         items.push(item);
@@ -301,6 +445,45 @@ pub fn to_items(node: &Node, service: &str, path: &str) -> Vec<MenuItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsandboxed_processes_have_no_proxy() {
+        assert_eq!(flatpak_session_proxy(std::process::id()), None);
+        assert_eq!(flatpak_session_proxy(u32::MAX), None);
+    }
+
+    /// Start a Flatpak (no window) and check its proxy is found:
+    /// `ORCHARD_FLATPAK_TEST=<app pid inside the sandbox> cargo test -p orchard-shell flatpak_proxy -- --ignored`
+    #[test]
+    #[ignore]
+    fn flatpak_proxy_is_found() {
+        let Some(pid) = std::env::var("ORCHARD_FLATPAK_TEST").ok().and_then(|p| p.parse().ok()) else { return };
+        let proxy = flatpak_session_proxy(pid).expect("proxy found");
+        let comm = std::fs::read_to_string(format!("/proc/{proxy}/comm")).unwrap();
+        assert_eq!(comm.trim(), "xdg-dbus-proxy");
+    }
+
+    /// A Wayland Electron app registers a non-X11 id; the registrar must find
+    /// the sender's process and hand the menu to that process's window.
+    /// Needs a session bus: `cargo test -p orchard-shell electron -- --ignored`
+    #[test]
+    #[ignore]
+    fn electron_registration_is_found_by_process() {
+        let Some(g) = GlobalMenu::start() else { return };
+        let me = g.conn.unique_name().unwrap().to_string();
+        let client = Connection::session().unwrap();
+        let path = OwnedObjectPath::try_from("/MenuBar/7").unwrap();
+        client
+            .call_method(Some(me.as_str()), "/com/canonical/AppMenu/Registrar", Some(REGISTRAR), "RegisterWindow", &(7u32, path))
+            .unwrap();
+        let sender = client.unique_name().unwrap().to_string();
+        let found = g.process_menu(std::process::id(), 0);
+        assert_eq!(found, Some((sender.clone(), "/MenuBar/7".to_string())));
+        // not an X11 id of ours, but still looked up by id for X11 apps
+        assert_eq!(g.x11_menu(7), Some((sender, "/MenuBar/7".to_string())));
+        // some other process gets nothing
+        assert_eq!(g.process_menu(1, 0), None);
+    }
 
     #[test]
     fn mnemonics() {
