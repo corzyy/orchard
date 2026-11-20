@@ -9,7 +9,7 @@ use tiny_skia::{FillRule, FilterQuality, Mask, Pixmap, PixmapPaint, Stroke, Tran
 
 use crate::{
     apps::Apps,
-    draw::{fill_rounded, paint, rounded_rect, stroke_rounded},
+    draw::{composite, fill_rounded, paint, rounded_rect, stroke_rounded},
     launcher::score,
     text::{Fonts, Weight},
     theme::Theme,
@@ -99,6 +99,45 @@ pub struct Launchpad {
     pub closing: bool,
     /// last layout, for keyboard navigation and scrolling
     geo: Geometry,
+    cache: Cache,
+}
+
+/// room around the panel for its shadow (logical px)
+const SHADOW_PAD: f32 = 48.0;
+
+struct Cached<K, P> {
+    key: K,
+    pm: P,
+}
+
+/// What the static panel chrome depends on.
+#[derive(Clone, PartialEq)]
+struct BaseKey {
+    size: (u32, u32),
+    query: String,
+    colors: [[u8; 4]; 4],
+    german: bool,
+}
+
+/// What the rendered panel depends on.
+#[derive(PartialEq)]
+struct PanelKey {
+    base: BaseKey,
+    scroll: u32,
+    selected: Option<usize>,
+    hovered: Option<usize>,
+    pressed: Option<isize>,
+    icon_gen: Option<usize>,
+    results: usize,
+}
+
+/// Pre-rendered layers, so animation frames only composite.
+#[derive(Default)]
+struct Cache {
+    shadow: Option<Cached<(u32, u32), Pixmap>>,
+    base: Option<Cached<BaseKey, Pixmap>>,
+    clip: Option<Cached<(u32, u32), Mask>>,
+    panel: Option<Cached<PanelKey, Pixmap>>,
 }
 
 impl Launchpad {
@@ -128,6 +167,7 @@ impl Launchpad {
             open: 0.0,
             closing: false,
             geo: Geometry::new(1920.0, 1080.0),
+            cache: Cache::default(),
         }
     }
 
@@ -342,66 +382,122 @@ impl Launchpad {
         if a <= 0.0 {
             return;
         }
-        let dark = theme.menu_text[0] > 128;
-        let opaque = theme.menu_bg[3] == 255;
-
-        // the panel is painted at full size into its own pixmap, then scaled
-        // and faded into place
-        let (pw, ph) = ((g.w * s).round() as u32, (g.h * s).round() as u32);
-        let Some(mut panel) = Pixmap::new(pw.max(1), ph.max(1)) else { return };
-        let tint = match (dark, opaque) {
-            (_, true) => theme.menu_bg,
-            (true, false) => [32, 32, 34, 168],
-            (false, false) => [248, 248, 250, 160],
-        };
-        fill_rounded(&mut panel, 0.0, 0.0, g.w * s, g.h * s, RADIUS * s, tint);
-        self.paint_header(&mut panel, s, &g, fonts, theme, german);
-        self.paint_grid(&mut panel, s, &g, apps, fonts, theme, german);
-
-        // clip to the rounded panel, then the glass edge on top
-        if let (Some(mut mask), Some(path)) = (Mask::new(pw.max(1), ph.max(1)), rounded_rect(0.0, 0.0, g.w * s, g.h * s, RADIUS * s)) {
-            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
-            panel.apply_mask(&mask);
-        }
-        let edge = if dark { [255, 255, 255, 46] } else { [255, 255, 255, 150] };
-        stroke_rounded(&mut panel, 0.5, 0.5, g.w * s - 1.0, g.h * s - 1.0, RADIUS * s, 1.0, edge);
-
-        // soft shadow under the (scaled) panel
-        let (bx, by, bw, bh, br) = self.backdrop(sw, sh);
-        let layers = (1..=10).map(|i| {
-            let t = i as f32 / 10.0;
-            (30.0 * t, 5.0 * (1.0 - t) + 1.0, 4.0 + 10.0 * t)
-        });
-        for (grow, al, dy) in layers {
-            fill_rounded(
-                pm,
-                (bx - grow) * s,
-                (by - grow + dy) * s,
-                (bw + 2.0 * grow) * s,
-                (bh + 2.0 * grow) * s,
-                (br + grow) * s,
-                [0, 0, 0, (al * a) as u8],
-            );
-        }
-        // the shadow must not darken the blurred glass itself
-        if let Some(p) = rounded_rect(bx * s, by * s, bw * s, bh * s, br * s) {
-            let mut clear = paint([0, 0, 0, 0]);
-            clear.blend_mode = tiny_skia::BlendMode::Clear;
-            pm.fill_path(&p, &clear, FillRule::Winding, Transform::identity(), None);
-        }
+        // Everything expensive (the soft shadow, the frosted tint, the clip
+        // mask, the icon grid) is rendered once into cached pixmaps; a frame
+        // of the open / close animation only composites them, and the panel
+        // contents are re-rendered only when what they show changes.
+        let (pw, ph) = (((g.w * s).round() as u32).max(1), ((g.h * s).round() as u32).max(1));
+        self.ensure_shadow(pw, ph, s, &g);
+        self.ensure_panel(pw, ph, s, &g, apps, fonts, theme, german);
 
         let k = self.zoom();
-        let t = if a >= 1.0 {
-            Transform::from_translate((g.x * s).round(), (g.y * s).round())
+        let (bx, by, _, _, _) = self.backdrop(sw, sh);
+        let settled = a >= 1.0;
+        let (k, ox, oy, px, py) = if settled {
+            (1.0, ((g.x - SHADOW_PAD) * s).round(), ((g.y - SHADOW_PAD) * s).round(), (g.x * s).round(), (g.y * s).round())
         } else {
-            Transform::from_row(k, 0.0, 0.0, k, bx * s, by * s)
+            (k, (bx - SHADOW_PAD * k) * s, (by - SHADOW_PAD * k) * s, bx * s, by * s)
         };
-        let p = PixmapPaint {
-            opacity: a,
-            quality: if a >= 1.0 { FilterQuality::Nearest } else { FilterQuality::Bilinear },
-            ..Default::default()
+        if let Some(c) = self.cache.shadow.as_ref() {
+            composite(pm, &c.pm, ox, oy, k, a);
+        }
+        if let Some(c) = self.cache.panel.as_ref() {
+            composite(pm, &c.pm, px, py, k, a);
+        }
+    }
+
+    /// The soft shadow around the settled panel, with the panel itself cut
+    /// out (it must not darken the blurred glass). Offset by `SHADOW_PAD`.
+    fn ensure_shadow(&mut self, pw: u32, ph: u32, s: f32, g: &Geometry) {
+        let key = (pw, ph);
+        if self.cache.shadow.as_ref().is_some_and(|c| c.key == key) {
+            return;
+        }
+        let pad = SHADOW_PAD * s;
+        let Some(mut sp) = Pixmap::new(pw + 2 * pad.ceil() as u32, ph + 2 * pad.ceil() as u32) else { return };
+        for i in 1..=10 {
+            let t = i as f32 / 10.0;
+            let (grow, al, dy) = (30.0 * t, 5.0 * (1.0 - t) + 1.0, 4.0 + 10.0 * t);
+            fill_rounded(
+                &mut sp,
+                pad - grow * s,
+                pad + (dy - grow) * s,
+                (g.w + 2.0 * grow) * s,
+                (g.h + 2.0 * grow) * s,
+                (RADIUS + grow) * s,
+                [0, 0, 0, al as u8],
+            );
+        }
+        if let Some(p) = rounded_rect(pad, pad, g.w * s, g.h * s, RADIUS * s) {
+            let mut clear = paint([0, 0, 0, 0]);
+            clear.blend_mode = tiny_skia::BlendMode::Clear;
+            sp.fill_path(&p, &clear, FillRule::Winding, Transform::identity(), None);
+        }
+        self.cache.shadow = Some(Cached { key, pm: sp });
+    }
+
+    /// The panel at full size: tint, search field, grid, glass edge.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_panel(&mut self, pw: u32, ph: u32, s: f32, g: &Geometry, apps: &Apps, fonts: &Fonts, theme: &Theme, german: bool) {
+        let base_key = BaseKey {
+            size: (pw, ph),
+            query: self.query.clone(),
+            colors: [theme.menu_text, theme.menu_bg, theme.menu_selection, theme.menu_separator],
+            german,
         };
-        pm.draw_pixmap(0, 0, panel.as_ref(), &p, t, None);
+        let key = PanelKey {
+            base: base_key.clone(),
+            scroll: self.scroll.to_bits(),
+            selected: self.selected,
+            hovered: self.hovered,
+            pressed: self.pressed.map(|h| match h {
+                Hit::App(i) => i as isize,
+                _ => -1,
+            }),
+            // a new icon theme clears the icon cache: the fallback icon is a
+            // fresh pixmap then
+            icon_gen: apps
+                .icon("application-x-executable", (ICON * s).round() as u32)
+                .map(|p| std::rc::Rc::as_ptr(&p) as usize),
+            results: self.results.len(),
+        };
+        if self.cache.panel.as_ref().is_some_and(|c| c.key == key) {
+            return;
+        }
+
+        // static chrome: tint, search field, hairline, glass edge
+        if !self.cache.base.as_ref().is_some_and(|c| c.key == base_key) {
+            let Some(mut base) = Pixmap::new(pw, ph) else { return };
+            let dark = theme.menu_text[0] > 128;
+            let tint = match (dark, theme.menu_bg[3] == 255) {
+                (_, true) => theme.menu_bg,
+                (true, false) => [32, 32, 34, 168],
+                (false, false) => [248, 248, 250, 160],
+            };
+            fill_rounded(&mut base, 0.0, 0.0, g.w * s, g.h * s, RADIUS * s, tint);
+            self.paint_header(&mut base, s, g, fonts, theme, german);
+            let edge = if dark { [255, 255, 255, 46] } else { [255, 255, 255, 150] };
+            stroke_rounded(&mut base, 0.5, 0.5, g.w * s - 1.0, g.h * s - 1.0, RADIUS * s, 1.0, edge);
+            self.cache.base = Some(Cached { key: base_key, pm: base });
+        }
+        if !self.cache.clip.as_ref().is_some_and(|c| c.key == (pw, ph)) {
+            let (Some(mut mask), Some(path)) = (Mask::new(pw, ph), rounded_rect(0.0, 0.0, g.w * s, g.h * s, RADIUS * s)) else { return };
+            mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+            self.cache.clip = Some(Cached { key: (pw, ph), pm: mask });
+        }
+
+        // reuse the previous panel's allocation
+        let mut panel = match self.cache.panel.take() {
+            Some(c) if c.pm.width() == pw && c.pm.height() == ph => c.pm,
+            _ => match Pixmap::new(pw, ph) {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        let (Some(base), Some(clip)) = (self.cache.base.as_ref(), self.cache.clip.as_ref()) else { return };
+        panel.data_mut().copy_from_slice(base.pm.data());
+        self.paint_grid(&mut panel, &clip.pm, s, g, apps, fonts, theme, german);
+        self.cache.panel = Some(Cached { key, pm: panel });
     }
 
     /// Search field: magnifier, query or placeholder, and the result count.
@@ -458,7 +554,7 @@ impl Launchpad {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_grid(&self, pm: &mut Pixmap, s: f32, g: &Geometry, apps: &Apps, fonts: &Fonts, theme: &Theme, german: bool) {
+    fn paint_grid(&self, pm: &mut Pixmap, clip: &Mask, s: f32, g: &Geometry, apps: &Apps, fonts: &Fonts, theme: &Theme, german: bool) {
         let text = theme.menu_text;
         // grid area: below the hairline down to the panel's bottom edge
         let area_top = HEADER_H;
@@ -511,7 +607,7 @@ impl Launchpad {
                 if let Some(icon) = icon {
                     let k = img_px as f32 / icon.width() as f32;
                     let p = PixmapPaint {
-                        quality: FilterQuality::Bilinear,
+                        quality: if icon.width() == img_px { FilterQuality::Nearest } else { FilterQuality::Bilinear },
                         ..Default::default()
                     };
                     let (ix, iy) = ((x * s).round(), (y * s).round());
@@ -545,7 +641,8 @@ impl Launchpad {
             area.as_ref(),
             &PixmapPaint::default(),
             Transform::identity(),
-            None,
+            // rounded bottom corners
+            Some(clip),
         );
     }
 }

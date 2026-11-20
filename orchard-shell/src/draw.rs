@@ -52,11 +52,24 @@ pub fn fill_circle(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
 
 /// Copy a premultiplied RGBA pixmap into a wl_shm ARGB8888 canvas (BGRA bytes).
 pub fn blit_to_shm(pm: &Pixmap, canvas: &mut [u8]) {
+    // RGBA -> BGRA as one u32 swap of the R and B bytes (vectorizes well;
+    // full-screen surfaces are tens of MB per frame on HiDPI)
     for (dst, src) in canvas.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        dst[3] = src[3];
+        let v = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+        let v = (v & 0xFF00_FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+        dst.copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod blit_tests {
+    #[test]
+    fn swaps_red_and_blue() {
+        let mut pm = tiny_skia::Pixmap::new(2, 1).unwrap();
+        pm.data_mut().copy_from_slice(&[1, 2, 3, 4, 10, 20, 30, 40]);
+        let mut out = [0u8; 8];
+        super::blit_to_shm(&pm, &mut out);
+        assert_eq!(out, [3, 2, 1, 4, 30, 20, 10, 40]);
     }
 }
 
@@ -80,5 +93,162 @@ mod clamp_tests {
         assert_eq!(clamp_span(f32::NAN, 4.0, 8.0), 4.0);
         assert_eq!(clamp_span(1.0, 4.0, 8.0), 4.0);
         assert_eq!(clamp_span(9.0, 4.0, 8.0), 8.0);
+    }
+}
+
+/// Source-over `src` onto `dst` (both premultiplied RGBA), scaled by `k`
+/// with its top-left corner at (`x`, `y`), faded by `opacity`. Much cheaper
+/// than tiny-skia's generic pipeline for big layers: an unscaled, pixel
+/// aligned layer is a straight blend, a scaled one is sampled bilinearly
+/// in fixed point, and fully transparent source pixels are skipped.
+pub fn composite(dst: &mut Pixmap, src: &Pixmap, x: f32, y: f32, k: f32, opacity: f32) {
+    let op = (opacity.clamp(0.0, 1.0) * 256.0).round() as u32;
+    if op == 0 || k <= 0.0 || !x.is_finite() || !y.is_finite() {
+        return;
+    }
+    let (dw, dh) = (dst.width() as i32, dst.height() as i32);
+    let (sw, sh) = (src.width() as i32, src.height() as i32);
+    let x0 = (x.floor() as i32).max(0);
+    let y0 = (y.floor() as i32).max(0);
+    let x1 = ((x + sw as f32 * k).ceil() as i32).min(dw);
+    let y1 = ((y + sh as f32 * k).ceil() as i32).min(dh);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let s = src.data();
+    let d = dst.data_mut();
+    let aligned = (k - 1.0).abs() < 1e-4 && x.fract() == 0.0 && y.fract() == 0.0;
+
+    #[inline(always)]
+    fn over(d: &mut [u8], c: [u32; 4]) {
+        let ia = 255 - c[3];
+        for i in 0..4 {
+            let t = d[i] as u32 * ia + 128;
+            d[i] = (c[i] + ((t + (t >> 8)) >> 8)).min(255) as u8;
+        }
+    }
+
+    if aligned {
+        let (ox, oy) = (x as i32, y as i32);
+        for dy in y0..y1 {
+            let sy = dy - oy;
+            let srow = &s[(sy * sw) as usize * 4..][..sw as usize * 4];
+            let drow = &mut d[(dy * dw) as usize * 4..][..dw as usize * 4];
+            for dx in x0..x1 {
+                let si = (dx - ox) as usize * 4;
+                let a = srow[si + 3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let di = dx as usize * 4;
+                let px = &srow[si..si + 4];
+                if a == 255 && op == 256 {
+                    drow[di..di + 4].copy_from_slice(px);
+                    continue;
+                }
+                let c = [
+                    px[0] as u32 * op >> 8,
+                    px[1] as u32 * op >> 8,
+                    px[2] as u32 * op >> 8,
+                    a * op >> 8,
+                ];
+                over(&mut drow[di..di + 4], c);
+            }
+        }
+        return;
+    }
+
+    // bilinear: taps outside `src` are transparent, so the edges stay smooth
+    let inv = 1.0 / k;
+    // per-column source index and weight, the same for every row
+    let cols: Vec<(i32, u32)> = (x0..x1)
+        .map(|dx| {
+            let fx = (dx as f32 + 0.5 - x) * inv - 0.5;
+            let ix = fx.floor();
+            (ix as i32, ((fx - ix) * 256.0) as u32)
+        })
+        .collect();
+    let row_of = |iy: i32| -> &[u8] {
+        if iy < 0 || iy >= sh {
+            &[]
+        } else {
+            &s[(iy * sw) as usize * 4..][..sw as usize * 4]
+        }
+    };
+    #[inline(always)]
+    fn px(row: &[u8], ix: i32) -> u32 {
+        if ix < 0 || (ix as usize + 1) * 4 > row.len() {
+            0
+        } else {
+            let i = ix as usize * 4;
+            u32::from_le_bytes([row[i], row[i + 1], row[i + 2], row[i + 3]])
+        }
+    }
+    // weighted sum of two RGBA pixels, two channels at a time (8.8 fixed point)
+    #[inline(always)]
+    fn lerp(a: u32, b: u32, w: u32) -> u32 {
+        let (iw, mask) = (256 - w, 0x00FF_00FF);
+        let rb = ((a & mask) * iw + (b & mask) * w) >> 8 & mask;
+        let ga = (((a >> 8) & mask) * iw + ((b >> 8) & mask) * w) & !mask;
+        rb | ga
+    }
+    for dy in y0..y1 {
+        let fy = (dy as f32 + 0.5 - y) * inv - 0.5;
+        let iy = fy.floor();
+        let wy = ((fy - iy) * 256.0) as u32;
+        let (r0, r1) = (row_of(iy as i32), row_of(iy as i32 + 1));
+        if r0.is_empty() && r1.is_empty() {
+            continue;
+        }
+        let drow = &mut d[(dy * dw) as usize * 4..][..dw as usize * 4];
+        for (dx, &(ix, wx)) in (x0..x1).zip(cols.iter()) {
+            let top = lerp(px(r0, ix), px(r0, ix + 1), wx);
+            let bot = lerp(px(r1, ix), px(r1, ix + 1), wx);
+            let mut v = lerp(top, bot, wy);
+            if v >> 24 == 0 {
+                continue;
+            }
+            if op < 256 {
+                v = lerp(0, v, op);
+            }
+            let b = v.to_le_bytes();
+            let di = dx as usize * 4;
+            over(&mut drow[di..di + 4], [b[0] as u32, b[1] as u32, b[2] as u32, b[3] as u32]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use tiny_skia::Pixmap;
+
+    fn solid(w: u32, h: u32, px: [u8; 4]) -> Pixmap {
+        let mut pm = Pixmap::new(w, h).unwrap();
+        for c in pm.data_mut().chunks_exact_mut(4) {
+            c.copy_from_slice(&px);
+        }
+        pm
+    }
+
+    #[test]
+    fn aligned_copy_and_blend() {
+        let mut dst = solid(4, 4, [0, 0, 255, 255]);
+        super::composite(&mut dst, &solid(2, 2, [255, 0, 0, 255]), 1.0, 1.0, 1.0, 1.0);
+        assert_eq!(&dst.data()[(4 + 1) * 4..][..4], &[255, 0, 0, 255]);
+        assert_eq!(&dst.data()[..4], &[0, 0, 255, 255], "outside untouched");
+        // half-transparent premultiplied red over blue
+        let mut dst = solid(1, 1, [0, 0, 255, 255]);
+        super::composite(&mut dst, &solid(1, 1, [128, 0, 0, 128]), 0.0, 0.0, 1.0, 1.0);
+        let p = &dst.data()[..4];
+        assert!(p[0] == 128 && (126..=128).contains(&p[2]) && p[3] == 255, "{p:?}");
+    }
+
+    #[test]
+    fn scaled_and_faded_stays_in_bounds() {
+        let mut dst = Pixmap::new(10, 10).unwrap();
+        super::composite(&mut dst, &solid(8, 8, [255, 255, 255, 255]), -3.0, 5.5, 0.9, 0.5);
+        let centre = &dst.data()[(7 * 10 + 1) * 4..][..4];
+        assert!((120..=130).contains(&centre[3]), "{centre:?}");
+        assert!(dst.data().chunks_exact(4).all(|p| p[0] <= p[3]), "stays premultiplied");
     }
 }
