@@ -265,6 +265,27 @@ pub fn battery(s: &Settings, st: &mut SystemState, wake: &Wake) -> El {
                 |v| edit(move |s| s.performance.battery_saver = v),
             ),
         ]))
+        .push(form::section("Game Mode"))
+        .push(form::group([
+            form::toggle_row(
+                "Game Mode",
+                some("Turns on by itself while a game runs full screen. Hot corners, live blur and the idle lock pause"),
+                s.game_mode.enabled,
+                |v| edit(move |s| s.game_mode.enabled = v),
+            ),
+            form::toggle_row(
+                "Silence notifications",
+                some("Hold back banners while playing; they wait in Notification Center"),
+                s.game_mode.silence_notifications,
+                |v| edit(move |s| s.game_mode.silence_notifications = v),
+            ),
+            form::toggle_row(
+                "Variable Refresh Rate for games",
+                some("Adaptive Sync on the game's display, even when VRR is off above"),
+                s.game_mode.vrr,
+                |v| edit(move |s| s.game_mode.vrr = v),
+            ),
+        ]))
         .into()
 }
 

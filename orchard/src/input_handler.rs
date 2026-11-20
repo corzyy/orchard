@@ -935,7 +935,13 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                     Some(constraint) if constraint.is_active() => {
                         let origin = win.as_ref().map(|w| w.1);
                         match &*constraint {
-                            PointerConstraint::Locked(_) => pointer_locked = true,
+                            PointerConstraint::Locked(_) => {
+                                pointer_locked = true;
+                                // mouse look: Game Mode treats it as a game
+                                if let Some((w, _, _)) = &win {
+                                    crate::game_mode::note_pointer_lock(w);
+                                }
+                            }
                             PointerConstraint::Confined(c) => {
                                 if let Some((_, origin, frame)) = &win {
                                     confine = Some((*origin, *frame, c.region().cloned()));

@@ -769,6 +769,24 @@ impl PerformanceSettings {
     }
 }
 
+/// Game Mode: switched on automatically while a game runs full screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameModeSettings {
+    /// Turn Game Mode on whenever a game is full screen (Control Center switch).
+    pub enabled: bool,
+    /// Hold back notification banners (critical ones still show).
+    pub silence_notifications: bool,
+    /// Variable refresh rate on the game's display, even if VRR is off otherwise.
+    pub vrr: bool,
+}
+
+impl Default for GameModeSettings {
+    fn default() -> Self {
+        Self { enabled: true, silence_notifications: true, vrr: true }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NightShiftSchedule {
@@ -932,6 +950,43 @@ pub fn kelvin_to_rgb(kelvin: f32) -> [f32; 3] {
     [0, 1, 2].map(|i| (c[i] / white[i]).clamp(0.0, 1.0))
 }
 
+/// How Stage Manager groups windows of the same application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StageAppWindows {
+    /// All windows of an app appear together in one stage (macOS default).
+    #[default]
+    AllAtOnce,
+    /// Each window forms its own stage.
+    OneAtATime,
+}
+
+/// macOS-style Stage Manager settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StageManagerSettings {
+    /// Master toggle (also switchable from Control Center).
+    pub enabled: bool,
+    /// Keep the recent-apps strip visible along the side (when false, it
+    /// reveals on screen-edge hover).
+    pub show_recent_apps: bool,
+    /// Clicking empty wallpaper moves the active stage aside to reveal desktop items.
+    pub click_wallpaper_to_reveal: bool,
+    /// Show all windows of an app at once, or one at a time.
+    pub app_windows: StageAppWindows,
+}
+
+impl Default for StageManagerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_recent_apps: true,
+            click_wallpaper_to_reveal: true,
+            app_windows: StageAppWindows::AllAtOnce,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
@@ -940,6 +995,7 @@ pub struct Settings {
     pub menu_bar: MenuBarSettings,
     pub windows: WindowSettings,
     pub tiling: TilingSettings,
+    pub stage_manager: StageManagerSettings,
     pub keyboard: KeyboardSettings,
     pub pointer: PointerSettings,
     pub desktop: DesktopSettings,
@@ -948,6 +1004,7 @@ pub struct Settings {
     pub apps: AppSettings,
     pub performance: PerformanceSettings,
     pub night_shift: NightShiftSettings,
+    pub game_mode: GameModeSettings,
 }
 
 pub fn config_dir() -> PathBuf {

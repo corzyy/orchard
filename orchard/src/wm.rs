@@ -447,6 +447,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         self.prune_spaces();
         self.sync_foreign_toplevels();
         self.tick_mission_control();
+        self.update_game_mode();
         self.ipc_broadcast_if_changed();
         let now: std::time::Duration = self.clock.now().into();
         if self

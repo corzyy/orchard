@@ -2002,11 +2002,13 @@ fn render_surface(
             .get::<crate::shell::FullscreenSurface>()
             .and_then(|f| f.get())
             .is_some();
-        let want_vrr = match perf.vrr {
-            orchard_config::VrrMode::Off => false,
-            orchard_config::VrrMode::Fullscreen => has_fullscreen,
-            orchard_config::VrrMode::On => true,
-        };
+        let game_here = settings.game_mode.vrr && crate::game_mode::output().as_deref() == Some(output.name().as_str());
+        let want_vrr = game_here
+            || match perf.vrr {
+                orchard_config::VrrMode::Off => false,
+                orchard_config::VrrMode::Fullscreen => has_fullscreen,
+                orchard_config::VrrMode::On => true,
+            };
         let cur_vrr = surface.drm_output.with_compositor(|c| c.vrr_enabled());
         if want_vrr != cur_vrr {
             if let Err(err) = surface.drm_output.with_compositor(|c| c.use_vrr(want_vrr)) {

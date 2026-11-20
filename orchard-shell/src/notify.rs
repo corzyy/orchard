@@ -102,6 +102,8 @@ pub struct Center {
     /// pointer position (surface-local) while over the banner surface
     pub hover: Option<(f32, f32)>,
     pub do_not_disturb: bool,
+    /// Game Mode holds banners back (without touching the saved DND switch)
+    pub game_quiet: bool,
 }
 
 /// Text layout of one notification card.
@@ -294,7 +296,7 @@ impl Center {
             b.expires = expires;
             return;
         }
-        if self.do_not_disturb && !n.critical {
+        if (self.do_not_disturb || self.game_quiet) && !n.critical {
             return;
         }
         self.banners.insert(0, Banner { n, shown: now, expires });

@@ -50,6 +50,8 @@ pub struct MenuBar {
     pub open: Option<BarItem>,
     /// Do Not Disturb is on: show a moon
     pub dnd: bool,
+    /// Game Mode is on: a controller next to the clock
+    pub game: bool,
     /// titles of the focused app's global menu (empty: Window + Help)
     pub app_menus: Vec<String>,
     /// source checkout status for the Rebuild item (`None`: hidden)
@@ -75,6 +77,7 @@ impl MenuBar {
             volume: None,
             open: None,
             dnd: false,
+            game: false,
             app_menus: Vec::new(),
             dev: crate::devbuild::DevBuild::detect(),
             dev_spin: 0,
@@ -227,6 +230,9 @@ impl MenuBar {
     /// Left edge after DND moon and battery (system tray icons sit to the left of this).
     fn tray_right_edge(&self, fonts: &Fonts, width: f32) -> f32 {
         let mut x = self.status_left_edge(fonts, width) - 4.0;
+        if self.game {
+            x -= 24.0;
+        }
         if self.dnd {
             x -= 22.0;
         }
@@ -372,6 +378,10 @@ impl MenuBar {
         }
 
         let mut x = self.status_left_edge(fonts, w) - 4.0;
+        if self.game {
+            x -= 24.0;
+            crate::panel::controller(pm, (x + 12.0) * s, HEIGHT / 2.0 * s, 7.0 * s, theme.bar_text);
+        }
         if self.dnd {
             x -= 22.0;
             crate::panel::moon(pm, (x + 11.0) * s, HEIGHT / 2.0 * s, 6.0 * s, theme.bar_text);

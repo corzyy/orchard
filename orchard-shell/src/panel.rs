@@ -116,6 +116,8 @@ pub enum Target {
     ClearAll,
     Dnd,
     NightShift,
+    StageManager,
+    GameMode,
     WifiToggle,
     BluetoothToggle,
     OpenSubmenu(Submenu),
@@ -166,6 +168,12 @@ pub struct Panel {
     pub dragging: Option<Target>,
     /// Night Shift on right now (schedule or manual switch)
     pub night_shift: bool,
+    /// Stage Manager active right now
+    pub stage_manager: bool,
+    /// Game Mode switches on by itself for full-screen games
+    pub game_mode_enabled: bool,
+    /// the game Game Mode is on for
+    pub game_active: Option<String>,
     // filled by paint, used for hit tests
     targets: Vec<((f32, f32, f32, f32), Target)>,
     cards: Vec<CardHit>,
@@ -189,6 +197,9 @@ impl Panel {
             control: ControlState::default(),
             dragging: None,
             night_shift: false,
+            stage_manager: false,
+            game_mode_enabled: true,
+            game_active: None,
             targets: Vec::new(),
             cards: Vec::new(),
             panel_rect: (0.0, 0.0, 0.0, 0.0),
@@ -458,6 +469,8 @@ impl Panel {
 
         // compute height first
         let mut height = pad + 110.0 + pad;
+        height += 50.0 + pad; // stage manager
+        height += GAME_CARD_H + pad;
         let disp_count = self.control.displays.len();
         if disp_count == 1 {
             height += 64.0 + pad;
@@ -587,8 +600,55 @@ impl Panel {
             self.targets.push(((fx, cy0, half, card_h), target));
         }
 
+        // Stage Manager: quick toggle card (macOS Control Center)
+        let sm_y = y + 110.0 + pad;
+        let sm_h = 50.0;
+        {
+            let sm_on = self.stage_manager;
+            let hovered = self.hovered(inner_x, sm_y, inner_w, sm_h);
+            fill_rounded(pm, inner_x * s, sm_y * s, inner_w * s, sm_h * s, 14.0 * s, if hovered && !sm_on { hover_bg } else { card });
+            stroke_rounded(pm, inner_x * s, sm_y * s, inner_w * s, sm_h * s, 14.0 * s, 0.75 * s, card_border);
+            let (cx, cy) = (inner_x + 22.0, sm_y + sm_h / 2.0);
+            fill_circle(pm, cx * s, cy * s, 14.0 * s, if sm_on { accent } else { off });
+            stage_manager_glyph(pm, cx * s, cy * s, 6.8 * s, if sm_on { [255, 255, 255, 255] } else { text });
+            let tx = inner_x + 42.0;
+            let maxw = inner_w - 104.0;
+            let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
+            fonts.draw(pm, &fonts.elide("Stage Manager", 12.0 * s, Weight::Bold, maxw * s), tx * s, b1, 12.0 * s, Weight::Bold, text);
+            let b2 = fonts.baseline_centered((cy + 1.0) * s, 14.0 * s, 11.0 * s, Weight::Regular);
+            fonts.draw(pm, if sm_on { t("On", "Ein") } else { t("Off", "Aus") }, tx * s, b2, 11.0 * s, Weight::Regular, sub);
+            switch(pm, s, inner_x + inner_w - 50.0, sm_y + (sm_h - 22.0) / 2.0, sm_on, accent, dark);
+            self.targets.push(((inner_x, sm_y, inner_w, sm_h), Target::StageManager));
+        }
+
+        // Game Mode: full width under Stage Manager
+        let gy = sm_y + sm_h + pad;
+        {
+            let on = self.game_mode_enabled;
+            let hovered = self.hovered(inner_x, gy, inner_w, GAME_CARD_H);
+            fill_rounded(pm, inner_x * s, gy * s, inner_w * s, GAME_CARD_H * s, 14.0 * s, if hovered && !on { hover_bg } else { card });
+            stroke_rounded(pm, inner_x * s, gy * s, inner_w * s, GAME_CARD_H * s, 14.0 * s, 0.75 * s, card_border);
+            let (cx, cy) = (inner_x + 22.0, gy + GAME_CARD_H / 2.0);
+            let active = self.game_active.is_some();
+            let circle = if active { [52, 199, 89, 255] } else if on { accent } else { off };
+            fill_circle(pm, cx * s, cy * s, 14.0 * s, circle);
+            controller(pm, cx * s, cy * s, 7.0 * s, if on { [255, 255, 255, 255] } else { text });
+            let tx = inner_x + 42.0;
+            let maxw = inner_w - 50.0;
+            let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
+            fonts.draw(pm, t("Game Mode", "Spielmodus"), tx * s, b1, 12.0 * s, Weight::Bold, text);
+            let status = match (&self.game_active, on) {
+                (Some(game), _) => if german { format!("Ein · {game}") } else { format!("On · {game}") },
+                (None, true) => t("Automatic: on while a game is full screen", "Automatisch: an, wenn ein Spiel im Vollbild läuft").to_string(),
+                (None, false) => t("Off", "Aus").to_string(),
+            };
+            let b2 = fonts.baseline_centered((cy + 1.0) * s, 14.0 * s, 11.0 * s, Weight::Regular);
+            fonts.draw(pm, &fonts.elide(&status, 11.0 * s, Weight::Regular, maxw * s), tx * s, b2, 11.0 * s, Weight::Regular, sub);
+            self.targets.push(((inner_x, gy, inner_w, GAME_CARD_H), Target::GameMode));
+        }
+
         // sliders
-        let mut y = y + 110.0 + pad;
+        let mut y = gy + GAME_CARD_H + pad;
         if self.control.displays.len() == 1 {
             let d = &self.control.displays[0];
             fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
@@ -1335,6 +1395,27 @@ pub fn moon(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     }
 }
 
+/// Height of the Control Center's Game Mode card.
+const GAME_CARD_H: f32 = 50.0;
+
+/// A game controller outline with a d-pad and two buttons (Game Mode).
+pub fn controller(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let (w, h) = (r * 2.3, r * 1.45);
+    crate::draw::stroke_rounded(pm, cx - w / 2.0, cy - h / 2.0, w, h, h * 0.45, r * 0.2, c);
+    let mut pb = PathBuilder::new();
+    let (dx, d) = (cx - w * 0.24, r * 0.32);
+    pb.move_to(dx - d, cy);
+    pb.line_to(dx + d, cy);
+    pb.move_to(dx, cy - d);
+    pb.line_to(dx, cy + d);
+    if let Some(p) = pb.finish() {
+        let st = Stroke { width: r * 0.18, line_cap: LineCap::Round, ..Default::default() };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+    fill_circle(pm, cx + w * 0.2, cy - r * 0.12, r * 0.14, c);
+    fill_circle(pm, cx + w * 0.3, cy + r * 0.16, r * 0.14, c);
+}
+
 /// A sun: a disc with eight short rays (Night Shift).
 pub fn sun(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     fill_circle(pm, cx, cy, r * 0.5, c);
@@ -1353,6 +1434,25 @@ pub fn sun(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
         };
         pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
     }
+}
+
+/// macOS Stage Manager glyph: three stacked recent tiles on the left + main window on the right.
+pub fn stage_manager_glyph(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let left_x = cx - r * 1.02;
+    let tile_w = r * 0.42;
+    let tile_h = r * 0.34;
+    let gap = r * 0.16;
+    let total_h = tile_h * 3.0 + gap * 2.0;
+    let top_y = cy - total_h / 2.0;
+    for i in 0..3 {
+        let ty = top_y + i as f32 * (tile_h + gap);
+        fill_rounded(pm, left_x, ty, tile_w, tile_h, r * 0.12, c);
+    }
+    let main_x = left_x + tile_w + r * 0.24;
+    let main_w = r * 1.38;
+    let main_h = total_h * 0.92;
+    let main_y = cy - main_h / 2.0;
+    stroke_rounded(pm, main_x, main_y, main_w, main_h, r * 0.24, (r * 0.22).max(1.2), c);
 }
 
 fn bluetooth(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {

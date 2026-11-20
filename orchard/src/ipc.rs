@@ -192,6 +192,8 @@ pub enum Event<'a> {
     LaunchpadToggle,
     /// settings.json changed; clients should reload it
     SettingsChanged,
+    /// a game went full screen / left it (`silence`: hold back banners)
+    GameMode { active: bool, app_id: Option<String>, silence: bool },
     /// volume / brightness / media key pressed (orchard-shell runs it and shows the HUD)
     MediaKey { key: &'static str, fine: bool },
     /// whether any visible window currently overlaps the Dock's resting rect
@@ -466,6 +468,14 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 let obstructed = self.is_dock_obstructed();
                 self.ipc.last_dock_obstructed = obstructed;
                 let _ = send_line(stream, &Event::DockObstructed { obstructed });
+                let _ = send_line(
+                    stream,
+                    &Event::GameMode {
+                        active: self.game_mode.is_some(),
+                        app_id: self.game_mode.as_ref().map(|g| g.app_id.clone()),
+                        silence: crate::settings::get().game_mode.silence_notifications,
+                    },
+                );
                 None
             }
             Request::Windows => {

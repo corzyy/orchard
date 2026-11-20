@@ -15,6 +15,7 @@ pub mod drawing;
 pub mod effects;
 pub mod focus;
 pub mod fs_reveal;
+pub mod game_mode;
 pub mod gtk_shell;
 #[cfg(feature = "headless")]
 pub mod headless;

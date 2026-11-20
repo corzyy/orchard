@@ -229,6 +229,8 @@ struct App {
     vol_pending: Arc<AtomicBool>,
     status_tick: u32,
     low_battery: lowbattery::Watch,
+    /// Game Mode: name of the full-screen game
+    game: Option<String>,
 
     /// global app menus
     gmenu: Option<globalmenu::GlobalMenu>,
@@ -427,6 +429,7 @@ fn main() {
         vol_pending: Arc::new(AtomicBool::new(false)),
         status_tick: 0,
         low_battery: lowbattery::Watch::default(),
+        game: None,
         gmenu,
         menu_addr: None,
         app_menu_ids: Vec::new(),
@@ -1239,6 +1242,12 @@ impl App {
                         self.toggle_screenshot_tool(output, windows);
                     }
                     Some("settings_changed") => self.reload_settings(),
+                    Some("game_mode") => {
+                        let active = v["active"].as_bool().unwrap_or(false);
+                        let app_id = v["app_id"].as_str().map(str::to_string);
+                        let silence = v["silence"].as_bool().unwrap_or(true);
+                        self.on_game_mode(active, app_id, silence);
+                    }
                     Some("dock_obstructed") => {
                         let obstructed = v["obstructed"].as_bool().unwrap_or(false);
                         if self.dock.obstructed != obstructed {
@@ -1276,6 +1285,10 @@ impl App {
         let was_showing_volume = self.menubar.cfg.show_volume;
         self.menubar.cfg = s.menu_bar.clone();
         self.menubar.tiling_mode = s.windows.tiling_mode;
+        if let Some(p) = self.panel.as_mut() {
+            p.night_shift = s.night_shift.active_now();
+            p.stage_manager = s.stage_manager.enabled;
+        }
         self.menubar.refresh_status_with(self.perf.battery_saver);
         if self.menubar.cfg.show_volume && !was_showing_volume {
             self.refresh_volume();
@@ -1543,7 +1556,9 @@ impl App {
     /// Slow status-poll cadence (seconds): relaxed on battery or in Power Saver.
     fn slow_poll_interval(&self) -> u64 {
         let on_battery = self.menubar.battery.as_ref().map(|b| !b.charging).unwrap_or(false);
-        if self.perf.preset == orchard_config::PerformancePreset::PowerSaver
+        // Game Mode: keep the background quiet while playing
+        if self.game.is_some()
+            || self.perf.preset == orchard_config::PerformancePreset::PowerSaver
             || (self.perf.battery_saver && on_battery)
         {
             30
@@ -2589,6 +2604,9 @@ impl App {
             Action::SetTilingMode(mode) => {
                 let mut s = orchard_config::Settings::load();
                 s.windows.tiling_mode = mode;
+                if mode == orchard_config::TilingMode::Tiling {
+                    s.stage_manager.enabled = false;
+                }
                 if let Err(e) = s.save() {
                     tracing::warn!("saving tiling mode: {e}");
                 }

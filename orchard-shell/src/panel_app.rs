@@ -48,7 +48,11 @@ impl App {
         let mut p = Panel::new(kind, anchor);
         if kind == Kind::Control {
             p.control = self.control_cache.clone();
-            p.night_shift = orchard_config::Settings::load().night_shift.active_now();
+            let settings = orchard_config::Settings::load();
+            p.night_shift = settings.night_shift.active_now();
+            p.stage_manager = settings.stage_manager.enabled;
+            p.game_mode_enabled = settings.game_mode.enabled;
+            p.game_active = self.game.clone();
             if let Some(sub) = submenu {
                 p.standalone = true;
                 p.open_submenu(sub);
@@ -185,6 +189,67 @@ impl App {
         self.redraw(Which::Panel);
     }
 
+    /// Control Center → Stage Manager: toggle macOS-style Stage Manager on/off.
+    pub(crate) fn toggle_stage_manager(&mut self) {
+        let mut s = orchard_config::Settings::load();
+        let on = !s.stage_manager.enabled;
+        s.stage_manager.enabled = on;
+        let tiling_changed = on && s.windows.tiling_mode == orchard_config::TilingMode::Tiling;
+        if tiling_changed {
+            s.windows.tiling_mode = orchard_config::TilingMode::Floating;
+            self.menubar.tiling_mode = orchard_config::TilingMode::Floating;
+        }
+        if let Err(e) = s.save() {
+            tracing::warn!("saving stage manager: {e}");
+            return;
+        }
+        if let Some(p) = self.panel.as_mut() {
+            p.stage_manager = on;
+        }
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.request("reload_settings", serde_json::json!({}));
+        }
+        if tiling_changed {
+            self.redraw(Which::Bar);
+        }
+        self.redraw(Which::Panel);
+    }
+
+    /// Control Center → Game Mode: switch the automatic Game Mode on or off.
+    pub(crate) fn toggle_game_mode(&mut self) {
+        let mut s = orchard_config::Settings::load();
+        s.game_mode.enabled = !s.game_mode.enabled;
+        if let Err(e) = s.save() {
+            tracing::warn!("saving game mode: {e}");
+            return;
+        }
+        if let Some(p) = self.panel.as_mut() {
+            p.game_mode_enabled = s.game_mode.enabled;
+        }
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.request("reload_settings", serde_json::json!({}));
+        }
+        self.redraw(Which::Panel);
+    }
+
+    /// The compositor reports that a game went full screen, or left it.
+    pub(crate) fn on_game_mode(&mut self, active: bool, app_id: Option<String>, silence: bool) {
+        let name = app_id.map(|id| self.apps.for_app_id(&id).map(|e| e.name.clone()).unwrap_or(id));
+        self.game = if active { Some(name.unwrap_or_default()) } else { None };
+        self.notes.game_quiet = active && silence;
+        if self.notes.game_quiet {
+            // banners already up slide away into the Notification Center
+            self.notes.banners.retain(|b| b.n.critical);
+            self.update_notes_surface();
+        }
+        self.menubar.game = active;
+        if let Some(p) = self.panel.as_mut() {
+            p.game_active = self.game.clone();
+        }
+        self.redraw(Which::Bar);
+        self.redraw(Which::Panel);
+    }
+
     pub(crate) fn send_panel_backdrop(&mut self) {
         let Some(p) = self.panel.as_ref() else { return };
         let (x, y, w, h) = p.rect();
@@ -280,6 +345,8 @@ impl App {
                     Target::Panel => {}
                     Target::Dnd => self.toggle_dnd(),
                     Target::NightShift => self.toggle_night_shift(),
+                    Target::StageManager => self.toggle_stage_manager(),
+                    Target::GameMode => self.toggle_game_mode(),
                     Target::ClearAll => {
                         let ids = self.notes.clear_history();
                         if let Some(c) = &self.dbus {

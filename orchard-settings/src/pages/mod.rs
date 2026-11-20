@@ -221,7 +221,7 @@ impl Page {
             Displays => "displays screen monitor resolution scale refresh hidpi vrr freesync gsync adaptive sync night shift blue light warm colour color temperature redshift",
             Wallpaper => "wallpaper background desktop picture",
             LockScreen => "lock screen idle password locker shortcut",
-            Battery => "battery power energy profile performance vrr freesync gsync adaptive sync latency scanout blur gaming",
+            Battery => "battery power energy profile performance vrr freesync gsync adaptive sync latency scanout blur gaming game mode gaming games fullscreen",
             Keyboard => "keyboard layout repeat modifier caps numlock",
             Mouse => "mouse pointer speed scroll natural acceleration primary button",
             Trackpad => "trackpad touchpad pointer speed tap click natural scrolling gestures swipe",

@@ -212,6 +212,8 @@ pub struct OrchardState<BackendData: Backend + 'static> {
     pub prefs_rt: crate::settings::Runtime,
     /// autostart + session environment done (waits for Xwayland's DISPLAY)
     pub session_ready: bool,
+    /// Game Mode: the full-screen game, while one runs
+    pub game_mode: Option<crate::game_mode::GameState>,
     /// ⌘⇧4 area / window picking in progress
     pub shot_select: Option<crate::screenshot::Select>,
     /// wlr-screencopy (None where the backend can't render offscreen)
@@ -908,6 +910,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             session_lock_state,
             prefs_rt: Default::default(),
             session_ready: false,
+            game_mode: None,
             shot_select: None,
             screencopy: Some(screencopy_state),
         };

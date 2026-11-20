@@ -79,6 +79,10 @@ pub fn effective_live_blur() -> bool {
     if !s.performance.live_blur || s.performance.preset == orchard_config::PerformancePreset::PowerSaver {
         return false;
     }
+    // a full-screen game covers the panels anyway: no blur passes behind them
+    if crate::game_mode::active() {
+        return false;
+    }
     if s.performance.battery_saver && on_battery() {
         return false;
     }
@@ -328,8 +332,9 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
         self.prefs_rt.corner = corner;
         let Some(corner) = corner else { return };
-        // don't fire while dragging a window or holding a button
-        if self.pointer.is_grabbed() {
+        // don't fire while dragging a window or holding a button, nor in a
+        // game (flicking the mouse to a corner is part of playing)
+        if self.pointer.is_grabbed() || crate::game_mode::active() {
             return;
         }
         let hc = &get().desktop.hot_corners;
@@ -377,7 +382,13 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
     /// Periodic timer: start the locker after the configured idle time.
     pub fn check_idle_lock(&mut self) {
         let minutes = get().lock.lock_after_minutes;
-        if minutes == 0 || self.prefs_rt.idle_locked || self.is_locked() || !self.protocols.idle_inhibitors.is_empty() {
+        // a game played with a controller sends no keyboard / mouse input
+        if minutes == 0
+            || self.prefs_rt.idle_locked
+            || self.is_locked()
+            || !self.protocols.idle_inhibitors.is_empty()
+            || crate::game_mode::active()
+        {
             return;
         }
         if self.prefs_rt.last_activity.elapsed().as_secs() >= minutes as u64 * 60 {
@@ -412,6 +423,8 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             state.supervise_shell();
             state.supervise_locker();
             state.check_settings_file();
+            // nothing repaints while idle: catch a game that went full screen meanwhile
+            state.update_game_mode();
             TimeoutAction::ToDuration(std::time::Duration::from_secs(1))
         });
         if let Err(e) = res {

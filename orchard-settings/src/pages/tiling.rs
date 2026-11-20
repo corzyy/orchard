@@ -33,7 +33,11 @@ pub fn tiling(s: &Settings) -> El {
             if tiling_on { "tiling" } else { "floating" },
             |v| {
                 edit(move |s| {
-                    s.windows.tiling_mode = if v == "tiling" { TilingMode::Tiling } else { TilingMode::Floating }
+                    let tiling = v == "tiling";
+                    s.windows.tiling_mode = if tiling { TilingMode::Tiling } else { TilingMode::Floating };
+                    if tiling {
+                        s.stage_manager.enabled = false;
+                    }
                 })
             },
         ),

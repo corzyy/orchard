@@ -4,6 +4,7 @@ pub mod blur;
 pub mod genie;
 pub mod label;
 pub mod night;
+pub mod perspective;
 pub mod shake;
 pub mod rounded;
 pub mod snapshot;
