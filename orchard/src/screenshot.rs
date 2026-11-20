@@ -112,16 +112,25 @@ fn file_name() -> String {
     }
 }
 
-/// ("YYYY-MM-DD", "HH.MM.SS") in local time via `date` (avoids a tz dependency).
+/// ("YYYY-MM-DD", "HH.MM.SS") in local time, without spawning `date` on the
+/// compositor thread at the moment of the capture.
 fn chrono_like_now() -> (String, String) {
-    let out = std::process::Command::new("date")
-        .arg("+%Y-%m-%d %H.%M.%S")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    let (d, t) = out.split_once(' ').unwrap_or(("screenshot", "0"));
-    (d.to_string(), t.to_string())
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    // SAFETY: localtime_r only writes into the zeroed `tm` we own.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return ("screenshot".into(), "0".into());
+        }
+        tm
+    };
+    (
+        format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday),
+        format!("{:02}.{:02}.{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+    )
 }
 
 /// ⌘⇧4 in progress.

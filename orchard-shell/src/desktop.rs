@@ -52,6 +52,8 @@ pub struct Desktop {
     pub selected: Option<usize>,
     pub sort: SortBy,
     pub enabled: bool,
+    /// set by helper threads (a failed trash) to rescan on the next poll
+    pub force_rescan: std::sync::Arc<std::sync::atomic::AtomicBool>,
     last_mtime: Option<SystemTime>,
     last_click: Option<(usize, Instant)>,
     icon_cache: HashMap<String, Option<Rc<Pixmap>>>,
@@ -68,6 +70,7 @@ impl Desktop {
             selected: None,
             sort: SortBy::Name,
             enabled,
+            force_rescan: Default::default(),
             last_mtime: None,
             last_click: None,
             icon_cache: HashMap::new(),
@@ -85,7 +88,8 @@ impl Desktop {
             return false;
         }
         let mtime = fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
-        if mtime != self.last_mtime {
+        let forced = self.force_rescan.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if forced || mtime != self.last_mtime {
             self.rescan();
             return true;
         }

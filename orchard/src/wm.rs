@@ -836,7 +836,10 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             return;
         }
         tracing::warn!(app, pid, "force quit");
-        let _ = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+        // SAFETY: plain syscall; pid was checked above (> 1, not us, not the shell)
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+            tracing::warn!(pid, "force quit failed: {}", std::io::Error::last_os_error());
+        }
     }
 }
 

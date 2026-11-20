@@ -2525,9 +2525,23 @@ impl App {
             Action::Confirm(kind) => self.open_dialog(kind),
             Action::DesktopOpen(path) => self.open_desktop_path(&path),
             Action::DesktopTrash(path) => {
+                // moving a big folder to the trash on another filesystem copies
+                // it: never block the menu bar and Dock on that. The icon goes
+                // away now; the Desktop folder poll picks up the real result.
                 let p = path.clone();
-                let _ = std::process::Command::new("gio").arg("trash").arg(&p).status();
-                self.desktop.rescan();
+                let failed = self.desktop.force_rescan.clone();
+                let _ = std::thread::Builder::new().name("desktop-trash".into()).spawn(move || {
+                    match std::process::Command::new("gio").arg("trash").arg(&p).status() {
+                        Ok(st) if st.success() => {}
+                        other => {
+                            tracing::warn!("trash {}: {other:?}", p.display());
+                            // bring the icon back
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+                self.desktop.entries.retain(|e| e.path != path);
+                self.desktop.selected = None;
                 self.redraw(Which::Desktop);
             }
             Action::DesktopNewFolder => {
