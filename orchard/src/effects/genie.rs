@@ -296,6 +296,10 @@ impl RenderElement<GlesRenderer> for MeshElement {
                 Some(p) => p,
                 None => build_program(gl)?,
             };
+            let prev_scissor = gl.IsEnabled(ffi::SCISSOR_TEST) != 0;
+            if prev_scissor {
+                gl.Disable(ffi::SCISSOR_TEST);
+            }
             gl.UseProgram(program.program);
             gl.UniformMatrix3fv(program.u_proj, 1, ffi::FALSE, proj.as_ptr());
             gl.Uniform1f(program.u_alpha, alpha);
@@ -303,6 +307,8 @@ impl RenderElement<GlesRenderer> for MeshElement {
             gl.BindTexture(ffi::TEXTURE_2D, tex_id);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
             gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
             gl.Uniform1i(program.u_tex, 0);
             gl.Enable(ffi::BLEND);
             gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
@@ -327,6 +333,10 @@ impl RenderElement<GlesRenderer> for MeshElement {
             gl.DisableVertexAttribArray(program.a_pos);
             gl.DisableVertexAttribArray(program.a_uv);
             gl.BindTexture(ffi::TEXTURE_2D, 0);
+            gl.UseProgram(0);
+            if prev_scissor {
+                gl.Enable(ffi::SCISSOR_TEST);
+            }
             Some(program)
         })?;
         if slot_program.is_none() {

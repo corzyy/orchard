@@ -9,7 +9,7 @@ use smithay::{
             damage::OutputDamageTracker,
             element::AsRenderElements,
             gles::{GlesRenderer, GlesTexture},
-            Bind, Color32F, Offscreen,
+            Bind, Color32F, Frame, Offscreen, Renderer,
         },
     },
     desktop::space::SpaceElement,
@@ -45,6 +45,11 @@ pub fn snapshot_window(renderer: &mut GlesRenderer, window: &WindowElement, scal
             .bind(&mut texture)
             .map_err(|e| tracing::warn!("snapshot bind: {e:?}"))
             .ok()?;
+        // Clear freshly allocated VRAM (prevents NVIDIA white-dot speckles).
+        if let Ok(mut frame) = renderer.render(&mut target, size, Transform::Normal) {
+            let _ = frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)]);
+            let _ = frame.finish();
+        }
         // render origin is the surface origin; bbox is relative to it
         let origin: Point<i32, Physical> =
             (Point::<i32, Logical>::from((0, 0)) - bbox.loc).to_physical_precise_round(scale);
@@ -85,6 +90,10 @@ pub fn thumbnail_rgba(renderer: &mut GlesRenderer, window: &WindowElement, max_p
     let mut texture: GlesTexture = renderer.create_buffer(Fourcc::Abgr8888, buf_size).ok()?;
     let mut data = {
         let mut target = renderer.bind(&mut texture).ok()?;
+        if let Ok(mut frame) = renderer.render(&mut target, size, Transform::Normal) {
+            let _ = frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)]);
+            let _ = frame.finish();
+        }
         let origin: Point<i32, Physical> = (Point::<i32, Logical>::from((0, 0)) - geo.loc).to_physical_precise_round(scale);
         let elements: Vec<WindowRenderElement> =
             AsRenderElements::<GlesRenderer>::render_elements(window, renderer, origin, Scale::from(scale), 1.0);

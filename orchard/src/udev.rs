@@ -127,7 +127,7 @@ pub struct UdevData {
     primary_gpu: DrmNode,
     gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     backends: HashMap<DrmNode, BackendData>,
-    pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    pointer_images: HashMap<u64, MemoryRenderBuffer>,
     pointer_element: PointerElement,
     /// last named cursor image + hotspot, for screencopy
     last_cursor: Option<(MemoryRenderBuffer, Point<i32, Logical>)>,
@@ -362,7 +362,7 @@ pub fn run_udev() {
         gpus,
         backends: HashMap::new(),
         pointer_image: crate::cursor::Cursor::load(),
-        pointer_images: Vec::new(),
+        pointer_images: HashMap::new(),
         pointer_element: PointerElement::default(),
         last_cursor: None,
         #[cfg(feature = "debug")]
@@ -640,7 +640,7 @@ pub fn run_udev() {
 
     crate::session::install_signal_handlers();
     while state.running.load(Ordering::SeqCst) {
-        let result = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state);
+        let result = event_loop.dispatch(Some(Duration::from_millis(500)), &mut state);
         if crate::session::shutdown_requested() {
             tracing::info!("termination signal: quitting");
             state.running.store(false, Ordering::SeqCst);
@@ -649,6 +649,7 @@ pub fn run_udev() {
         } else {
             state.space.refresh();
             state.popups.cleanup();
+            state.wake_idle_outputs();
             let _ = display_handle.flush_clients();
         }
     }
@@ -767,6 +768,10 @@ struct SurfaceData {
     vblank_throttle_timer: Option<RegistrationToken>,
     /// pending forced full repaints (see `reset_buffers`)
     full_damage: FullDamage,
+    /// true when the output's DRM driver is NVIDIA (needs explicit GPU sync before queue_frame)
+    is_nvidia: bool,
+    /// true when parked waiting for the next compositor event instead of polling at refresh rate
+    idle: bool,
 }
 
 /// Damages the whole output for the next few frames by placing an invisible
@@ -792,7 +797,7 @@ impl FullDamage {
     /// Enough frames to cover every buffer of the swapchain, even if one of
     /// them gets skipped (the damage history makes one usually suffice).
     fn request(&mut self) {
-        self.frames = 4;
+        self.frames = 3;
     }
 
     fn element(&mut self, output_size: smithay::utils::Size<i32, smithay::utils::Physical>) -> Option<OutputRenderElements> {
@@ -1183,13 +1188,13 @@ impl OrchardState<UdevData> {
             // memory is uninitialized VRAM, so white dots flash around the pointer
             // on every cursor change (and every frame of an animated cursor).
             // Without a cursor plane the cursor is composited on the primary plane.
-            if driver.name().to_string_lossy().to_lowercase().contains("nvidia")
+            let is_nvidia = driver.name().to_string_lossy().to_lowercase().contains("nvidia")
                 || driver
                     .description()
                     .to_string_lossy()
                     .to_lowercase()
-                    .contains("nvidia")
-            {
+                    .contains("nvidia");
+            if is_nvidia {
                 planes.overlay = vec![];
                 if std::env::var("ORCHARD_NVIDIA_CURSOR_PLANE").is_err() {
                     planes.cursor = vec![];
@@ -1214,7 +1219,11 @@ impl OrchardState<UdevData> {
                 }
             };
 
-            let disable_direct_scanout = std::env::var("ORCHARD_DISABLE_DIRECT_SCANOUT").is_ok();
+            // On NVIDIA, direct primary-plane scanout bypasses Swapchain::sync.wait()
+            // and can flash corrupted/white-dot frames on scanout transitions.
+            let disable_direct_scanout = (is_nvidia
+                && std::env::var("ORCHARD_NVIDIA_DIRECT_SCANOUT").is_err())
+                || std::env::var("ORCHARD_DISABLE_DIRECT_SCANOUT").is_ok();
 
             let dmabuf_feedback = drm_output.with_compositor(|compositor| {
                 compositor.set_debug_flags(self.backend_data.debug_flags);
@@ -1244,6 +1253,8 @@ impl OrchardState<UdevData> {
                 last_presentation_time: None,
                 vblank_throttle_timer: None,
                 full_damage: FullDamage::default(),
+                is_nvidia,
+                idle: false,
             };
 
             device.surfaces.insert(crtc, surface);
@@ -1621,18 +1632,18 @@ impl OrchardState<UdevData> {
         let start = Instant::now();
 
         // TODO get scale from the rendersurface when supporting HiDPI
-        let frame = match &self.cursor_status {
+        let (cursor_id, frame, cursor_animated) = match &self.cursor_status {
             CursorImageStatus::Named(icon) => {
                 let mut names = vec![icon.name()];
                 names.extend(icon.alt_names().iter().copied());
                 self.backend_data
                     .pointer_image
-                    .get_named_image(&names, 1 /*scale*/, self.clock.now().into())
+                    .get_named_image_cached(&names, 1 /*scale*/, self.clock.now().into())
             }
             _ => self
                 .backend_data
                 .pointer_image
-                .get_image(1 /*scale*/, self.clock.now().into()),
+                .get_image_cached(1 /*scale*/, self.clock.now().into()),
         };
 
         let primary_gpu = self.backend_data.primary_gpu;
@@ -1653,28 +1664,21 @@ impl OrchardState<UdevData> {
             }
         };
 
-        let pointer_images = &mut self.backend_data.pointer_images;
-        let pointer_image = pointer_images
-            .iter()
-            .find_map(|(image, texture)| {
-                if image == &frame {
-                    Some(texture.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| {
-                let buffer = MemoryRenderBuffer::from_slice(
+        let pointer_image = self
+            .backend_data
+            .pointer_images
+            .entry(cursor_id)
+            .or_insert_with(|| {
+                MemoryRenderBuffer::from_slice(
                     &frame.pixels_rgba,
                     Fourcc::Argb8888,
                     (frame.width as i32, frame.height as i32),
                     1,
                     Transform::Normal,
                     None,
-                );
-                pointer_images.push((frame.clone(), buffer.clone()));
-                buffer
-            });
+                )
+            })
+            .clone();
         let named_hotspot: Point<i32, Logical> = (frame.xhot as i32, frame.yhot as i32).into();
         self.backend_data.last_cursor = Some((pointer_image.clone(), named_hotspot));
 
@@ -1702,11 +1706,21 @@ impl OrchardState<UdevData> {
             &mut ctx,
             now,
         );
-        let reschedule = match result {
+        let full_damage_pending = surface.full_damage.frames > 0;
+        let (reschedule, rendered_frame, park_idle) = match result {
             Ok((has_rendered, states)) => {
                 let dmabuf_feedback = surface.dmabuf_feedback.clone();
                 self.post_repaint(&output, frame_target, dmabuf_feedback, &states);
-                !has_rendered
+                if has_rendered {
+                    (false, true, false)
+                } else {
+                    let continuous = full_damage_pending
+                        || cursor_animated
+                        || self.fx.is_animating(now)
+                        || self.mc.is_some()
+                        || crate::effects::any_animating(self.space.elements(), now);
+                    (continuous, false, !continuous)
+                }
             }
             Err(err) => {
                 // a persistent failure would otherwise log on every frame
@@ -1715,7 +1729,7 @@ impl OrchardState<UdevData> {
                 if n < 20 || n % 1000 == 0 {
                     warn!(count = n + 1, "Error during rendering: {:#?}", err);
                 }
-                match err {
+                let retry = match err {
                     SwapBuffersError::AlreadySwapped => false,
                     SwapBuffersError::TemporaryFailure(err) => match err.downcast_ref::<DrmError>() {
                         Some(DrmError::DeviceInactive) => true,
@@ -1745,9 +1759,25 @@ impl OrchardState<UdevData> {
                             true
                         }
                     },
-                }
+                };
+                (retry, false, false)
             }
         };
+
+        if park_idle {
+            if let Some(surface) = self
+                .backend_data
+                .backends
+                .get_mut(&node)
+                .and_then(|d| d.surfaces.get_mut(&crtc))
+            {
+                surface.idle = true;
+            }
+        }
+
+        if rendered_frame {
+            self.screencopy_notify_damage();
+        }
 
         if reschedule {
             let output_refresh = match output.current_mode() {
@@ -1755,9 +1785,6 @@ impl OrchardState<UdevData> {
                 None => return,
             };
 
-            // If reschedule is true we either hit a temporary failure or more likely rendering
-            // did not cause any damage on the output. In this case we just re-schedule a repaint
-            // after approx. one frame to re-test for damage.
             let next_frame_target = frame_target + Duration::from_millis(1_000_000 / output_refresh as u64);
             let reschedule_timeout =
                 Duration::from(next_frame_target).saturating_sub(self.clock.now().into());
@@ -1779,6 +1806,26 @@ impl OrchardState<UdevData> {
         }
 
         profiling::finish_frame!();
+    }
+
+    /// Trigger a render pass on any output that parked idle, right after new
+    /// events were dispatched by the calloop event loop.
+    fn wake_idle_outputs(&mut self) {
+        let mut to_wake: Vec<(DrmNode, crtc::Handle)> = Vec::new();
+        for (&node, device) in &mut self.backend_data.backends {
+            for (&crtc, surface) in &mut device.surfaces {
+                if surface.idle {
+                    surface.idle = false;
+                    to_wake.push((node, crtc));
+                }
+            }
+        }
+        if !to_wake.is_empty() {
+            let now = self.clock.now();
+            for (node, crtc) in to_wake {
+                self.render(node, Some(crtc), now);
+            }
+        }
     }
 }
 
@@ -1897,10 +1944,12 @@ fn render_surface(
         .render_frame(renderer, &elements, clear_color, frame_mode)
         .map(|render_frame_result| {
             // Wait for the GPU to finish rendering the primary swapchain buffer
-            // before handing it to DRM, preventing monitor-wide scanout flicker
-            // (white dot/noise flashes) on NVIDIA.
-            if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
-                let _ = element.sync.wait();
+            // before handing it to DRM on NVIDIA, preventing monitor-wide scanout
+            // flicker (white dot/noise flashes) without stalling AMD/Intel GPUs.
+            if surface.is_nvidia {
+                if let PrimaryPlaneElement::Swapchain(element) = render_frame_result.primary_element {
+                    let _ = element.sync.wait();
+                }
             }
             (!render_frame_result.is_empty, render_frame_result.states)
         })

@@ -918,10 +918,16 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                         elements.push(ThumbElement::Wall(RescaleRenderElement::from_element(wall, origin, k)));
                     }
                     let texture: Option<GlesTexture> = (|| {
+                        use smithay::backend::renderer::{Frame, Renderer};
                         let mut tex: GlesTexture =
                             renderer.create_buffer(Fourcc::Abgr8888, (size.w, size.h).into()).ok()?;
                         {
                             let mut target = renderer.bind(&mut tex).ok()?;
+                            // Clear freshly allocated VRAM (prevents NVIDIA speckles).
+                            if let Ok(mut frame) = renderer.render(&mut target, size, Transform::Normal) {
+                                let _ = frame.clear(Color32F::new(0.1, 0.1, 0.1, 1.0), &[Rectangle::from_size(size)]);
+                                let _ = frame.finish();
+                            }
                             let mut tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
                             tracker
                                 .render_output(renderer, &mut target, 0, &elements, Color32F::new(0.1, 0.1, 0.1, 1.0))

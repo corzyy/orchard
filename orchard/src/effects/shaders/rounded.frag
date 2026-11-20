@@ -6,7 +6,11 @@
 #extension GL_OES_EGL_image_external : require
 #endif
 
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 #if defined(EXTERNAL)
 uniform samplerExternalOES tex;
 #else
@@ -57,7 +61,7 @@ void main() {
     color = color * alpha;
 #endif
 
-    color = color * corner_alpha((v_coords - src_off) / src_scale * size);
+    color = color * corner_alpha((v_coords - src_off) / max(src_scale, vec2(1e-5)) * size);
 
 #if defined(DEBUG_FLAGS)
     if (tint == 1.0)

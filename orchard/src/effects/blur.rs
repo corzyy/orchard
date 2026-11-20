@@ -19,7 +19,7 @@ use smithay::{
             damage::OutputDamageTracker,
             element::{
                 texture::TextureRenderElement,
-                utils::{Relocate, RelocateRenderElement},
+                utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
                 Element, Id, Kind, RenderElement,
             },
             gles::{GlesError, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, UniformName, UniformType},
@@ -154,6 +154,10 @@ fn pass(
     let size: Size<i32, Physical> = (dst_size.w, dst_size.h).into();
     let area = Rectangle::<i32, Physical>::from_size((dst_used.w, dst_used.h).into());
     let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
+    // Clear the target before drawing: render_texture_from_to uses alpha blending,
+    // so stale pixels from previous frames or larger backdrop sizes would otherwise
+    // accumulate or bleed into bilinear edge taps.
+    frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)])?;
     let (sw, sh) = (src_size.w as f32, src_size.h as f32);
     let hp = (0.5 / sw * OFFSET, 0.5 / sh * OFFSET);
     // texel centres of the first and last pixel of `src_rect`
@@ -240,14 +244,6 @@ impl LiveBlur {
         };
 
         let s = Scale::from(scale);
-        let fingerprint: Fingerprint = below
-            .iter()
-            .filter_map(|e| {
-                let g = e.geometry(s);
-                g.overlaps(padded)
-                    .then(|| (e.id().clone(), e.current_commit(), g, e.alpha().to_bits()))
-            })
-            .collect();
 
         let size_ok = self
             .cache
@@ -255,11 +251,13 @@ impl LiveBlur {
             .map(|c| c.padded.size == padded.size && c.levels.len() == iterations as usize)
             .unwrap_or(false);
         if !size_ok {
-            // (re)allocate for the new size
-            let scene_size: Size<i32, Buffer> = (padded.size.w, padded.size.h).into();
+            // (re)allocate for the new size: capture `scene` at 0.5x physical scale
+            // (cutting scene VRAM by 75% and GPU fillrate by 4x).
+            let full_size: Size<i32, Buffer> = (padded.size.w, padded.size.h).into();
+            let scene_size = half(full_size);
             let scene = texture(renderer, scene_size).map_err(|e| tracing::warn!("blur buffer: {e:?}")).ok()?;
             let mut levels = Vec::new();
-            let mut sz = scene_size;
+            let mut sz = full_size;
             for _ in 0..iterations {
                 sz = half(sz);
                 levels.push((texture(renderer, sz).ok()?, sz));
@@ -282,7 +280,28 @@ impl LiveBlur {
         let cache = self.cache.get_mut(id)?;
         cache.last_used = now;
 
-        let rescene = cached.is_none() || cache.fingerprint != fingerprint;
+        // Zero-allocation in-place fingerprint comparison against cached state.
+        let fp_matches = cached.is_some() && {
+            let mut cur = below.iter().filter_map(|e| {
+                let g = e.geometry(s);
+                g.overlaps(padded)
+                    .then(|| (e.id(), e.current_commit(), g, e.alpha().to_bits()))
+            });
+            let mut old = cache.fingerprint.iter();
+            loop {
+                match (cur.next(), old.next()) {
+                    (Some((id1, c1, g1, a1)), Some((id2, c2, g2, a2))) => {
+                        if id1 != id2 || c1 != *c2 || g1 != *g2 || a1 != *a2 {
+                            break false;
+                        }
+                    }
+                    (None, None) => break true,
+                    _ => break false,
+                }
+            }
+        };
+
+        let rescene = !fp_matches;
         if rescene || cache.region != region {
             tracing::debug!(
                 "live blur: re-render {:?} {}x{} (scene: {}, realloc: {})",
@@ -298,7 +317,14 @@ impl LiveBlur {
                 self.cache.remove(id);
                 return None;
             }
-            cache.fingerprint = fingerprint;
+            if rescene {
+                cache.fingerprint.clear();
+                cache.fingerprint.extend(below.iter().filter_map(|e| {
+                    let g = e.geometry(s);
+                    g.overlaps(padded)
+                        .then(|| (e.id().clone(), e.current_commit(), g, e.alpha().to_bits()))
+                }));
+            }
             cache.region = region;
             let used = cache.used;
             cache.damage.add([Rectangle::from_size(used)]);
@@ -306,7 +332,11 @@ impl LiveBlur {
 
         let (tex, l0) = cache.levels[0].clone();
         let used = cache.used;
-        let src = Rectangle::<f64, Logical>::from_size((used.w as f64, used.h as f64).into());
+        // Inset by 0.5 texel on edges smaller than the backing texture so bilinear
+        // filtering never samples into the cleared border outside `used`.
+        let src_w = if used.w < l0.w { (used.w as f64 - 0.5).max(1.0) } else { used.w as f64 };
+        let src_h = if used.h < l0.h { (used.h as f64 - 0.5).max(1.0) } else { used.h as f64 };
+        let src = Rectangle::<f64, Logical>::from_size((src_w, src_h).into());
         let dst_size: Size<i32, Logical> = region.size.to_f64().to_logical(scale).to_i32_round();
         let el = TextureRenderElement::from_texture_with_damage(
             id.clone(),
@@ -339,17 +369,22 @@ fn render_blur<E: RenderElement<GlesRenderer>>(
 ) -> Result<(), GlesError> {
     let padded = cache.padded;
     let s = Scale::from(scale);
-    // 1. what is below, cropped to the padded area
+    let scene_size = half((padded.size.w, padded.size.h).into());
+    // 1. what is below, cropped to the padded area and rendered at 0.5x physical scale
     if rescene {
         let offset = Point::<i32, Physical>::from((-padded.loc.x, -padded.loc.y));
-        let elements: Vec<RelocateRenderElement<&E>> = below
+        let elements: Vec<RescaleRenderElement<RelocateRenderElement<&E>>> = below
             .iter()
             .filter(|e| e.geometry(s).overlaps(padded))
-            .map(|e| RelocateRenderElement::from_element(e, offset, Relocate::Relative))
+            .map(|e| {
+                let rel = RelocateRenderElement::from_element(e, offset, Relocate::Relative);
+                RescaleRenderElement::from_element(rel, (0, 0).into(), 0.5)
+            })
             .collect();
         let mut scene = cache.scene.clone();
         let mut target = renderer.bind(&mut scene)?;
-        let mut tracker = OutputDamageTracker::new(padded.size, scale, Transform::Normal);
+        let half_phys: Size<i32, Physical> = (scene_size.w, scene_size.h).into();
+        let mut tracker = OutputDamageTracker::new(half_phys, scale, Transform::Normal);
         tracker
             .render_output(renderer, &mut target, 0, &elements, clear)
             .map_err(|e| match e {
@@ -357,24 +392,25 @@ fn render_blur<E: RenderElement<GlesRenderer>>(
                 smithay::backend::renderer::damage::Error::OutputNoMode(_) => GlesError::UnknownSize,
             })?;
     }
-    // 2. down to the smallest level, 3. back up to level 0 — only the part
-    // of each level that corresponds to `region` (top-left aligned)
-    let scene_size: Size<i32, Buffer> = (padded.size.w, padded.size.h).into();
+    // 2. down from half-res scene directly to levels[1..], 3. back up to level 0
     let mut used = Vec::with_capacity(cache.levels.len());
     let mut u: Size<i32, Buffer> = (region.size.w, region.size.h).into();
     for _ in &cache.levels {
         u = half(u);
         used.push(u);
     }
+    let rx = ((region.loc.x - padded.loc.x) / 2).clamp(0, scene_size.w.saturating_sub(1));
+    let ry = ((region.loc.y - padded.loc.y) / 2).clamp(0, scene_size.h.saturating_sub(1));
+    let rw = used[0].w.min(scene_size.w - rx).max(1);
+    let rh = used[0].h.min(scene_size.h - ry).max(1);
     let mut src = (
         cache.scene.clone(),
         scene_size,
-        Rectangle::<i32, Buffer>::new(
-            (region.loc.x - padded.loc.x, region.loc.y - padded.loc.y).into(),
-            (region.size.w, region.size.h).into(),
-        ),
+        Rectangle::<i32, Buffer>::new((rx, ry).into(), (rw, rh).into()),
     );
-    for ((tex, size), u) in cache.levels.clone().into_iter().zip(used.iter().copied()) {
+    for i in 1..cache.levels.len() {
+        let (tex, size) = cache.levels[i].clone();
+        let u = used[i];
         pass(renderer, prog, &src.0, src.1, src.2, &tex, size, u, false)?;
         src = (tex, size, Rectangle::from_size(u));
     }
