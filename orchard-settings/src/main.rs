@@ -178,9 +178,13 @@ impl App {
     fn new(cc: &eframe::CreationContext) -> App {
         style::install_fonts(&cc.egui_ctx);
         let settings = Settings::load();
+        let norm = |s: &str| s.to_lowercase().replace([' ', '\u{2011}', '-'], "");
         let start = std::env::args()
             .nth(1)
-            .and_then(|a| ALL_PAGES.iter().copied().find(|p| p.title().to_lowercase().replace(' ', "-") == a.to_lowercase()))
+            .and_then(|a| {
+                let want = norm(&a);
+                ALL_PAGES.iter().copied().find(|p| norm(p.title()) == want)
+            })
             .unwrap_or(Appearance);
         App {
             saved: settings.clone(),

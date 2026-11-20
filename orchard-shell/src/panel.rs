@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use tiny_skia::{FillRule, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
+use tiny_skia::{FillRule, LineCap, LineJoin, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
 
 use crate::{
     apps::Apps,
@@ -19,6 +19,7 @@ pub const NC_WIDTH: f32 = 356.0;
 pub const CC_WIDTH: f32 = 320.0;
 const MARGIN: f32 = 10.0;
 const SLIDE: Duration = Duration::from_millis(260);
+const SUBMENU_ANIM: Duration = Duration::from_millis(160);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -26,14 +27,60 @@ pub enum Kind {
     Control,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Submenu {
+    Wifi,
+    Bluetooth,
+    Sound,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    /// 0..=100
+    pub signal: u8,
+    pub secure: bool,
+    pub active: bool,
+    pub known: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BtDevice {
+    pub mac: String,
+    pub name: String,
+    pub connected: bool,
+    pub icon: String,
+    pub battery: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AudioIcon {
+    #[default]
+    Speaker,
+    Headphones,
+    Bluetooth,
+    Display,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AudioSink {
+    pub name: String,
+    pub desc: String,
+    pub active: bool,
+    pub icon: AudioIcon,
+}
+
 /// What the Control Center shows (queried on a helper thread).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ControlState {
     /// Wi-Fi radio on, connected network
     pub wifi: Option<(bool, Option<String>)>,
+    pub wifi_networks: Vec<WifiNetwork>,
     pub bluetooth: Option<bool>,
+    pub bt_devices: Vec<BtDevice>,
     /// 0..1, muted
     pub volume: Option<(f32, bool)>,
+    pub audio_sinks: Vec<AudioSink>,
     /// 0..1 (only with a backlight)
     pub brightness: Option<f32>,
     pub media: Option<Media>,
@@ -52,10 +99,25 @@ pub enum Target {
     Card(Hit),
     ClearAll,
     Dnd,
-    Wifi,
-    Bluetooth,
+    WifiToggle,
+    BluetoothToggle,
+    OpenSubmenu(Submenu),
+    SubmenuBack,
+    WifiConnect {
+        ssid: String,
+        known: bool,
+        secure: bool,
+    },
+    WifiToggleOthers,
+    BtToggleDevice {
+        mac: String,
+        connected: bool,
+    },
+    AudioSelectSink(String),
+    OpenSettings(&'static str),
     /// slider: x range of the track
     Volume(f32, f32),
+    VolumeMute,
     Brightness(f32, f32),
     MediaPrev,
     MediaPlay,
@@ -67,6 +129,11 @@ pub enum Target {
 pub struct Panel {
     pub kind: Kind,
     pub opened: Instant,
+    pub submenu: Option<Submenu>,
+    pub submenu_since: Instant,
+    pub wifi_others_open: bool,
+    /// SSID or MAC currently connecting / toggling
+    pub busy_item: Option<String>,
     pub scroll: f32,
     pub hover: Option<(f32, f32)>,
     /// x of the right edge of the Control Center icon (Control Center anchors there)
@@ -82,9 +149,14 @@ pub struct Panel {
 
 impl Panel {
     pub fn new(kind: Kind, anchor_right: f32) -> Panel {
+        let now = Instant::now();
         Panel {
             kind,
-            opened: Instant::now(),
+            opened: now,
+            submenu: None,
+            submenu_since: now - SUBMENU_ANIM,
+            wifi_others_open: true,
+            busy_item: None,
             scroll: 0.0,
             hover: None,
             anchor_right,
@@ -96,13 +168,44 @@ impl Panel {
         }
     }
 
+    pub fn open_submenu(&mut self, sub: Submenu) {
+        self.submenu = Some(sub);
+        self.submenu_since = Instant::now();
+        self.scroll = 0.0;
+        self.dragging = None;
+        if sub == Submenu::Wifi {
+            // If user already has known networks, start with Other Networks expanded if not connected
+            let connected = self.control.wifi.as_ref().and_then(|(_, s)| s.as_ref()).is_some();
+            let has_known = self.control.wifi_networks.iter().any(|n| n.known || n.active);
+            self.wifi_others_open = !connected || !has_known;
+        }
+    }
+
+    pub fn close_submenu(&mut self) {
+        self.submenu = None;
+        self.submenu_since = Instant::now();
+        self.scroll = 0.0;
+        self.dragging = None;
+    }
+
     pub fn is_animating(&self) -> bool {
-        self.opened.elapsed() < SLIDE
+        self.opened.elapsed() < SLIDE || self.submenu_since.elapsed() < SUBMENU_ANIM
     }
 
     fn progress(&self) -> f32 {
         let t = (self.opened.elapsed().as_secs_f32() / SLIDE.as_secs_f32()).clamp(0.0, 1.0);
         1.0 - (1.0 - t).powi(3)
+    }
+
+    fn sub_progress(&self) -> f32 {
+        let t = (self.submenu_since.elapsed().as_secs_f32() / SUBMENU_ANIM.as_secs_f32()).clamp(0.0, 1.0);
+        1.0 - (1.0 - t).powi(3)
+    }
+
+    fn hovered(&self, rx: f32, ry: f32, rw: f32, rh: f32) -> bool {
+        self.hover
+            .map(|(hx, hy)| hx >= rx && hx < rx + rw && hy >= ry && hy < ry + rh)
+            .unwrap_or(false)
     }
 
     /// The panel's rect (for the frosted backdrop), surface coordinates.
@@ -138,19 +241,44 @@ impl Panel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn paint(&mut self, pm: &mut Pixmap, s: f32, w: f32, h: f32, center: &Center, apps: &Apps, fonts: &Fonts, theme: &Theme, german: bool) {
+    pub fn paint(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        w: f32,
+        h: f32,
+        center: &Center,
+        apps: &Apps,
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+    ) {
         self.targets.clear();
         self.cards.clear();
         match self.kind {
             Kind::Notifications => self.paint_nc(pm, s, w, h, center, apps, fonts, theme, german),
-            Kind::Control => self.paint_cc(pm, s, w, center, fonts, theme, german),
+            Kind::Control => match self.submenu {
+                None => self.paint_cc(pm, s, w, center, fonts, theme, german),
+                Some(sub) => self.paint_cc_submenu(pm, s, w, h, sub, fonts, theme, german),
+            },
         }
     }
 
     // ---- Notification Center -------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_nc(&mut self, pm: &mut Pixmap, s: f32, w: f32, h: f32, center: &Center, apps: &Apps, fonts: &Fonts, theme: &Theme, german: bool) {
+    fn paint_nc(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        w: f32,
+        h: f32,
+        center: &Center,
+        apps: &Apps,
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+    ) {
         let t = |en: &'static str, de: &'static str| if german { de } else { en };
         let slide = (1.0 - self.progress()) * (NC_WIDTH + MARGIN);
         let x0 = w - NC_WIDTH - MARGIN + slide;
@@ -177,7 +305,7 @@ impl Panel {
         moon(pm, (inner_x + 24.0) * s, (row_y + 22.0) * s, 7.0 * s, [255, 255, 255, 255]);
         let base = fonts.baseline_centered(row_y * s, 44.0 * s, 13.0 * s, Weight::Bold);
         fonts.draw(pm, t("Do Not Disturb", "Nicht stören"), (inner_x + 48.0) * s, base, 13.0 * s, Weight::Bold, theme.menu_text);
-        switch(pm, s, inner_x + inner_w - 52.0, row_y + 11.0, center.do_not_disturb, accent);
+        switch(pm, s, inner_x + inner_w - 52.0, row_y + 11.0, center.do_not_disturb, accent, dark);
         self.targets.push(((inner_x, row_y, inner_w, 44.0), Target::Dnd));
 
         // section header
@@ -205,17 +333,31 @@ impl Panel {
         let layouts: Vec<_> = center.history.iter().map(|p| notify::card_layout(fonts, &p.n, inner_w)).collect();
         let total: f32 = layouts.iter().map(|l| l.h + 10.0).sum();
         self.scroll = self.scroll.min((total - list_h).max(0.0));
-        let (Some(mut sub), true) = (Pixmap::new((inner_w * s).ceil().max(1.0) as u32 + 2, (list_h * s).ceil().max(1.0) as u32), list_h > 1.0) else {
+        let (Some(mut sub), true) = (
+            Pixmap::new((inner_w * s).ceil().max(1.0) as u32 + 2, (list_h * s).ceil().max(1.0) as u32),
+            list_h > 1.0,
+        ) else {
             return;
         };
-        let hover_id = self.hover.and_then(|(hx, hy)| {
-            self.cards_prev_hover(hx, hy)
-        });
+        let hover_id = self.hover.and_then(|(hx, hy)| self.cards_prev_hover(hx, hy));
         let mut y = -self.scroll + 10.0;
         let mut cards = Vec::new();
         for (p, l) in center.history.iter().zip(&layouts) {
             if y + l.h >= 0.0 && y <= list_h {
-                let hit = notify::paint_card(&mut sub, s, 1.0, y, inner_w - 2.0, &p.n, l, p.received.elapsed(), hover_id == Some(p.n.id), apps, fonts, theme);
+                let hit = notify::paint_card(
+                    &mut sub,
+                    s,
+                    1.0,
+                    y,
+                    inner_w - 2.0,
+                    &p.n,
+                    l,
+                    p.received.elapsed(),
+                    hover_id == Some(p.n.id),
+                    apps,
+                    fonts,
+                    theme,
+                );
                 // back to surface coordinates; cards outside the visible list don't count
                 let mut hit = hit;
                 hit.rect = (hit.rect.0 + inner_x - 1.0, hit.rect.1 + list_y, hit.rect.2, hit.rect.3);
@@ -252,7 +394,10 @@ impl Panel {
     /// The card under the pointer, from the last paint.
     fn cards_prev_hover(&self, x: f32, y: f32) -> Option<u32> {
         PREV_CARDS.with(|c| {
-            c.borrow().iter().find(|(_, (cx, cy, cw, ch))| x >= *cx && x < cx + cw && y >= *cy && y < cy + ch).map(|(id, _)| *id)
+            c.borrow()
+                .iter()
+                .find(|(_, (cx, cy, cw, ch))| x >= *cx && x < cx + cw && y >= *cy && y < cy + ch)
+                .map(|(id, _)| *id)
         })
     }
 
@@ -260,18 +405,20 @@ impl Panel {
         PREV_CARDS.with(|c| *c.borrow_mut() = self.cards.iter().map(|h| (h.id, h.rect)).collect());
     }
 
-    // ---- Control Center ------------------------------------------------------
+    // ---- Control Center (main view) ------------------------------------------
 
     fn paint_cc(&mut self, pm: &mut Pixmap, s: f32, w: f32, center: &Center, fonts: &Fonts, theme: &Theme, german: bool) {
         let t = |en: &'static str, de: &'static str| if german { de } else { en };
-        let st = &self.control;
         let dark = theme.bar_text[0] > 128;
-        let tint: Rgba = if dark { [30, 30, 32, 150] } else { [240, 240, 242, 150] };
-        let card: Rgba = if dark { [255, 255, 255, 22] } else { [255, 255, 255, 150] };
-        let off: Rgba = if dark { [255, 255, 255, 40] } else { [0, 0, 0, 30] };
+        let tint: Rgba = if dark { [30, 30, 32, 160] } else { [242, 242, 245, 170] };
+        let border: Rgba = if dark { [255, 255, 255, 34] } else { [0, 0, 0, 22] };
+        let card: Rgba = if dark { [255, 255, 255, 22] } else { [255, 255, 255, 155] };
+        let card_border: Rgba = if dark { [255, 255, 255, 18] } else { [0, 0, 0, 12] };
+        let off: Rgba = if dark { [255, 255, 255, 40] } else { [0, 0, 0, 26] };
+        let hover_bg: Rgba = if dark { [255, 255, 255, 18] } else { [0, 0, 0, 12] };
         let accent = theme.menu_selection;
         let text = theme.menu_text;
-        let sub = theme.menu_text_disabled;
+        let sub: Rgba = if dark { [235, 235, 235, 130] } else { [20, 20, 20, 120] };
 
         let pad = 10.0;
         let x0 = (self.anchor_right - CC_WIDTH).clamp(MARGIN, (w - CC_WIDTH - MARGIN).max(MARGIN));
@@ -282,25 +429,52 @@ impl Panel {
 
         // compute height first
         let mut height = pad + 110.0 + pad;
-        if st.brightness.is_some() {
+        if self.control.brightness.is_some() {
             height += 64.0 + pad;
         }
         height += 64.0 + pad; // sound
-        if st.media.is_some() {
+        if self.control.media.is_some() {
             height += 64.0 + pad;
         }
         self.panel_rect = (x0, y0, CC_WIDTH, height);
         fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, tint);
+        stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, 1.0 * s, border);
 
         // connectivity card: Wi-Fi + Bluetooth
         let y = y0 + pad;
         fill_rounded(pm, inner_x * s, y * s, half * s, 110.0 * s, 14.0 * s, card);
-        let (wifi_on, ssid) = st.wifi.clone().unwrap_or((false, None));
+        stroke_rounded(pm, inner_x * s, y * s, half * s, 110.0 * s, 14.0 * s, 0.75 * s, card_border);
+
+        let (wifi_on, ssid) = self.control.wifi.clone().unwrap_or((false, None));
+        let bt_connected: Vec<&str> = self
+            .control
+            .bt_devices
+            .iter()
+            .filter(|d| d.connected)
+            .map(|d| d.name.as_str())
+            .collect();
+        let bt_status = match self.control.bluetooth {
+            Some(true) => match bt_connected.len() {
+                0 => t("On", "Ein").to_string(),
+                1 => bt_connected[0].to_string(),
+                n => {
+                    if german {
+                        format!("{n} Geräte")
+                    } else {
+                        format!("{n} Devices")
+                    }
+                }
+            },
+            Some(false) => t("Off", "Aus").to_string(),
+            None => t("Unavailable", "Nicht verfügbar").to_string(),
+        };
+
         let rows = [
             (
-                Target::Wifi,
+                Target::WifiToggle,
+                Submenu::Wifi,
                 "Wi-Fi".to_string(),
-                if st.wifi.is_none() {
+                if self.control.wifi.is_none() {
                     t("Unavailable", "Nicht verfügbar").to_string()
                 } else if !wifi_on {
                     t("Off", "Aus").to_string()
@@ -308,43 +482,53 @@ impl Panel {
                     ssid.unwrap_or_else(|| t("Not Connected", "Nicht verbunden").into())
                 },
                 wifi_on,
-                st.wifi.is_some(),
+                self.control.wifi.is_some(),
             ),
             (
-                Target::Bluetooth,
+                Target::BluetoothToggle,
+                Submenu::Bluetooth,
                 "Bluetooth".to_string(),
-                match st.bluetooth {
-                    Some(true) => t("On", "Ein").to_string(),
-                    Some(false) => t("Off", "Aus").to_string(),
-                    None => t("Unavailable", "Nicht verfügbar").to_string(),
-                },
-                st.bluetooth == Some(true),
-                st.bluetooth.is_some(),
+                bt_status,
+                self.control.bluetooth == Some(true),
+                self.control.bluetooth.is_some(),
             ),
         ];
-        for (i, (target, title, status, on, available)) in rows.into_iter().enumerate() {
-            let ry = y + 10.0 + i as f32 * 48.0;
-            let (cx, cy) = (inner_x + 24.0, ry + 20.0);
+
+        for (i, (toggle_target, submenu, title, status, on, available)) in rows.into_iter().enumerate() {
+            let ry = y + 9.0 + i as f32 * 48.0;
+            let row_rect = (inner_x + 4.0, ry, half - 8.0, 44.0);
+            let circle_rect = (inner_x + 8.0, ry + 5.0, 32.0, 32.0);
+            let open_rect = (inner_x + 40.0, ry, half - 42.0, 44.0);
+            let row_hovered = available && self.hovered(open_rect.0, open_rect.1, open_rect.2, open_rect.3);
+            if row_hovered {
+                fill_rounded(pm, row_rect.0 * s, row_rect.1 * s, row_rect.2 * s, row_rect.3 * s, 10.0 * s, hover_bg);
+            }
+            let (cx, cy) = (inner_x + 24.0, ry + 22.0);
             fill_circle(pm, cx * s, cy * s, 15.0 * s, if on { accent } else { off });
             let glyph = if on { [255, 255, 255, 255] } else { text };
-            match target {
-                Target::Wifi => crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.8, Network::Wifi(3), glyph),
+            match submenu {
+                Submenu::Wifi => crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.8, Network::Wifi(3), glyph),
                 _ => bluetooth(pm, cx * s, cy * s, 7.0 * s, glyph),
             }
             let tx = inner_x + 46.0;
-            let maxw = half - 50.0;
-            let b1 = fonts.baseline_centered((ry + 4.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
+            let maxw = half - 62.0;
+            let b1 = fonts.baseline_centered((ry + 5.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
             fonts.draw(pm, &fonts.elide(&title, 12.0 * s, Weight::Bold, maxw * s), tx * s, b1, 12.0 * s, Weight::Bold, text);
-            let b2 = fonts.baseline_centered((ry + 20.0) * s, 16.0 * s, 11.0 * s, Weight::Regular);
+            let b2 = fonts.baseline_centered((ry + 21.0) * s, 16.0 * s, 11.0 * s, Weight::Regular);
             fonts.draw(pm, &fonts.elide(&status, 11.0 * s, Weight::Regular, maxw * s), tx * s, b2, 11.0 * s, Weight::Regular, sub);
             if available {
-                self.targets.push(((inner_x, ry, half, 44.0), target));
+                let chev_col = if row_hovered { text } else { sub };
+                chevron_right(pm, (inner_x + half - 11.0) * s, (ry + 22.0) * s, 4.0 * s, chev_col);
+                // Circle toggles directly; rest of row opens submenu (1:1 macOS)
+                self.targets.push((circle_rect, toggle_target));
+                self.targets.push((open_rect, Target::OpenSubmenu(submenu)));
             }
         }
 
         // Do Not Disturb card
         let fx = inner_x + half + pad;
         fill_rounded(pm, fx * s, y * s, half * s, 110.0 * s, 14.0 * s, card);
+        stroke_rounded(pm, fx * s, y * s, half * s, 110.0 * s, 14.0 * s, 0.75 * s, card_border);
         let dnd = center.do_not_disturb;
         let (cx, cy) = (fx + 24.0, y + 30.0);
         fill_circle(pm, cx * s, cy * s, 15.0 * s, if dnd { [94, 92, 230, 255] } else { off });
@@ -357,35 +541,42 @@ impl Panel {
 
         // sliders
         let mut y = y + 110.0 + pad;
-        let slider = |pm: &mut Pixmap, targets: &mut Vec<_>, y: f32, label: &str, value: f32, icon: u8, target: fn(f32, f32) -> Target| {
+        if let Some(b) = self.control.brightness {
             fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
-            let b = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
-            fonts.draw(pm, label, (inner_x + 12.0) * s, b, 12.0 * s, Weight::Bold, text);
+            stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
+            let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
+            fonts.draw(pm, t("Display", "Display"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
+            draw_pill_slider(pm, s, inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0, b, 0, false, off);
             let (tx, ty, tw, th) = (inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0);
-            fill_rounded(pm, tx * s, ty * s, tw * s, th * s, 11.0 * s, off);
-            let fill_w = (th + (tw - th) * value.clamp(0.0, 1.0)).max(th);
-            fill_rounded(pm, tx * s, ty * s, fill_w * s, th * s, 11.0 * s, [255, 255, 255, 235]);
-            let knob_x = tx + fill_w - th / 2.0;
-            fill_circle(pm, knob_x * s, (ty + th / 2.0) * s, (th / 2.0 - 1.0) * s, [255, 255, 255, 255]);
-            stroke_rounded(pm, (knob_x - th / 2.0 + 1.0) * s, (ty + 1.0) * s, (th - 2.0) * s, (th - 2.0) * s, (th / 2.0 - 1.0) * s, 1.0 * s, [0, 0, 0, 30]);
-            let glyph: Rgba = [90, 90, 92, 255];
-            match icon {
-                0 => crate::osd::sun(pm, (tx + th / 2.0) * s, (ty + th / 2.0) * s, 8.0 * s, value, glyph),
-                _ => crate::osd::speaker(pm, (tx + th / 2.0 + 1.0) * s, (ty + th / 2.0) * s, 7.0 * s, value, value <= 0.001, glyph),
-            }
-            targets.push(((tx - 4.0, ty - 6.0, tw + 8.0, th + 12.0), target(tx + th / 2.0, tx + tw - th / 2.0)));
-        };
-        if let Some(b) = st.brightness {
-            slider(pm, &mut self.targets, y, t("Display", "Display"), b, 0, Target::Brightness);
+            self.targets
+                .push(((tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0), Target::Brightness(tx + th / 2.0, tx + tw - th / 2.0)));
             y += 64.0 + pad;
         }
-        let (vol, muted) = st.volume.unwrap_or((0.0, true));
-        slider(pm, &mut self.targets, y, t("Sound", "Ton"), if muted { 0.0 } else { vol.min(1.0) }, 1, Target::Volume);
+
+        // Sound card (header opens Sound submenu, slider adjusts volume)
+        let (vol, muted) = self.control.volume.unwrap_or((0.0, true));
+        fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
+        stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
+        let sound_head_rect = (inner_x + 4.0, y + 2.0, inner_w - 8.0, 26.0);
+        let sound_hovered = self.hovered(sound_head_rect.0, sound_head_rect.1, sound_head_rect.2, sound_head_rect.3);
+        if sound_hovered {
+            fill_rounded(pm, sound_head_rect.0 * s, sound_head_rect.1 * s, sound_head_rect.2 * s, sound_head_rect.3 * s, 8.0 * s, hover_bg);
+        }
+        let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
+        fonts.draw(pm, t("Sound", "Ton"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
+        chevron_right(pm, (inner_x + inner_w - 14.0) * s, (y + 15.0) * s, 4.0 * s, if sound_hovered { text } else { sub });
+        self.targets.push((sound_head_rect, Target::OpenSubmenu(Submenu::Sound)));
+
+        let (tx, ty, tw, th) = (inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0);
+        draw_pill_slider(pm, s, tx, ty, tw, th, if muted { 0.0 } else { vol.min(1.0) }, 1, muted, off);
+        self.targets
+            .push(((tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0), Target::Volume(tx + th / 2.0, tx + tw - th / 2.0)));
         y += 64.0 + pad;
 
         // now playing
-        if let Some(m) = &st.media {
+        if let Some(m) = self.control.media.clone() {
             fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
+            stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
             let maxw = inner_w - 130.0;
             let b1 = fonts.baseline_centered((y + 12.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
             let title = if m.title.is_empty() { t("Not Playing", "Keine Wiedergabe") } else { &m.title };
@@ -406,6 +597,546 @@ impl Panel {
             }
         }
     }
+
+    // ---- Control Center submenus (1:1 macOS) ---------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_cc_submenu(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        w: f32,
+        h: f32,
+        submenu: Submenu,
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+    ) {
+        let t = |en: &'static str, de: &'static str| if german { de } else { en };
+        let dark = theme.bar_text[0] > 128;
+        let tint: Rgba = if dark { [30, 30, 32, 165] } else { [242, 242, 245, 178] };
+        let border: Rgba = if dark { [255, 255, 255, 34] } else { [0, 0, 0, 22] };
+        let off: Rgba = if dark { [255, 255, 255, 36] } else { [0, 0, 0, 22] };
+        let hover_bg: Rgba = if dark { [255, 255, 255, 22] } else { [0, 0, 0, 13] };
+        let sep: Rgba = if dark { [255, 255, 255, 26] } else { [0, 0, 0, 22] };
+        let accent = theme.menu_selection;
+        let text = theme.menu_text;
+        let sub_text: Rgba = if dark { [235, 235, 235, 138] } else { [20, 20, 20, 128] };
+
+        let x0 = (self.anchor_right - CC_WIDTH).clamp(MARGIN, (w - CC_WIDTH - MARGIN).max(MARGIN));
+        let y0 = 6.0 - (1.0 - self.progress()) * 12.0;
+        let slide_x = (1.0 - self.sub_progress()) * 10.0;
+
+        // Pre-build the scrollable content items for each submenu
+        let (title, toggle_state, toggle_target, settings_label, settings_page) = match submenu {
+            Submenu::Wifi => (
+                "Wi-Fi",
+                Some(self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false)),
+                Some(Target::WifiToggle),
+                t("Wi-Fi Settings…", "WLAN-Einstellungen …"),
+                "wifi",
+            ),
+            Submenu::Bluetooth => (
+                "Bluetooth",
+                Some(self.control.bluetooth == Some(true)),
+                Some(Target::BluetoothToggle),
+                t("Bluetooth Settings…", "Bluetooth-Einstellungen …"),
+                "bluetooth",
+            ),
+            Submenu::Sound => (
+                t("Sound", "Ton"),
+                None,
+                None,
+                t("Sound Settings…", "Toneinstellungen …"),
+                "sound",
+            ),
+        };
+
+        // Header geometry
+        let header_h = 44.0;
+        // Sound submenu puts the pill slider directly below the header (no divider above slider)
+        let sound_slider_h = if submenu == Submenu::Sound { 34.0 } else { 0.0 };
+        let footer_h = 42.0; // divider (8px) + button (30px) + bottom pad (4px)
+
+        // Compute content height for the list area
+        let content_h = match submenu {
+            Submenu::Wifi => {
+                let wifi_on = self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false);
+                if !wifi_on {
+                    0.0
+                } else {
+                    let known_count = self.control.wifi_networks.iter().filter(|n| n.active || n.known).count();
+                    let other_count = self.control.wifi_networks.iter().filter(|n| !n.active && !n.known).count();
+                    let mut ch = 4.0;
+                    if known_count > 0 {
+                        ch += 24.0 + known_count as f32 * 38.0 + 4.0;
+                        if other_count > 0 {
+                            ch += 9.0; // divider
+                        }
+                    }
+                    if other_count > 0 || known_count == 0 {
+                        ch += 26.0; // "Other Networks" header row
+                        if self.wifi_others_open {
+                            if other_count == 0 {
+                                ch += 34.0;
+                            } else {
+                                ch += other_count as f32 * 38.0;
+                            }
+                        }
+                    }
+                    ch + 4.0
+                }
+            }
+            Submenu::Bluetooth => {
+                let bt_on = self.control.bluetooth == Some(true);
+                if !bt_on {
+                    0.0
+                } else {
+                    let count = self.control.bt_devices.len();
+                    4.0 + 24.0 + if count == 0 { 34.0 } else { count as f32 * 38.0 } + 4.0
+                }
+            }
+            Submenu::Sound => {
+                let count = self.control.audio_sinks.len();
+                4.0 + 24.0 + if count == 0 { 34.0 } else { count as f32 * 38.0 } + 4.0
+            }
+        };
+
+        let top_chrome = 4.0 + header_h + sound_slider_h + if content_h > 0.0 { 1.0 } else { 0.0 };
+        let max_list_h = (h - y0 - MARGIN - top_chrome - footer_h).clamp(110.0, 380.0);
+        let visible_list_h = content_h.min(max_list_h);
+        let total_h = top_chrome + visible_list_h + footer_h;
+
+        self.panel_rect = (x0, y0, CC_WIDTH, total_h);
+        fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, total_h * s, 18.0 * s, tint);
+        stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, total_h * s, 18.0 * s, 1.0 * s, border);
+
+        // ---- Header ----
+        let hy = y0 + 4.0;
+        let back_rect = (x0 + 6.0, hy + 4.0, if toggle_state.is_some() { CC_WIDTH - 68.0 } else { CC_WIDTH - 12.0 }, 36.0);
+        let back_hovered = self.hovered(back_rect.0, back_rect.1, back_rect.2, back_rect.3);
+        if back_hovered {
+            fill_rounded(pm, back_rect.0 * s, back_rect.1 * s, back_rect.2 * s, back_rect.3 * s, 8.0 * s, hover_bg);
+        }
+        chevron_left(pm, (x0 + 18.0 + slide_x) * s, (hy + 22.0) * s, 4.5 * s, if back_hovered { text } else { sub_text });
+        let hb = fonts.baseline_centered(hy * s, header_h * s, 13.5 * s, Weight::Bold);
+        fonts.draw(pm, title, (x0 + 30.0 + slide_x) * s, hb, 13.5 * s, Weight::Bold, text);
+        self.targets.push((back_rect, Target::SubmenuBack));
+
+        if let (Some(on), Some(t_target)) = (toggle_state, toggle_target) {
+            let sx = x0 + CC_WIDTH - 14.0 - 38.0;
+            let sy = hy + 11.0;
+            switch(pm, s, sx, sy, on, accent, dark);
+            self.targets.push(((sx - 4.0, sy - 4.0, 46.0, 30.0), t_target));
+        }
+
+        // ---- Sound slider (directly under Sound header) ----
+        let mut cur_y = hy + header_h;
+        if submenu == Submenu::Sound {
+            let (vol, muted) = self.control.volume.unwrap_or((0.0, true));
+            let (tx, ty, tw, th) = (x0 + 14.0, cur_y + 2.0, CC_WIDTH - 28.0, 22.0);
+            draw_pill_slider(pm, s, tx, ty, tw, th, if muted { 0.0 } else { vol.min(1.0) }, 1, muted, off);
+            // Clicking the speaker icon toggles mute; dragging anywhere else sets volume
+            self.targets.push(((tx - 2.0, ty - 4.0, 24.0, th + 8.0), Target::VolumeMute));
+            self.targets
+                .push(((tx + 22.0, ty - 4.0, tw - 18.0, th + 8.0), Target::Volume(tx + th / 2.0, tx + tw - th / 2.0)));
+            cur_y += sound_slider_h;
+        }
+
+        // ---- Scrollable body ----
+        if content_h > 0.0 {
+            draw_sep(pm, s, x0 + 14.0, cur_y, CC_WIDTH - 28.0, sep);
+            cur_y += 1.0;
+
+            let list_y = cur_y;
+            self.scroll = self.scroll.min((content_h - visible_list_h).max(0.0));
+            let scroll = self.scroll;
+
+            if let Some(mut sub_pm) = Pixmap::new((CC_WIDTH * s).ceil().max(1.0) as u32, (visible_list_h * s).ceil().max(1.0) as u32) {
+                let mut local_targets: Vec<((f32, f32, f32, f32), Target)> = Vec::new();
+                let hover_local = self.hover.and_then(|(hx, hy)| {
+                    if hy >= list_y && hy < list_y + visible_list_h && hx >= x0 && hx < x0 + CC_WIDTH {
+                        Some((hx - x0, hy - list_y))
+                    } else {
+                        None
+                    }
+                });
+                let is_hov = |rx: f32, ry: f32, rw: f32, rh: f32| {
+                    hover_local
+                        .map(|(hx, hy)| hx >= rx && hx < rx + rw && hy >= ry && hy < ry + rh)
+                        .unwrap_or(false)
+                };
+
+                let mut ly = 4.0 - scroll;
+
+                match submenu {
+                    Submenu::Wifi => {
+                        let known: Vec<WifiNetwork> = self
+                            .control
+                            .wifi_networks
+                            .iter()
+                            .filter(|n| n.active || n.known)
+                            .cloned()
+                            .collect();
+                        let others: Vec<WifiNetwork> = self
+                            .control
+                            .wifi_networks
+                            .iter()
+                            .filter(|n| !n.active && !n.known)
+                            .cloned()
+                            .collect();
+
+                        if !known.is_empty() {
+                            let lbl = if known.len() == 1 {
+                                t("Known Network", "Bekanntes Netzwerk")
+                            } else {
+                                t("Known Networks", "Bekannte Netzwerke")
+                            };
+                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, lbl, fonts, sub_text);
+                            ly += 24.0;
+                            for net in &known {
+                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                if is_hov(row.0, row.1, row.2, row.3) {
+                                    fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
+                                }
+                                draw_wifi_row(
+                                    &mut sub_pm,
+                                    s,
+                                    slide_x,
+                                    ly,
+                                    net,
+                                    self.busy_item.as_deref() == Some(net.ssid.as_str()),
+                                    fonts,
+                                    accent,
+                                    off,
+                                    text,
+                                    sub_text,
+                                    german,
+                                );
+                                local_targets.push((
+                                    row,
+                                    Target::WifiConnect {
+                                        ssid: net.ssid.clone(),
+                                        known: true,
+                                        secure: net.secure,
+                                    },
+                                ));
+                                ly += 38.0;
+                            }
+                            ly += 4.0;
+                            if !others.is_empty() {
+                                draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                                ly += 9.0;
+                            }
+                        }
+
+                        if !others.is_empty() || known.is_empty() {
+                            let hdr_rect = (6.0, ly, CC_WIDTH - 12.0, 26.0);
+                            if is_hov(hdr_rect.0, hdr_rect.1, hdr_rect.2, hdr_rect.3) {
+                                fill_rounded(&mut sub_pm, hdr_rect.0 * s, hdr_rect.1 * s, hdr_rect.2 * s, hdr_rect.3 * s, 6.0 * s, hover_bg);
+                            }
+                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly + 1.0, t("Other Networks", "Andere Netzwerke"), fonts, sub_text);
+                            if self.wifi_others_open {
+                                chevron_down(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
+                            } else {
+                                chevron_right(&mut sub_pm, (CC_WIDTH - 18.0) * s, (ly + 13.0) * s, 4.0 * s, sub_text);
+                            }
+                            local_targets.push((hdr_rect, Target::WifiToggleOthers));
+                            ly += 26.0;
+
+                            if self.wifi_others_open {
+                                if others.is_empty() {
+                                    let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
+                                    fonts.draw(&mut sub_pm, t("No Networks Found", "Keine Netzwerke gefunden"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
+                                } else {
+                                    for net in &others {
+                                        let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                        if is_hov(row.0, row.1, row.2, row.3) {
+                                            fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
+                                        }
+                                        draw_wifi_row(
+                                            &mut sub_pm,
+                                            s,
+                                            slide_x,
+                                            ly,
+                                            net,
+                                            self.busy_item.as_deref() == Some(net.ssid.as_str()),
+                                            fonts,
+                                            accent,
+                                            off,
+                                            text,
+                                            sub_text,
+                                            german,
+                                        );
+                                        local_targets.push((
+                                            row,
+                                            Target::WifiConnect {
+                                                ssid: net.ssid.clone(),
+                                                known: false,
+                                                secure: net.secure,
+                                            },
+                                        ));
+                                        ly += 38.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Submenu::Bluetooth => {
+                        draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Devices", "Geräte"), fonts, sub_text);
+                        ly += 24.0;
+                        if self.control.bt_devices.is_empty() {
+                            let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
+                            fonts.draw(&mut sub_pm, t("No Devices", "Keine Geräte"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
+                        } else {
+                            for dev in &self.control.bt_devices {
+                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                if is_hov(row.0, row.1, row.2, row.3) {
+                                    fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
+                                }
+                                let busy = self.busy_item.as_deref() == Some(dev.mac.as_str());
+                                draw_bt_row(&mut sub_pm, s, slide_x, ly, dev, busy, fonts, accent, off, text, sub_text, german);
+                                local_targets.push((
+                                    row,
+                                    Target::BtToggleDevice {
+                                        mac: dev.mac.clone(),
+                                        connected: dev.connected,
+                                    },
+                                ));
+                                ly += 38.0;
+                            }
+                        }
+                    }
+
+                    Submenu::Sound => {
+                        draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Output", "Ausgabe"), fonts, sub_text);
+                        ly += 24.0;
+                        if self.control.audio_sinks.is_empty() {
+                            let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
+                            fonts.draw(&mut sub_pm, t("No Output Devices", "Keine Ausgabegeräte"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
+                        } else {
+                            for sink in &self.control.audio_sinks {
+                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                if is_hov(row.0, row.1, row.2, row.3) {
+                                    fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
+                                }
+                                draw_sink_row(&mut sub_pm, s, slide_x, ly, sink, fonts, accent, off, text);
+                                local_targets.push((row, Target::AudioSelectSink(sink.name.clone())));
+                                ly += 38.0;
+                            }
+                        }
+                    }
+                }
+
+                pm.draw_pixmap(
+                    (x0 * s) as i32,
+                    (list_y * s) as i32,
+                    sub_pm.as_ref(),
+                    &PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                );
+
+                // Translate & clip local targets to the visible list viewport
+                for ((rx, ry, rw, rh), target) in local_targets {
+                    let y1 = ry.max(0.0);
+                    let y2 = (ry + rh).min(visible_list_h);
+                    if y2 > y1 {
+                        self.targets.push(((x0 + rx, list_y + y1, rw, y2 - y1), target));
+                    }
+                }
+            }
+
+            cur_y += visible_list_h;
+        }
+
+        // ---- Footer ("… Settings…") ----
+        draw_sep(pm, s, x0 + 14.0, cur_y + 2.0, CC_WIDTH - 28.0, sep);
+        let foot_rect = (x0 + 6.0, cur_y + 6.0, CC_WIDTH - 12.0, 30.0);
+        if self.hovered(foot_rect.0, foot_rect.1, foot_rect.2, foot_rect.3) {
+            fill_rounded(pm, foot_rect.0 * s, foot_rect.1 * s, foot_rect.2 * s, foot_rect.3 * s, 8.0 * s, hover_bg);
+        }
+        let fb = fonts.baseline_centered(foot_rect.1 * s, foot_rect.3 * s, 12.5 * s, Weight::Regular);
+        fonts.draw(pm, settings_label, (x0 + 16.0) * s, fb, 12.5 * s, Weight::Regular, text);
+        self.targets.push((foot_rect, Target::OpenSettings(settings_page)));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_pill_slider(pm: &mut Pixmap, s: f32, tx: f32, ty: f32, tw: f32, th: f32, value: f32, icon: u8, muted: bool, off: Rgba) {
+    fill_rounded(pm, tx * s, ty * s, tw * s, th * s, (th / 2.0) * s, off);
+    let fill_w = (th + (tw - th) * value.clamp(0.0, 1.0)).max(th);
+    fill_rounded(pm, tx * s, ty * s, fill_w * s, th * s, (th / 2.0) * s, [255, 255, 255, 238]);
+    let knob_x = tx + fill_w - th / 2.0;
+    fill_circle(pm, knob_x * s, (ty + th / 2.0) * s, (th / 2.0 - 1.0) * s, [255, 255, 255, 255]);
+    stroke_rounded(
+        pm,
+        (knob_x - th / 2.0 + 1.0) * s,
+        (ty + 1.0) * s,
+        (th - 2.0) * s,
+        (th - 2.0) * s,
+        (th / 2.0 - 1.0) * s,
+        1.0 * s,
+        [0, 0, 0, 30],
+    );
+    let glyph: Rgba = [90, 90, 92, 255];
+    match icon {
+        0 => crate::osd::sun(pm, (tx + th / 2.0) * s, (ty + th / 2.0) * s, 8.0 * s, value, glyph),
+        _ => crate::osd::speaker(pm, (tx + th / 2.0 + 1.0) * s, (ty + th / 2.0) * s, 7.0 * s, value, muted || value <= 0.001, glyph),
+    }
+}
+
+fn draw_sep(pm: &mut Pixmap, s: f32, x: f32, y: f32, w: f32, c: Rgba) {
+    fill_rounded(pm, x * s, y * s, w * s, (0.75 * s).max(1.0), 0.0, c);
+}
+
+fn draw_section_header(pm: &mut Pixmap, s: f32, x: f32, y: f32, label: &str, fonts: &Fonts, c: Rgba) {
+    let b = fonts.baseline_centered(y * s, 24.0 * s, 11.5 * s, Weight::Bold);
+    fonts.draw(pm, label, x * s, b, 11.5 * s, Weight::Bold, c);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_wifi_row(
+    pm: &mut Pixmap,
+    s: f32,
+    slide_x: f32,
+    ly: f32,
+    net: &WifiNetwork,
+    busy: bool,
+    fonts: &Fonts,
+    accent: Rgba,
+    off: Rgba,
+    text: Rgba,
+    sub_text: Rgba,
+    german: bool,
+) {
+    let (cx, cy) = (27.0 + slide_x, ly + 19.0);
+    fill_circle(pm, cx * s, cy * s, 13.0 * s, if net.active { accent } else { off });
+    let glyph_col = if net.active { [255, 255, 255, 255] } else { text };
+    let bars = if net.signal >= 67 {
+        3
+    } else if net.signal >= 34 {
+        2
+    } else {
+        1
+    };
+    crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.72, Network::Wifi(bars), glyph_col);
+
+    let right_reserve = if busy {
+        86.0
+    } else if net.secure {
+        32.0
+    } else {
+        16.0
+    };
+    let maxw = (CC_WIDTH - 48.0 - right_reserve).max(40.0);
+    let b = fonts.baseline_centered(ly * s, 38.0 * s, 13.0 * s, Weight::Regular);
+    let label = fonts.elide(&net.ssid, 13.0 * s, Weight::Regular, maxw * s);
+    fonts.draw(pm, &label, (48.0 + slide_x) * s, b, 13.0 * s, Weight::Regular, text);
+
+    if busy {
+        let msg = if german { "Verbinden…" } else { "Connecting…" };
+        let mw = fonts.measure(msg, 11.0 * s, Weight::Regular) / s;
+        let mb = fonts.baseline_centered(ly * s, 38.0 * s, 11.0 * s, Weight::Regular);
+        fonts.draw(pm, msg, (CC_WIDTH - 14.0 - mw) * s, mb, 11.0 * s, Weight::Regular, sub_text);
+    } else if net.secure {
+        lock_glyph(pm, (CC_WIDTH - 22.0) * s, cy * s, 5.5 * s, sub_text);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_bt_row(
+    pm: &mut Pixmap,
+    s: f32,
+    slide_x: f32,
+    ly: f32,
+    dev: &BtDevice,
+    busy: bool,
+    fonts: &Fonts,
+    accent: Rgba,
+    off: Rgba,
+    text: Rgba,
+    sub_text: Rgba,
+    german: bool,
+) {
+    let (cx, cy) = (27.0 + slide_x, ly + 19.0);
+    fill_circle(pm, cx * s, cy * s, 13.0 * s, if dev.connected { accent } else { off });
+    let glyph_col = if dev.connected { [255, 255, 255, 255] } else { text };
+    let icon = dev.icon.as_str();
+    if icon.contains("headphone") || icon.contains("headset") {
+        headphones(pm, cx * s, cy * s, 6.8 * s, glyph_col);
+    } else if icon.contains("keyboard") {
+        keyboard_glyph(pm, cx * s, cy * s, 6.8 * s, glyph_col);
+    } else if icon.contains("mouse") || icon.contains("touchpad") {
+        mouse_glyph(pm, cx * s, cy * s, 6.8 * s, glyph_col);
+    } else if icon.contains("audio") || icon.contains("speaker") {
+        crate::osd::speaker(pm, (cx + 1.0) * s, cy * s, 6.8 * s, 0.8, false, glyph_col);
+    } else {
+        bluetooth(pm, cx * s, cy * s, 6.5 * s, glyph_col);
+    }
+
+    let right_reserve = if busy {
+        88.0
+    } else if dev.connected && dev.battery.is_some() {
+        64.0
+    } else {
+        16.0
+    };
+    let maxw = (CC_WIDTH - 48.0 - right_reserve).max(40.0);
+    let b = fonts.baseline_centered(ly * s, 38.0 * s, 13.0 * s, Weight::Regular);
+    let label = fonts.elide(&dev.name, 13.0 * s, Weight::Regular, maxw * s);
+    fonts.draw(pm, &label, (48.0 + slide_x) * s, b, 13.0 * s, Weight::Regular, text);
+
+    if busy {
+        let msg = if dev.connected {
+            if german { "Trennen…" } else { "Disconnecting…" }
+        } else if german {
+            "Verbinden…"
+        } else {
+            "Connecting…"
+        };
+        let mw = fonts.measure(msg, 11.0 * s, Weight::Regular) / s;
+        let mb = fonts.baseline_centered(ly * s, 38.0 * s, 11.0 * s, Weight::Regular);
+        fonts.draw(pm, msg, (CC_WIDTH - 14.0 - mw) * s, mb, 11.0 * s, Weight::Regular, sub_text);
+    } else if dev.connected {
+        if let Some(pct) = dev.battery {
+            let pct_str = format!("{pct}%");
+            let pw = fonts.measure(&pct_str, 11.0 * s, Weight::Regular) / s;
+            let bx = CC_WIDTH - 34.0;
+            let pb = fonts.baseline_centered(ly * s, 38.0 * s, 11.0 * s, Weight::Regular);
+            fonts.draw(pm, &pct_str, (bx - pw - 5.0) * s, pb, 11.0 * s, Weight::Regular, sub_text);
+            mini_battery(pm, bx * s, cy * s, s, pct, sub_text);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_sink_row(
+    pm: &mut Pixmap,
+    s: f32,
+    slide_x: f32,
+    ly: f32,
+    sink: &AudioSink,
+    fonts: &Fonts,
+    accent: Rgba,
+    off: Rgba,
+    text: Rgba,
+) {
+    let (cx, cy) = (27.0 + slide_x, ly + 19.0);
+    fill_circle(pm, cx * s, cy * s, 13.0 * s, if sink.active { accent } else { off });
+    let glyph_col = if sink.active { [255, 255, 255, 255] } else { text };
+    match sink.icon {
+        AudioIcon::Headphones => headphones(pm, cx * s, cy * s, 6.8 * s, glyph_col),
+        AudioIcon::Bluetooth => bluetooth(pm, cx * s, cy * s, 6.5 * s, glyph_col),
+        AudioIcon::Display => display_glyph(pm, cx * s, cy * s, 6.8 * s, glyph_col),
+        AudioIcon::Speaker => crate::osd::speaker(pm, (cx + 1.0) * s, cy * s, 6.8 * s, 0.8, false, glyph_col),
+    }
+
+    let maxw = (CC_WIDTH - 48.0 - 16.0).max(40.0);
+    let b = fonts.baseline_centered(ly * s, 38.0 * s, 13.0 * s, Weight::Regular);
+    let label = fonts.elide(&sink.desc, 13.0 * s, Weight::Regular, maxw * s);
+    fonts.draw(pm, &label, (48.0 + slide_x) * s, b, 13.0 * s, Weight::Regular, text);
 }
 
 thread_local! {
@@ -472,12 +1203,146 @@ fn bluetooth(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     if let Some(p) = pb.finish() {
         let st = Stroke {
             width: r * 0.22,
-            line_cap: tiny_skia::LineCap::Round,
-            line_join: tiny_skia::LineJoin::Round,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
             ..Default::default()
         };
         pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
     }
+}
+
+fn chevron_right(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - r * 0.45, cy - r);
+    pb.line_to(cx + r * 0.45, cy);
+    pb.line_to(cx - r * 0.45, cy + r);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.38).max(1.3),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+}
+
+fn chevron_left(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + r * 0.45, cy - r);
+    pb.line_to(cx - r * 0.45, cy);
+    pb.line_to(cx + r * 0.45, cy + r);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.38).max(1.4),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+}
+
+fn chevron_down(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - r, cy - r * 0.4);
+    pb.line_to(cx, cy + r * 0.5);
+    pb.line_to(cx + r, cy - r * 0.4);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.38).max(1.3),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+}
+
+fn lock_glyph(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    // Padlock body
+    fill_rounded(pm, cx - r * 0.65, cy - r * 0.1, r * 1.3, r * 1.05, r * 0.25, c);
+    // Shackle arch
+    let mut pb = PathBuilder::new();
+    let arch_r = r * 0.4;
+    let base_y = cy - r * 0.1;
+    let top_y = cy - r * 0.55;
+    pb.move_to(cx - arch_r, base_y);
+    pb.line_to(cx - arch_r, top_y);
+    for k in 0..=12 {
+        let a = std::f32::consts::PI + std::f32::consts::PI * (k as f32 / 12.0);
+        pb.line_to(cx + arch_r * a.cos(), top_y + arch_r * a.sin());
+    }
+    pb.line_to(cx + arch_r, base_y);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.24).max(1.1),
+            line_cap: LineCap::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+}
+
+fn headphones(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    // Headband arc
+    let mut pb = PathBuilder::new();
+    let band_r = r * 0.82;
+    for k in 0..=16 {
+        let a = std::f32::consts::PI + std::f32::consts::PI * (k as f32 / 16.0);
+        let (x, y) = (cx + band_r * a.cos(), cy + r * 0.15 + band_r * a.sin());
+        if k == 0 {
+            pb.move_to(x, y);
+        } else {
+            pb.line_to(x, y);
+        }
+    }
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.22).max(1.3),
+            line_cap: LineCap::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+    // Left and right ear cups
+    fill_rounded(pm, cx - r * 0.96, cy + r * 0.02, r * 0.42, r * 0.85, r * 0.2, c);
+    fill_rounded(pm, cx + r * 0.54, cy + r * 0.02, r * 0.42, r * 0.85, r * 0.2, c);
+}
+
+fn keyboard_glyph(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    stroke_rounded(pm, cx - r, cy - r * 0.62, r * 2.0, r * 1.24, r * 0.25, (r * 0.18).max(1.1), c);
+    // Tiny key dots
+    let kw = r * 0.24;
+    let kh = r * 0.2;
+    for row in [-0.26f32, 0.08] {
+        for col in [-0.62f32, -0.22, 0.18, 0.56] {
+            fill_rounded(pm, cx + col * r - kw / 2.0, cy + row * r - kh / 2.0, kw, kh, r * 0.05, c);
+        }
+    }
+    fill_rounded(pm, cx - r * 0.42, cy + r * 0.3, r * 0.84, kh * 0.85, r * 0.05, c);
+}
+
+fn mouse_glyph(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    stroke_rounded(pm, cx - r * 0.58, cy - r * 0.88, r * 1.16, r * 1.76, r * 0.56, (r * 0.2).max(1.2), c);
+    fill_rounded(pm, cx - r * 0.09, cy - r * 0.56, r * 0.18, r * 0.42, r * 0.09, c);
+}
+
+fn display_glyph(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    stroke_rounded(pm, cx - r * 0.92, cy - r * 0.78, r * 1.84, r * 1.24, r * 0.2, (r * 0.18).max(1.2), c);
+    fill_rounded(pm, cx - r * 0.12, cy + r * 0.48, r * 0.24, r * 0.26, 0.0, c);
+    fill_rounded(pm, cx - r * 0.46, cy + r * 0.72, r * 0.92, r * 0.16, r * 0.08, c);
+}
+
+fn mini_battery(pm: &mut Pixmap, x: f32, cy: f32, s: f32, pct: u8, c: Rgba) {
+    let w = 18.0 * s;
+    let h = 9.0 * s;
+    let y = cy - h / 2.0;
+    stroke_rounded(pm, x, y, w, h, 2.4 * s, 1.0 * s, c);
+    fill_rounded(pm, x + w + 1.0 * s, cy - 1.6 * s, 1.3 * s, 3.2 * s, 0.6 * s, c);
+    let fill_w = (w - 3.6 * s) * (pct as f32 / 100.0).clamp(0.08, 1.0);
+    let fill_c = if pct <= 15 { [255, 69, 58, 255] } else { c };
+    fill_rounded(pm, x + 1.8 * s, y + 1.8 * s, fill_w, h - 3.6 * s, 1.2 * s, fill_c);
 }
 
 fn play(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
@@ -512,37 +1377,241 @@ fn transport(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, dir: i32, c: Rgba) {
     }
 }
 
-/// iOS-style switch at (x, y), 40×22.
-fn switch(pm: &mut Pixmap, s: f32, x: f32, y: f32, on: bool, accent: Rgba) {
-    let bg = if on { accent } else { [120, 120, 128, 90] };
-    fill_rounded(pm, x * s, y * s, 40.0 * s, 22.0 * s, 11.0 * s, bg);
-    let kx = if on { x + 29.0 } else { x + 11.0 };
-    fill_circle(pm, kx * s, (y + 11.0) * s, 9.5 * s, [255, 255, 255, 255]);
+/// macOS / iOS-style switch at (x, y), 38×22.
+fn switch(pm: &mut Pixmap, s: f32, x: f32, y: f32, on: bool, accent: Rgba, dark: bool) {
+    let bg = if on {
+        accent
+    } else if dark {
+        [120, 120, 128, 100]
+    } else {
+        [0, 0, 0, 42]
+    };
+    fill_rounded(pm, x * s, y * s, 38.0 * s, 22.0 * s, 11.0 * s, bg);
+    let kx = if on { x + 27.0 } else { x + 11.0 };
+    fill_circle(pm, kx * s, (y + 11.0) * s, 9.0 * s, [255, 255, 255, 255]);
+    stroke_rounded(pm, (kx - 9.0) * s, (y + 2.0) * s, 18.0 * s, 18.0 * s, 9.0 * s, 0.75 * s, [0, 0, 0, 26]);
 }
 
 // ---- system state (helper thread) ---------------------------------------------
 
-fn sh(cmd: &str) -> Option<String> {
+fn cmd(prog: &str, args: &[&str]) -> Option<String> {
     // a hung daemon (bluetoothd, NetworkManager …) must not freeze the panel
-    let out = std::process::Command::new("timeout").arg("3").arg("sh").arg("-c").arg(cmd).output().ok()?;
+    let out = std::process::Command::new("timeout")
+        .arg("4")
+        .arg(prog)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+fn cmd_localized(prog: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("timeout").arg("4").arg(prog).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn sh(script: &str) -> Option<String> {
+    let out = std::process::Command::new("timeout")
+        .arg("4")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Split one `nmcli -t` line, honouring `\:` escapes.
+fn nm_fields(line: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    out.last_mut().unwrap().push(n);
+                }
+            }
+            ':' => out.push(String::new()),
+            c => out.last_mut().unwrap().push(c),
+        }
+    }
+    out
+}
+
+fn parse_wifi_networks(list: &str, known_cons: &str) -> Vec<WifiNetwork> {
+    let known: Vec<String> = known_cons
+        .lines()
+        .map(nm_fields)
+        .filter(|f| f.get(1).map(|t| t == "802-11-wireless").unwrap_or(false))
+        .map(|f| f[0].clone())
+        .collect();
+
+    let mut nets: Vec<WifiNetwork> = Vec::new();
+    for f in list.lines().map(nm_fields) {
+        if f.len() < 4 || f[1].is_empty() {
+            continue;
+        }
+        let ssid = f[1].clone();
+        let active = f[0].trim() == "*";
+        let signal: u8 = f[2].parse().unwrap_or(0);
+        let secure = !f[3].trim().is_empty() && f[3].trim() != "--";
+        let is_known = active || known.iter().any(|k| k == &ssid);
+        match nets.iter_mut().find(|n| n.ssid == ssid) {
+            Some(n) => {
+                n.active |= active;
+                n.signal = n.signal.max(signal);
+                n.secure |= secure;
+                n.known |= is_known;
+            }
+            None => nets.push(WifiNetwork {
+                ssid,
+                signal,
+                secure,
+                active,
+                known: is_known,
+            }),
+        }
+    }
+    nets.sort_by(|a, b| {
+        b.active
+            .cmp(&a.active)
+            .then(b.known.cmp(&a.known))
+            .then(b.signal.cmp(&a.signal))
+            .then(a.ssid.cmp(&b.ssid))
+    });
+    nets
+}
+
+fn parse_bt_list(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("Device ")?;
+            let (mac, name) = rest.split_once(' ')?;
+            Some((mac.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+fn infer_audio_icon(name: &str, desc: &str, active_port: &str) -> AudioIcon {
+    let combined = format!("{} {} {}", name, desc, active_port).to_lowercase();
+    if combined.contains("headphone")
+        || combined.contains("headset")
+        || combined.contains("earphone")
+        || combined.contains("airpod")
+        || combined.contains("buds")
+    {
+        AudioIcon::Headphones
+    } else if combined.contains("bluez") || combined.contains("bluetooth") {
+        AudioIcon::Bluetooth
+    } else if combined.contains("hdmi") || combined.contains("displayport") || combined.contains("dp-") || combined.contains("monitor") {
+        AudioIcon::Display
+    } else {
+        AudioIcon::Speaker
+    }
+}
+
+fn parse_audio_sinks(json: &str, default_sink: &str) -> Vec<AudioSink> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let mut sinks: Vec<AudioSink> = v
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| {
+                    let name = d["name"].as_str()?.to_string();
+                    if name.ends_with(".monitor") || name == "auto_null" {
+                        return None;
+                    }
+                    let desc = d["description"].as_str().unwrap_or(&name).to_string();
+                    let active_port = d["active_port"].as_str().unwrap_or_default();
+                    let active = name == default_sink;
+                    let icon = infer_audio_icon(&name, &desc, active_port);
+                    Some(AudioSink { name, desc, active, icon })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !sinks.iter().any(|s| s.active) {
+        if let Some(first) = sinks.first_mut() {
+            first.active = true;
+        }
+    }
+    sinks
+}
+
+fn query_wifi_networks() -> Vec<WifiNetwork> {
+    let list = cmd_localized("nmcli", &["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "dev", "wifi", "list"]).unwrap_or_default();
+    let cons = cmd_localized("nmcli", &["-t", "-f", "NAME,TYPE", "con", "show"]).unwrap_or_default();
+    parse_wifi_networks(&list, &cons)
+}
+
+fn query_bt_devices() -> Vec<BtDevice> {
+    let paired = parse_bt_list(&cmd("bluetoothctl", &["devices", "Paired"]).unwrap_or_default());
+    let connected: Vec<String> = parse_bt_list(&cmd("bluetoothctl", &["devices", "Connected"]).unwrap_or_default())
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect();
+    let mut devices = Vec::new();
+    for (mac, name) in paired {
+        let is_connected = connected.contains(&mac);
+        let mut icon = String::new();
+        let mut battery = None;
+        if let Some(detail) = cmd("bluetoothctl", &["info", &mac]) {
+            for l in detail.lines().map(str::trim) {
+                if let Some(i) = l.strip_prefix("Icon: ") {
+                    icon = i.to_string();
+                }
+                if let Some(b) = l.strip_prefix("Battery Percentage: ") {
+                    // "0x5a (90)"
+                    battery = b.split('(').nth(1).and_then(|x| x.trim_end_matches(')').parse().ok());
+                }
+            }
+        }
+        devices.push(BtDevice {
+            mac,
+            name,
+            connected: is_connected,
+            icon,
+            battery,
+        });
+    }
+    devices.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
+    devices
+}
+
+fn query_audio_sinks() -> Vec<AudioSink> {
+    let json = cmd_localized("pactl", &["-f", "json", "list", "sinks"]).unwrap_or_default();
+    let default_sink = cmd("pactl", &["get-default-sink"]).unwrap_or_default().trim().to_string();
+    parse_audio_sinks(&json, &default_sink)
+}
+
 pub fn query_control() -> ControlState {
-    let wifi = sh("nmcli -t radio wifi").map(|r| {
-        let on = r.trim() == "enabled";
+    let has_wifi = cmd("nmcli", &["-t", "-f", "type", "dev"])
+        .map(|o| o.lines().any(|l| l == "wifi"))
+        .unwrap_or(false);
+    let wifi_on = if has_wifi {
+        cmd("nmcli", &["-t", "radio", "wifi"]).map(|r| r.trim() == "enabled")
+    } else {
+        None
+    };
+    let wifi_networks = if wifi_on == Some(true) {
+        query_wifi_networks()
+    } else {
+        Vec::new()
+    };
+    let wifi = wifi_on.map(|on| {
         let ssid = if on {
-            sh("nmcli -t -f active,ssid dev wifi").and_then(|o| {
-                o.lines().find_map(|l| l.strip_prefix("yes:").map(|s| s.replace("\\:", ":"))).filter(|s| !s.is_empty())
-            })
+            wifi_networks.iter().find(|n| n.active).map(|n| n.ssid.clone())
         } else {
             None
         };
         (on, ssid)
     });
-    // no Wi-Fi hardware: nmcli still answers, but there is no wifi device
-    let has_wifi = sh("nmcli -t -f type dev").map(|o| o.lines().any(|l| l == "wifi")).unwrap_or(false);
-    let bluetooth = sh("bluetoothctl show").and_then(|o| {
+
+    let bluetooth = cmd("bluetoothctl", &["show"]).and_then(|o| {
         if o.contains("Powered: yes") {
             Some(true)
         } else if o.contains("Powered: no") {
@@ -551,12 +1620,21 @@ pub fn query_control() -> ControlState {
             None
         }
     });
-    let volume = sh("wpctl get-volume @DEFAULT_AUDIO_SINK@").and_then(|o| crate::osd::parse_wpctl(&o));
+    let bt_devices = if bluetooth == Some(true) {
+        query_bt_devices()
+    } else {
+        Vec::new()
+    };
+
+    let volume = cmd("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).and_then(|o| crate::osd::parse_wpctl(&o));
+    let audio_sinks = query_audio_sinks();
+
     let brightness = std::fs::read_dir("/sys/class/backlight")
         .ok()
         .and_then(|mut d| d.next())
-        .and_then(|_| sh("brightnessctl -m"))
+        .and_then(|_| cmd("brightnessctl", &["-m"]))
         .and_then(|o| crate::osd::parse_brightnessctl(&o));
+
     let media = sh("playerctl metadata --format '{{status}}\t{{title}}\t{{artist}}'").and_then(|o| {
         let mut parts = o.trim_end_matches('\n').splitn(3, '\t');
         let status = parts.next()?;
@@ -566,10 +1644,14 @@ pub fn query_control() -> ControlState {
             artist: parts.next().unwrap_or_default().to_string(),
         })
     });
+
     ControlState {
-        wifi: wifi.filter(|_| has_wifi),
+        wifi,
+        wifi_networks,
         bluetooth,
+        bt_devices,
         volume,
+        audio_sinks,
         brightness,
         media,
     }
@@ -578,33 +1660,62 @@ pub fn query_control() -> ControlState {
 /// Run a Control Center action; returns the new state.
 pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) -> ControlState {
     match target {
-        Target::Wifi => {
+        Target::WifiToggle => {
             let on = current.wifi.as_ref().map(|w| w.0).unwrap_or(false);
-            sh(if on { "nmcli radio wifi off" } else { "nmcli radio wifi on" });
+            cmd("nmcli", &["radio", "wifi", if on { "off" } else { "on" }]);
         }
-        Target::Bluetooth => {
+        Target::WifiConnect { ssid, known, .. } => {
+            if *known {
+                if cmd("nmcli", &["con", "up", "id", ssid]).is_none() {
+                    cmd("nmcli", &["dev", "wifi", "connect", ssid]);
+                }
+            } else {
+                cmd("nmcli", &["dev", "wifi", "connect", ssid]);
+            }
+        }
+        Target::BluetoothToggle => {
             let on = current.bluetooth == Some(true);
             // a soft-blocked adapter has to be unblocked before it can power on
-            sh(if on { "bluetoothctl power off" } else { "rfkill unblock bluetooth; bluetoothctl power on" });
+            if on {
+                cmd("bluetoothctl", &["power", "off"]);
+            } else {
+                let _ = cmd("rfkill", &["unblock", "bluetooth"]);
+                cmd("bluetoothctl", &["power", "on"]);
+            }
+        }
+        Target::BtToggleDevice { mac, connected } => {
+            let verb = if *connected { "disconnect" } else { "connect" };
+            let _ = std::process::Command::new("timeout")
+                .arg("8")
+                .arg("bluetoothctl")
+                .args([verb, mac])
+                .output();
+        }
+        Target::AudioSelectSink(name) => {
+            cmd("pactl", &["set-default-sink", name]);
         }
         Target::Volume(..) => {
             if let Some(v) = value {
-                sh(&format!("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0; wpctl set-volume @DEFAULT_AUDIO_SINK@ {:.3}", v));
+                let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
+                let _ = cmd("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{:.3}", v)]);
             }
+        }
+        Target::VolumeMute => {
+            let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]);
         }
         Target::Brightness(..) => {
             if let Some(v) = value {
-                sh(&format!("brightnessctl -q set {}%", (v * 100.0).round().max(1.0)));
+                let _ = cmd("brightnessctl", &["-q", "set", &format!("{}%", (v * 100.0).round().max(1.0))]);
             }
         }
         Target::MediaPrev => {
-            sh("playerctl previous");
+            cmd("playerctl", &["previous"]);
         }
         Target::MediaPlay => {
-            sh("playerctl play-pause");
+            cmd("playerctl", &["play-pause"]);
         }
         Target::MediaNext => {
-            sh("playerctl next");
+            cmd("playerctl", &["next"]);
         }
         _ => {}
     }
@@ -613,4 +1724,56 @@ pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) 
         std::thread::sleep(Duration::from_millis(250));
     }
     query_control()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_wifi_and_sorts() {
+        let list = " :CoffeeShop:45:WPA2\n*:Home\\:5G:82:WPA2\n :Home\\:5G:60:WPA2\n :FreeWifi:90:--\n";
+        let known = "Home\\:5G:802-11-wireless\nCoffeeShop:802-11-wireless\nWired:802-3-ethernet\n";
+        let nets = parse_wifi_networks(list, known);
+        assert_eq!(nets.len(), 3);
+        // Active first, then known, then other
+        assert_eq!(nets[0].ssid, "Home:5G");
+        assert!(nets[0].active);
+        assert_eq!(nets[0].signal, 82);
+        assert!(nets[0].secure);
+        assert_eq!(nets[1].ssid, "CoffeeShop");
+        assert!(nets[1].known);
+        assert!(!nets[1].active);
+        assert_eq!(nets[2].ssid, "FreeWifi");
+        assert!(!nets[2].known);
+        assert!(!nets[2].secure);
+    }
+
+    #[test]
+    fn parses_bt_devices() {
+        let out = "Device AA:BB:CC:DD:EE:FF AirPods Pro\nDevice 11:22:33:44:55:66 Magic Mouse\n";
+        let devs = parse_bt_list(out);
+        assert_eq!(devs.len(), 2);
+        assert_eq!(devs[0], ("AA:BB:CC:DD:EE:FF".into(), "AirPods Pro".into()));
+        assert_eq!(devs[1], ("11:22:33:44:55:66".into(), "Magic Mouse".into()));
+    }
+
+    #[test]
+    fn parses_audio_sinks_and_icons() {
+        let json = r#"[
+            {"name": "alsa_output.pci.analog", "description": "Built-in Audio", "active_port": "analog-output-speaker"},
+            {"name": "bluez_output.AA_BB", "description": "AirPods Pro", "active_port": "headphone-output"},
+            {"name": "alsa_output.hdmi", "description": "HDMI / DisplayPort", "active_port": "hdmi-output-0"},
+            {"name": "auto_null", "description": "Dummy Output"},
+            {"name": "alsa_output.pci.analog.monitor", "description": "Monitor"}
+        ]"#;
+        let sinks = parse_audio_sinks(json, "bluez_output.AA_BB");
+        assert_eq!(sinks.len(), 3);
+        assert!(!sinks[0].active);
+        assert_eq!(sinks[0].icon, AudioIcon::Speaker);
+        assert!(sinks[1].active);
+        assert_eq!(sinks[1].icon, AudioIcon::Headphones);
+        assert!(!sinks[2].active);
+        assert_eq!(sinks[2].icon, AudioIcon::Display);
+    }
 }

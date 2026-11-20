@@ -1953,7 +1953,14 @@ impl KeyboardHandler for App {
                 self.close_menu();
             }
             if event.keysym == Keysym::Escape && self.panel.is_some() {
-                self.close_panel();
+                if self.panel.as_ref().and_then(|p| p.submenu).is_some() {
+                    if let Some(p) = self.panel.as_mut() {
+                        p.close_submenu();
+                    }
+                    self.redraw(Which::Panel);
+                } else {
+                    self.close_panel();
+                }
             }
             return;
         }

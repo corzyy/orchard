@@ -92,6 +92,7 @@ impl App {
             let volume = p.control.volume;
             let brightness = p.control.brightness;
             p.control = st;
+            p.busy_item = None;
             match p.dragging {
                 Some(Target::Volume(..)) => p.control.volume = volume,
                 Some(Target::Brightness(..)) => p.control.brightness = brightness,
@@ -137,14 +138,26 @@ impl App {
         let (x, y) = (x as f32, y as f32);
         match kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                let dragging = self.panel.as_ref().and_then(|p| p.dragging.clone());
+                let (dragging, prev_hit, is_nc) = match self.panel.as_ref() {
+                    Some(p) => (
+                        p.dragging.clone(),
+                        p.hover.and_then(|(hx, hy)| p.hit(hx, hy)),
+                        p.kind == Kind::Notifications,
+                    ),
+                    None => (None, None, false),
+                };
                 if let Some(p) = self.panel.as_mut() {
                     p.hover = Some((x, y));
                 }
                 if let Some(t) = dragging {
                     self.set_slider(&t, x);
-                } else if self.panel.as_ref().map(|p| p.kind == Kind::Notifications).unwrap_or(false) {
+                } else if is_nc {
                     self.redraw(Which::Panel);
+                } else {
+                    let new_hit = self.panel.as_ref().and_then(|p| p.hit(x, y));
+                    if new_hit != prev_hit {
+                        self.redraw(Which::Panel);
+                    }
                 }
             }
             PointerEventKind::Leave { .. } => {
@@ -188,6 +201,67 @@ impl App {
                         self.redraw(Which::Panel);
                     }
                     Target::Card(hit) => self.click_notification(hit),
+                    Target::OpenSubmenu(sub) => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.open_submenu(sub);
+                        }
+                        self.redraw(Which::Panel);
+                        self.refresh_control(None, None);
+                    }
+                    Target::SubmenuBack => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.close_submenu();
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::WifiToggleOthers => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.wifi_others_open = !p.wifi_others_open;
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::OpenSettings(page) => {
+                        let _ = std::process::Command::new("orchard-settings").arg(page).spawn();
+                        self.close_panel();
+                    }
+                    Target::WifiConnect { ssid, known, secure } => {
+                        if !known && secure {
+                            // Secured unknown network needs a password prompt -> open Wi-Fi Settings
+                            let _ = std::process::Command::new("orchard-settings").arg("wifi").spawn();
+                            self.close_panel();
+                        } else {
+                            if let Some(p) = self.panel.as_mut() {
+                                p.busy_item = Some(ssid.clone());
+                            }
+                            self.redraw(Which::Panel);
+                            self.refresh_control(Some(Target::WifiConnect { ssid, known, secure }), None);
+                        }
+                    }
+                    Target::BtToggleDevice { mac, connected } => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.busy_item = Some(mac.clone());
+                        }
+                        self.redraw(Which::Panel);
+                        self.refresh_control(Some(Target::BtToggleDevice { mac, connected }), None);
+                    }
+                    Target::AudioSelectSink(name) => {
+                        if let Some(p) = self.panel.as_mut() {
+                            for s in &mut p.control.audio_sinks {
+                                s.active = s.name == name;
+                            }
+                        }
+                        self.redraw(Which::Panel);
+                        self.refresh_control(Some(Target::AudioSelectSink(name)), None);
+                    }
+                    Target::VolumeMute => {
+                        if let Some(p) = self.panel.as_mut() {
+                            if let Some((_, m)) = p.control.volume.as_mut() {
+                                *m = !*m;
+                            }
+                        }
+                        self.redraw(Which::Panel);
+                        self.refresh_control(Some(Target::VolumeMute), None);
+                    }
                     Target::Volume(..) | Target::Brightness(..) => {
                         if let Some(p) = self.panel.as_mut() {
                             p.dragging = Some(target.clone());
@@ -199,12 +273,12 @@ impl App {
                         // optimistic toggle, then the real state from the system
                         if let Some(p) = self.panel.as_mut() {
                             match other {
-                                Target::Wifi => {
+                                Target::WifiToggle => {
                                     if let Some(w) = p.control.wifi.as_mut() {
                                         w.0 = !w.0;
                                     }
                                 }
-                                Target::Bluetooth => p.control.bluetooth = p.control.bluetooth.map(|b| !b),
+                                Target::BluetoothToggle => p.control.bluetooth = p.control.bluetooth.map(|b| !b),
                                 Target::MediaPlay => {
                                     if let Some(m) = p.control.media.as_mut() {
                                         m.playing = !m.playing;
