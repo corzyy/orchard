@@ -10,18 +10,26 @@ use smithay::{
     utils::{Buffer, Physical, Point, Rectangle, Scale, Transform},
 };
 
+use std::cell::RefCell;
+
 const SHADER: &str = include_str!("shaders/rounded.frag");
 
-struct RoundedProgram(GlesTexProgram);
+struct RoundedProgram(RefCell<(u64, GlesTexProgram)>);
 
-/// Compile (once per GL context) and return the rounded-corner program.
+/// Compile (once per GL context, or again after `reload_shaders`) and return
+/// the rounded-corner program.
 pub fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
-    if let Some(p) = renderer.egl_context().user_data().get::<RoundedProgram>() {
-        return Some(p.0.clone());
+    let gen = crate::effects::shader_generation();
+    if let Some(cached) = renderer.egl_context().user_data().get::<RoundedProgram>() {
+        let (cached_gen, ref prog) = *cached.0.borrow();
+        if cached_gen == gen {
+            return Some(prog.clone());
+        }
     }
-    let program = renderer
+    let src = crate::effects::load_shader("rounded.frag", SHADER);
+    let compiled = renderer
         .compile_custom_texture_shader(
-            SHADER,
+            &src,
             &[
                 UniformName::new("size", UniformType::_2f),
                 UniformName::new("radius", UniformType::_1f),
@@ -31,12 +39,25 @@ pub fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
             ],
         )
         .map_err(|e| tracing::error!("failed to compile rounded-corner shader: {e:?}"))
-        .ok()?;
-    renderer
-        .egl_context()
-        .user_data()
-        .insert_if_missing(|| RoundedProgram(program.clone()));
-    Some(program)
+        .ok();
+    let ud = renderer.egl_context().user_data();
+    match (compiled, ud.get::<RoundedProgram>()) {
+        (Some(program), Some(cached)) => {
+            *cached.0.borrow_mut() = (gen, program.clone());
+            Some(program)
+        }
+        (Some(program), None) => {
+            ud.insert_if_missing(|| RoundedProgram(RefCell::new((gen, program.clone()))));
+            Some(program)
+        }
+        (None, Some(cached)) => {
+            // Keep the last working program and advance gen so we don't retry every frame.
+            let mut slot = cached.0.borrow_mut();
+            slot.0 = gen;
+            Some(slot.1.clone())
+        }
+        (None, None) => None,
+    }
 }
 
 /// Which corners to round (top-left, top-right, bottom-right, bottom-left).

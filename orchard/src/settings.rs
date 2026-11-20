@@ -68,6 +68,14 @@ use smithay::{
 
 use crate::state::{Backend, OrchardState};
 
+/// File metadata fingerprint `(mtime, size)` used to detect external edits.
+type FileStamp = (std::time::SystemTime, u64);
+
+fn settings_file_stamp() -> Option<FileStamp> {
+    let meta = std::fs::metadata(orchard_config::settings_path()).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 /// Runtime state for settings-driven behaviour.
 #[derive(Debug)]
 pub struct Runtime {
@@ -76,6 +84,8 @@ pub struct Runtime {
     pub last_activity: std::time::Instant,
     /// The idle locker already ran for this idle period.
     pub idle_locked: bool,
+    /// Last observed `(mtime, len)` of `settings.json` for live auto-reload.
+    pub settings_stamp: Option<FileStamp>,
 }
 
 impl Default for Runtime {
@@ -84,6 +94,7 @@ impl Default for Runtime {
             corner: None,
             last_activity: std::time::Instant::now(),
             idle_locked: false,
+            settings_stamp: settings_file_stamp(),
         }
     }
 }
@@ -102,10 +113,19 @@ const CORNER_SIZE: f64 = 2.0;
 impl<BackendData: Backend + 'static> OrchardState<BackendData> {
     /// `reload_settings` IPC request: re-read the file, apply it, tell clients.
     pub fn reload_settings(&mut self) {
+        self.prefs_rt.settings_stamp = settings_file_stamp();
         let s = reload();
         tracing::info!("settings reloaded");
         self.apply_settings(&s);
         self.ipc_broadcast(&crate::ipc::Event::SettingsChanged);
+    }
+
+    /// Auto-reload `settings.json` when it was edited outside `orchard-settings`.
+    pub fn check_settings_file(&mut self) {
+        let stamp = settings_file_stamp();
+        if stamp.is_some() && stamp != self.prefs_rt.settings_stamp {
+            self.reload_settings();
+        }
     }
 
     /// Push settings into live objects. Things read on demand (corner radius,
@@ -264,6 +284,7 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
         let res = self.handle.insert_source(Timer::from_duration(std::time::Duration::from_secs(1)), |_, _, state| {
             state.supervise_shell();
+            state.check_settings_file();
             TimeoutAction::ToDuration(std::time::Duration::from_secs(1))
         });
         if let Err(e) = res {

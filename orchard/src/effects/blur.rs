@@ -10,7 +10,7 @@
 //! when that fingerprint changes, and the (cheap) blur passes only when it or
 //! the backdrop rect changes, so a static desktop costs nothing per frame.
 
-use std::{collections::HashMap, time::Duration};
+use std::{cell::RefCell, collections::HashMap, time::Duration};
 
 use smithay::{
     backend::{
@@ -40,15 +40,20 @@ const OFFSET: f32 = 2.5;
 /// (Dock magnification) without re-rendering.
 const SLACK: i32 = 160;
 
-struct KawaseProgram(GlesTexProgram);
+struct KawaseProgram(RefCell<(u64, GlesTexProgram)>);
 
 fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
-    if let Some(p) = renderer.egl_context().user_data().get::<KawaseProgram>() {
-        return Some(p.0.clone());
+    let gen = crate::effects::shader_generation();
+    if let Some(cached) = renderer.egl_context().user_data().get::<KawaseProgram>() {
+        let (cached_gen, ref prog) = *cached.0.borrow();
+        if cached_gen == gen {
+            return Some(prog.clone());
+        }
     }
-    let program = renderer
+    let src = crate::effects::load_shader("kawase.frag", SHADER);
+    let compiled = renderer
         .compile_custom_texture_shader(
-            SHADER,
+            &src,
             &[
                 UniformName::new("halfpixel", UniformType::_2f),
                 UniformName::new("up", UniformType::_1f),
@@ -56,12 +61,24 @@ fn program(renderer: &mut GlesRenderer) -> Option<GlesTexProgram> {
             ],
         )
         .map_err(|e| tracing::error!("failed to compile blur shader: {e:?}"))
-        .ok()?;
-    renderer
-        .egl_context()
-        .user_data()
-        .insert_if_missing(|| KawaseProgram(program.clone()));
-    Some(program)
+        .ok();
+    let ud = renderer.egl_context().user_data();
+    match (compiled, ud.get::<KawaseProgram>()) {
+        (Some(program), Some(cached)) => {
+            *cached.0.borrow_mut() = (gen, program.clone());
+            Some(program)
+        }
+        (Some(program), None) => {
+            ud.insert_if_missing(|| KawaseProgram(RefCell::new((gen, program.clone()))));
+            Some(program)
+        }
+        (None, Some(cached)) => {
+            let mut slot = cached.0.borrow_mut();
+            slot.0 = gen;
+            Some(slot.1.clone())
+        }
+        (None, None) => None,
+    }
 }
 
 /// Live blur can be switched off with ORCHARD_NO_LIVE_BLUR=1 (falls back to
@@ -157,6 +174,11 @@ fn pass(
 }
 
 impl LiveBlur {
+    /// Drop all cached blurred backdrops (e.g. after a live shader reload).
+    pub fn invalidate(&mut self) {
+        self.cache.clear();
+    }
+
     /// Forget backdrops that have not been drawn for a while.
     pub fn evict(&mut self, now: Duration) {
         self.cache

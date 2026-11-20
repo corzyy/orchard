@@ -79,6 +79,11 @@ pub enum Request {
     Outputs,
     /// Re-read ~/.config/orchard/settings.json and apply it.
     ReloadSettings,
+    /// Recompile GLSL shaders from disk (or built-in) and force a full redraw.
+    ReloadShaders {
+        #[serde(default)]
+        dir: Option<String>,
+    },
     /// Restart the menu bar + Dock from the newest `orchard-shell` binary.
     RestartShell,
 }
@@ -449,6 +454,15 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
             }
             Request::ReloadSettings => {
                 self.reload_settings();
+                Some(Event::Ok)
+            }
+            Request::ReloadShaders { dir } => {
+                crate::effects::reload_shaders(dir.map(PathBuf::from));
+                self.fx.blur.invalidate();
+                for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+                    self.backend_data.reset_buffers(&output);
+                }
+                tracing::info!("shaders reloaded");
                 Some(Event::Ok)
             }
             Request::RestartShell => {

@@ -10,8 +10,54 @@ pub mod wallpaper;
 
 use std::{
     cell::{Cell, RefCell},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        RwLock,
+    },
     time::Duration,
 };
+
+static SHADER_GENERATION: AtomicU64 = AtomicU64::new(0);
+static SHADER_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Monotonic counter bumped on every `reload_shaders` IPC request.
+pub fn shader_generation() -> u64 {
+    SHADER_GENERATION.load(Ordering::Relaxed)
+}
+
+/// Trigger live GLSL shader reload on the next frame.
+/// If `dir` is provided, shaders are loaded from that directory (falling back
+/// to the compiled-in sources for any missing file).
+pub fn reload_shaders(dir: Option<PathBuf>) {
+    if let Some(d) = dir {
+        *SHADER_DIR.write().unwrap() = Some(d);
+    }
+    SHADER_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Read a shader source from the override directory (or `ORCHARD_SHADER_DIR`),
+/// falling back to the compiled-in `fallback`.
+pub fn load_shader(filename: &str, fallback: &'static str) -> String {
+    let dir = SHADER_DIR
+        .read()
+        .unwrap()
+        .clone()
+        .or_else(|| std::env::var_os("ORCHARD_SHADER_DIR").map(PathBuf::from));
+    if let Some(dir) = dir {
+        let path = dir.join(filename);
+        match std::fs::read_to_string(&path) {
+            Ok(src) => {
+                tracing::info!("loaded shader from {}", path.display());
+                return src;
+            }
+            Err(e) => {
+                tracing::warn!("failed to read shader {}: {e}; using built-in", path.display());
+            }
+        }
+    }
+    fallback.to_string()
+}
 
 use smithay::{
     backend::renderer::{element::Id, utils::CommitCounter},

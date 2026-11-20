@@ -114,12 +114,17 @@ dist/install.sh --dev     # /usr/local/bin/orchard* -> symlinks into target/rele
 ```
 Afterwards, from a terminal inside the Orchard session:
 ```sh
-dist/dev.sh               # rebuild and apply
-dist/dev.sh watch         # rebuild and apply on every save
+dist/dev.sh                  # rebuild and apply once
+dist/dev.sh watch            # rebuild and apply on every save (foreground)
+dist/dev.sh start            # run the auto-reloader in the background (stop / status / logs)
+dist/dev.sh install-service  # auto-start the watcher on every Orchard login
+dist/dev.sh reload-shaders   # hot-reload GLSL shaders without rebuilding
 ```
-- menu bar + Dock (`orchard-shell`): restarted in place via the `restart_shell` IPC request; windows stay open. The compositor also restarts the shell by itself if it crashes (gives up after 5 exits in a minute).
-- System Settings: reopened on the same page if it was open.
-- compositor: can't be replaced under running apps; the new build is used at the next login, no reinstall needed.
+- GLSL shaders (`orchard/src/effects/shaders/*.frag`): hot-reloaded in place via `reload_shaders` IPC without rebuilding.
+- `~/.config/orchard/settings.json`: auto-reloaded by the compositor when edited externally.
+- menu bar + Dock (`orchard-shell`): targeted `-p orchard-shell` rebuild and restarted in place via `restart_shell` IPC; windows stay open. The compositor also restarts the shell by itself if it crashes (gives up after 5 exits in a minute).
+- System Settings (`orchard-settings`): targeted rebuild and reopened on the same page if it was open.
+- compositor (`orchard`): targeted rebuild; if a nested Orchard window (`dist/nested.sh`) is open it is restarted automatically. The live session compositor can't be replaced under running apps, so the new build is used at the next login with no reinstall needed.
 
 The real-hardware backend links against `libinput` and `libseat`. Without their `-devel` packages it builds through a shim in `.devshim/` (see `.cargo/config.toml`). The proper fix is:
 `sudo dnf install libinput-devel libseat-devel`
