@@ -22,6 +22,10 @@ pub enum BarItem {
     Clock,
     /// Control Center (the switches icon)
     Control,
+    /// Sound / volume icon (left of Control Center)
+    Volume,
+    /// Ethernet / Wi-Fi icon (left of Volume)
+    Network,
     /// one of the focused app's own menus (global menu), by index
     AppMenu(u8),
 }
@@ -34,6 +38,8 @@ pub struct MenuBar {
     /// Settings ▸ Menu Bar
     pub cfg: orchard_config::MenuBarSettings,
     pub network: Network,
+    /// Default output sink volume `(0.0..=1.0+, muted)`
+    pub volume: Option<(f32, bool)>,
     /// item whose menu is open
     pub open: Option<BarItem>,
     /// Do Not Disturb is on: show a moon
@@ -52,6 +58,7 @@ impl MenuBar {
             battery: status::battery(),
             cfg: Default::default(),
             network: status::network(),
+            volume: None,
             open: None,
             dnd: false,
             app_menus: Vec::new(),
@@ -78,7 +85,7 @@ impl MenuBar {
             BarItem::Window => if self.german { "Fenster" } else { "Window" }.into(),
             BarItem::Help => if self.german { "Hilfe" } else { "Help" }.into(),
             BarItem::Clock => self.clock.clone(),
-            BarItem::Control => String::new(),
+            BarItem::Control | BarItem::Volume | BarItem::Network => String::new(),
             BarItem::AppMenu(i) => self.app_menus.get(i as usize).cloned().unwrap_or_default(),
         }
     }
@@ -117,6 +124,18 @@ impl MenuBar {
         (ca - 32.0, ca - 2.0)
     }
 
+    /// The Volume icon, left of Control Center.
+    pub fn volume_range(&self, fonts: &Fonts, width: f32) -> (f32, f32) {
+        let (cca, _) = self.control_range(fonts, width);
+        (cca - 30.0, cca - 2.0)
+    }
+
+    /// The Ethernet / Wi-Fi icon, left of Volume.
+    pub fn network_range(&self, fonts: &Fonts, width: f32) -> (f32, f32) {
+        let (va, _) = self.volume_range(fonts, width);
+        (va - 30.0, va - 2.0)
+    }
+
     pub fn hit(&self, fonts: &Fonts, x: f32, width: f32) -> Option<BarItem> {
         if let Some((item, _, _)) = self.left_items(fonts).into_iter().find(|(_, a, b)| x >= *a && x < *b) {
             return Some(item);
@@ -126,7 +145,15 @@ impl MenuBar {
             return Some(BarItem::Clock);
         }
         let (a, b) = self.control_range(fonts, width);
-        (x >= a && x < b).then_some(BarItem::Control)
+        if x >= a && x < b {
+            return Some(BarItem::Control);
+        }
+        let (a, b) = self.volume_range(fonts, width);
+        if x >= a && x < b {
+            return Some(BarItem::Volume);
+        }
+        let (a, b) = self.network_range(fonts, width);
+        (x >= a && x < b).then_some(BarItem::Network)
     }
 
     pub fn paint(&self, pm: &mut Pixmap, scale: f32, fonts: &Fonts, theme: &Theme) {
@@ -162,7 +189,20 @@ impl MenuBar {
             fill_rounded(pm, cca * s, 3.0 * s, (ccb - cca) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
         }
         draw_control_icon(pm, (cca + ccb) / 2.0 * s, HEIGHT / 2.0 * s, s, theme.bar_text);
-        let mut x = cca - 4.0;
+
+        let (va, vb) = self.volume_range(fonts, w);
+        if self.open == Some(BarItem::Volume) {
+            fill_rounded(pm, va * s, 3.0 * s, (vb - va) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+        }
+        draw_volume(pm, (va + vb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.volume, theme.bar_text);
+
+        let (na, nb) = self.network_range(fonts, w);
+        if self.open == Some(BarItem::Network) {
+            fill_rounded(pm, na * s, 3.0 * s, (nb - na) * s, (HEIGHT - 6.0) * s, 4.0 * s, theme.bar_highlight);
+        }
+        draw_network(pm, (na + nb) / 2.0 * s, HEIGHT / 2.0 * s, s, self.network, theme.bar_text);
+
+        let mut x = na - 4.0;
         if self.dnd {
             x -= 22.0;
             crate::panel::moon(pm, (x + 11.0) * s, HEIGHT / 2.0 * s, 6.0 * s, theme.bar_text);
@@ -177,8 +217,6 @@ impl MenuBar {
                 fonts.draw(pm, &label, x * s, baseline, 12.0 * s, Weight::Regular, theme.bar_text);
             }
         }
-        x -= 26.0;
-        draw_network(pm, (x + 10.0) * s, HEIGHT / 2.0 * s, s, self.network, theme.bar_text);
     }
 }
 
@@ -240,6 +278,74 @@ fn draw_battery(pm: &mut Pixmap, x: f32, cy: f32, s: f32, b: &Battery, color: [u
     fill_rounded(pm, x + 2.0 * s, y + 2.0 * s, fill_w, h - 4.0 * s, 1.5 * s, c);
 }
 
+/// macOS-style menu bar speaker icon: cone + 0–3 sound waves, or an `×` when muted.
+fn draw_volume(pm: &mut Pixmap, cx: f32, cy: f32, s: f32, vol: Option<(f32, bool)>, color: [u8; 4]) {
+    let (level, muted) = vol.unwrap_or((0.5, false));
+    let x0 = cx - 7.2 * s;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x0, cy - 2.1 * s);
+    pb.line_to(x0 + 2.8 * s, cy - 2.1 * s);
+    pb.line_to(x0 + 6.3 * s, cy - 5.2 * s);
+    pb.line_to(x0 + 6.3 * s, cy + 5.2 * s);
+    pb.line_to(x0 + 2.8 * s, cy + 2.1 * s);
+    pb.line_to(x0, cy + 2.1 * s);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        pm.fill_path(&p, &paint(color), FillRule::Winding, Transform::identity(), None);
+    }
+
+    let st = Stroke {
+        width: 1.35 * s,
+        line_cap: tiny_skia::LineCap::Round,
+        ..Default::default()
+    };
+
+    if muted {
+        let (a, b) = (cx + 1.2 * s, cx + 5.8 * s);
+        let (y0, y1) = (cy - 2.3 * s, cy + 2.3 * s);
+        for (ya, yb) in [(y0, y1), (y1, y0)] {
+            let mut pb = PathBuilder::new();
+            pb.move_to(a, ya);
+            pb.line_to(b, yb);
+            if let Some(p) = pb.finish() {
+                pm.stroke_path(&p, &paint(color), &st, Transform::identity(), None);
+            }
+        }
+        return;
+    }
+
+    let waves = if level <= 0.001 {
+        0
+    } else if level < 0.34 {
+        1
+    } else if level < 0.67 {
+        2
+    } else {
+        3
+    };
+    let wx = x0 + 6.8 * s;
+    for (i, rad) in [2.6f32, 5.0, 7.4].iter().enumerate() {
+        let mut c = color;
+        if i >= waves {
+            c[3] = 65;
+        }
+        let mut pb = PathBuilder::new();
+        let n = 10;
+        for k in 0..=n {
+            let a = (-48.0 + 96.0 * k as f32 / n as f32).to_radians();
+            let (px, py) = (wx + rad * s * a.cos(), cy + rad * s * a.sin());
+            if k == 0 {
+                pb.move_to(px, py);
+            } else {
+                pb.line_to(px, py);
+            }
+        }
+        if let Some(p) = pb.finish() {
+            pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+        }
+    }
+}
+
 pub(crate) fn draw_network(pm: &mut Pixmap, cx: f32, cy: f32, s: f32, n: Network, color: [u8; 4]) {
     match n {
         Network::Wifi(level) => {
@@ -273,31 +379,91 @@ pub(crate) fn draw_network(pm: &mut Pixmap, cx: f32, cy: f32, s: f32, n: Network
             }
         }
         Network::Wired => {
-            // two arrows (up/down)
+            // RJ45 Ethernet port outline with top contact pins and bottom clip notch
             let st = Stroke {
-                width: 1.6 * s,
+                width: 1.35 * s,
+                line_cap: tiny_skia::LineCap::Round,
+                line_join: tiny_skia::LineJoin::Round,
+                ..Default::default()
+            };
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - 6.5 * s, cy - 5.0 * s);
+            pb.line_to(cx + 6.5 * s, cy - 5.0 * s);
+            pb.line_to(cx + 6.5 * s, cy + 3.0 * s);
+            pb.line_to(cx + 3.0 * s, cy + 3.0 * s);
+            pb.line_to(cx + 3.0 * s, cy + 5.3 * s);
+            pb.line_to(cx - 3.0 * s, cy + 5.3 * s);
+            pb.line_to(cx - 3.0 * s, cy + 3.0 * s);
+            pb.line_to(cx - 6.5 * s, cy + 3.0 * s);
+            pb.close();
+            if let Some(p) = pb.finish() {
+                pm.stroke_path(&p, &paint(color), &st, Transform::identity(), None);
+            }
+            // contact pins at the top of the jack
+            let pin_st = Stroke {
+                width: 1.15 * s,
                 line_cap: tiny_skia::LineCap::Round,
                 ..Default::default()
             };
-            for (dx, up) in [(-3.0f32, true), (3.0, false)] {
-                let x = cx + dx * s;
+            for dx in [-3.0f32, 0.0, 3.0] {
                 let mut pb = PathBuilder::new();
-                pb.move_to(x, cy - 6.0 * s);
-                pb.line_to(x, cy + 6.0 * s);
-                let tip = if up { cy - 6.0 * s } else { cy + 6.0 * s };
-                let d = if up { 3.0 * s } else { -3.0 * s };
-                pb.move_to(x - 3.0 * s, tip + d);
-                pb.line_to(x, tip);
-                pb.line_to(x + 3.0 * s, tip + d);
+                pb.move_to(cx + dx * s, cy - 4.8 * s);
+                pb.line_to(cx + dx * s, cy - 2.0 * s);
                 if let Some(p) = pb.finish() {
-                    pm.stroke_path(&p, &paint(color), &st, Transform::identity(), None);
+                    pm.stroke_path(&p, &paint(color), &pin_st, Transform::identity(), None);
                 }
             }
         }
         Network::Offline => {
-            let mut c = color;
-            c[3] = 90;
-            crate::draw::fill_circle(pm, cx, cy + 5.0 * s, 1.6 * s, c);
+            // Dimmed Wi-Fi arcs with a diagonal slash (macOS disconnected style)
+            let mut dim = color;
+            dim[3] = 80;
+            draw_network(pm, cx, cy, s, Network::Wifi(3), dim);
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - 6.5 * s, cy - 5.5 * s);
+            pb.line_to(cx + 6.5 * s, cy + 5.5 * s);
+            if let Some(p) = pb.finish() {
+                let st = Stroke {
+                    width: 1.45 * s,
+                    line_cap: tiny_skia::LineCap::Round,
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint(color), &st, Transform::identity(), None);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn right_side_hit_order_matches_macos() {
+        let fonts = Fonts::load();
+        let bar = MenuBar::new();
+        let width = 1440.0;
+        let (ca, cb) = bar.clock_range(&fonts, width);
+        let (cca, ccb) = bar.control_range(&fonts, width);
+        let (va, vb) = bar.volume_range(&fonts, width);
+        let (na, nb) = bar.network_range(&fonts, width);
+
+        // Network | Volume | Control Center | Clock (left to right)
+        assert!(nb < va && vb < cca && ccb < ca && ca < cb);
+        assert_eq!(bar.hit(&fonts, (na + nb) / 2.0, width), Some(BarItem::Network));
+        assert_eq!(bar.hit(&fonts, (va + vb) / 2.0, width), Some(BarItem::Volume));
+        assert_eq!(bar.hit(&fonts, (cca + ccb) / 2.0, width), Some(BarItem::Control));
+        assert_eq!(bar.hit(&fonts, (ca + cb) / 2.0, width), Some(BarItem::Clock));
+    }
+
+    #[test]
+    fn draws_volume_and_network_states_without_panic() {
+        let mut pm = Pixmap::new(64, 48).unwrap();
+        for vol in [None, Some((0.0, false)), Some((0.2, false)), Some((0.5, false)), Some((0.9, false)), Some((0.5, true))] {
+            draw_volume(&mut pm, 32.0, 24.0, 2.0, vol, [255, 255, 255, 255]);
+        }
+        for net in [Network::Wired, Network::Wifi(1), Network::Wifi(2), Network::Wifi(3), Network::Offline] {
+            draw_network(&mut pm, 32.0, 24.0, 2.0, net, [255, 255, 255, 255]);
         }
     }
 }

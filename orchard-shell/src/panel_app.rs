@@ -14,14 +14,14 @@ use smithay_client_toolkit::{
 use crate::{
     menubar::BarItem,
     notify::{self, Hit},
-    panel::{self, ControlState, Kind, Panel, Target},
+    panel::{self, ControlState, Kind, Panel, Submenu, Target},
     App, Surf, Which, BTN_LEFT,
 };
 
 impl App {
-    /// Clock / Control Center icon clicked.
-    pub(crate) fn toggle_panel(&mut self, kind: Kind) {
-        let same = self.panel.as_ref().map(|p| p.kind == kind).unwrap_or(false);
+    /// Clock / Control Center / Volume / Network icon clicked.
+    pub(crate) fn toggle_panel(&mut self, item: BarItem, kind: Kind, submenu: Option<Submenu>) {
+        let same = self.panel.is_some() && self.menubar.open == Some(item);
         self.close_panel();
         if same {
             return;
@@ -30,17 +30,22 @@ impl App {
             self.close_menu();
         }
         let width = self.bar.as_ref().map(|s| s.width).unwrap_or(0) as f32;
-        let anchor = self.menubar.control_range(&self.fonts, width).1 + 8.0;
+        let anchor = match item {
+            BarItem::Volume => self.menubar.volume_range(&self.fonts, width).1 + 8.0,
+            BarItem::Network => self.menubar.network_range(&self.fonts, width).1 + 8.0,
+            _ => self.menubar.control_range(&self.fonts, width).1 + 8.0,
+        };
         let mut p = Panel::new(kind, anchor);
         if kind == Kind::Control {
             p.control = self.control_cache.clone();
+            if let Some(sub) = submenu {
+                p.standalone = true;
+                p.open_submenu(sub);
+            }
             self.refresh_control(None, None);
         }
         self.panel = Some(p);
-        self.menubar.open = Some(match kind {
-            Kind::Notifications => BarItem::Clock,
-            Kind::Control => BarItem::Control,
-        });
+        self.menubar.open = Some(item);
         self.redraw(Which::Bar);
 
         let surface = self.compositor.create_surface(&self.qh);
@@ -65,7 +70,10 @@ impl App {
         }
         self.panel_surf = None;
         self.set_backdrop("orchard-panel", None);
-        if matches!(self.menubar.open, Some(BarItem::Clock | BarItem::Control)) {
+        if matches!(
+            self.menubar.open,
+            Some(BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network)
+        ) {
             self.menubar.open = None;
             self.redraw(Which::Bar);
         }
@@ -87,6 +95,10 @@ impl App {
     pub(crate) fn on_control_state(&mut self, st: ControlState) {
         tracing::debug!(?st, "control center state");
         self.control_cache = st.clone();
+        if st.volume.is_some() && self.menubar.volume != st.volume {
+            self.menubar.volume = st.volume;
+            self.redraw(Which::Bar);
+        }
         if let Some(p) = self.panel.as_mut() {
             // keep the slider where the user holds it
             let volume = p.control.volume;
@@ -120,7 +132,13 @@ impl App {
         let Some(v) = Panel::slider_value(target, x) else { return };
         if let Some(p) = self.panel.as_mut() {
             match target {
-                Target::Volume(..) => p.control.volume = Some((v, false)),
+                Target::Volume(..) => {
+                    p.control.volume = Some((v, false));
+                    if self.menubar.volume != Some((v, false)) {
+                        self.menubar.volume = Some((v, false));
+                        self.redraw(Which::Bar);
+                    }
+                }
                 Target::Brightness(..) => p.control.brightness = Some(v),
                 _ => {}
             }
@@ -255,8 +273,10 @@ impl App {
                     }
                     Target::VolumeMute => {
                         if let Some(p) = self.panel.as_mut() {
-                            if let Some((_, m)) = p.control.volume.as_mut() {
+                            if let Some((vol, m)) = p.control.volume.as_mut() {
                                 *m = !*m;
+                                self.menubar.volume = Some((*vol, *m));
+                                self.redraw(Which::Bar);
                             }
                         }
                         self.redraw(Which::Panel);

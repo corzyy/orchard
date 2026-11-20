@@ -24,7 +24,13 @@ mod text;
 mod theme;
 
 use orchard_config::DockPosition;
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use serde_json::json;
 use smithay_client_toolkit::{
@@ -189,6 +195,9 @@ struct App {
     control_tx: Sender<panel::ControlState>,
     control_cache: panel::ControlState,
     last_slider_cmd: Instant,
+    vol_tx: Sender<Option<(f32, bool)>>,
+    vol_pending: Arc<AtomicBool>,
+    status_tick: u32,
 
     /// global app menus
     gmenu: Option<globalmenu::GlobalMenu>,
@@ -268,6 +277,17 @@ fn main() {
             }
         })
         .expect("control channel");
+    let (vol_tx, vol_rx) = channel::channel::<Option<(f32, bool)>>();
+    loop_handle
+        .insert_source(vol_rx, |ev, _, app: &mut App| {
+            if let channel::Event::Msg(vol) = ev {
+                if app.menubar.volume != vol {
+                    app.menubar.volume = vol;
+                    app.redraw(Which::Bar);
+                }
+            }
+        })
+        .expect("volume channel");
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -323,6 +343,9 @@ fn main() {
         control_tx,
         control_cache: Default::default(),
         last_slider_cmd: Instant::now(),
+        vol_tx,
+        vol_pending: Arc::new(AtomicBool::new(false)),
+        status_tick: 0,
         gmenu,
         menu_addr: None,
         app_menu_ids: Vec::new(),
@@ -331,6 +354,7 @@ fn main() {
     app.dock.cfg = settings.dock.clone();
     app.menubar.cfg = settings.menu_bar.clone();
     app.menubar.refresh_status();
+    app.refresh_volume();
     app.notes.do_not_disturb = panel_app::load_dnd();
     app.menubar.dnd = app.notes.do_not_disturb;
     let apps_ref = &app.apps;
@@ -348,11 +372,15 @@ fn main() {
             .expect("ipc source");
     }
 
-    // status refresh (clock etc.)
+    // status refresh (clock, battery, network, volume)
     loop_handle
         .insert_source(Timer::from_duration(Duration::from_secs(1)), |_, _, app: &mut App| {
             if app.menubar.refresh_status() {
                 app.redraw(Which::Bar);
+            }
+            app.status_tick = app.status_tick.wrapping_add(1);
+            if app.status_tick.is_multiple_of(2) {
+                app.refresh_volume();
             }
             // X11 apps register their menu some time after mapping
             app.refresh_app_menu();
@@ -383,6 +411,26 @@ fn main() {
 }
 
 impl App {
+    /// Query current default sink volume on a helper thread (at most one in flight).
+    fn refresh_volume(&self) {
+        if self.vol_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let tx = self.vol_tx.clone();
+        let pending = self.vol_pending.clone();
+        if std::thread::Builder::new()
+            .name("volume-poll".into())
+            .spawn(move || {
+                let vol = status::volume();
+                pending.store(false, Ordering::Release);
+                let _ = tx.send(vol);
+            })
+            .is_err()
+        {
+            self.vol_pending.store(false, Ordering::Release);
+        }
+    }
+
     /// The output the menu bar and Dock belong on: the configured primary
     /// display if it is connected, else the first one with a known size.
     fn desired_output(&self, skip: Option<&wl_output::WlOutput>) -> Option<wl_output::WlOutput> {
@@ -1379,7 +1427,7 @@ impl App {
                 t("Orchard Help", "Orchard-Hilfe"),
                 Action::Launch("xdg-open https://github.com/Smithay/smithay".into()),
             )],
-            BarItem::Control => vec![],
+            BarItem::Control | BarItem::Volume | BarItem::Network => vec![],
             BarItem::AppMenu(i) => {
                 let items = match (&self.menu_addr, self.app_menu_ids.get(i as usize), &self.gmenu) {
                     (Some((service, path)), Some(id), Some(g)) => {
@@ -1547,8 +1595,14 @@ impl App {
         let hit = self.menubar.hit(&self.fonts, x as f32, width);
         if let PointerEventKind::Press { button: BTN_LEFT, .. } = kind {
             match hit {
-                Some(BarItem::Clock) => return self.toggle_panel(panel::Kind::Notifications),
-                Some(BarItem::Control) => return self.toggle_panel(panel::Kind::Control),
+                Some(BarItem::Clock) => return self.toggle_panel(BarItem::Clock, panel::Kind::Notifications, None),
+                Some(BarItem::Control) => return self.toggle_panel(BarItem::Control, panel::Kind::Control, None),
+                Some(BarItem::Volume) => {
+                    return self.toggle_panel(BarItem::Volume, panel::Kind::Control, Some(panel::Submenu::Sound))
+                }
+                Some(BarItem::Network) => {
+                    return self.toggle_panel(BarItem::Network, panel::Kind::Control, Some(panel::Submenu::Wifi))
+                }
                 Some(_) => self.close_panel(),
                 None => {}
             }
@@ -1659,7 +1713,9 @@ impl App {
         if y < menubar::HEIGHT && matches!(self.menu_owner, Some(MenuOwner::Bar(_))) {
             let width = self.output_size.0 as f32;
             if let Some(item) = self.menubar.hit(&self.fonts, x, width) {
-                if Some(MenuOwner::Bar(item)) != self.menu_owner {
+                if !matches!(item, BarItem::Clock | BarItem::Control | BarItem::Volume | BarItem::Network)
+                    && Some(MenuOwner::Bar(item)) != self.menu_owner
+                {
                     if let PointerEventKind::Motion { .. } = kind {
                         let mx = self
                             .menubar
@@ -1953,7 +2009,7 @@ impl KeyboardHandler for App {
                 self.close_menu();
             }
             if event.keysym == Keysym::Escape && self.panel.is_some() {
-                if self.panel.as_ref().and_then(|p| p.submenu).is_some() {
+                if self.panel.as_ref().is_some_and(|p| p.submenu.is_some() && !p.standalone) {
                     if let Some(p) = self.panel.as_mut() {
                         p.close_submenu();
                     }

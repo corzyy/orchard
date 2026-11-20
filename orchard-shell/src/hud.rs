@@ -37,6 +37,13 @@ impl App {
     // ---- HUD -----------------------------------------------------------------
 
     pub(crate) fn show_osd(&mut self, level: osd::Level) {
+        if level.kind == osd::Kind::Volume {
+            let vol = Some((level.value, level.muted));
+            if self.menubar.volume != vol {
+                self.menubar.volume = vol;
+                self.redraw(Which::Bar);
+            }
+        }
         let until = Instant::now() + osd::SHOW_FOR;
         self.osd = Some(osd::Osd { level, until });
         match self.osd_surf.as_ref() {

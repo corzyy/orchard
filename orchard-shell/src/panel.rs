@@ -130,6 +130,8 @@ pub struct Panel {
     pub kind: Kind,
     pub opened: Instant,
     pub submenu: Option<Submenu>,
+    /// True when opened directly from a menu bar icon (Sound / Network) rather than via Control Center.
+    pub standalone: bool,
     pub submenu_since: Instant,
     pub wifi_others_open: bool,
     /// SSID or MAC currently connecting / toggling
@@ -154,6 +156,7 @@ impl Panel {
             kind,
             opened: now,
             submenu: None,
+            standalone: false,
             submenu_since: now - SUBMENU_ANIM,
             wifi_others_open: true,
             busy_item: None,
@@ -625,17 +628,29 @@ impl Panel {
 
         let x0 = (self.anchor_right - CC_WIDTH).clamp(MARGIN, (w - CC_WIDTH - MARGIN).max(MARGIN));
         let y0 = 6.0 - (1.0 - self.progress()) * 12.0;
-        let slide_x = (1.0 - self.sub_progress()) * 10.0;
+        let slide_x = if self.standalone { 0.0 } else { (1.0 - self.sub_progress()) * 10.0 };
 
         // Pre-build the scrollable content items for each submenu
         let (title, toggle_state, toggle_target, settings_label, settings_page) = match submenu {
-            Submenu::Wifi => (
-                "Wi-Fi",
-                Some(self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false)),
-                Some(Target::WifiToggle),
-                t("Wi-Fi Settings…", "WLAN-Einstellungen …"),
-                "wifi",
-            ),
+            Submenu::Wifi => {
+                if self.control.wifi.is_some() {
+                    (
+                        "Wi-Fi",
+                        Some(self.control.wifi.as_ref().map(|w| w.0).unwrap_or(false)),
+                        Some(Target::WifiToggle),
+                        t("Wi-Fi Settings…", "WLAN-Einstellungen …"),
+                        "wifi",
+                    )
+                } else {
+                    (
+                        t("Network", "Netzwerk"),
+                        None,
+                        None,
+                        t("Network Settings…", "Netzwerkeinstellungen …"),
+                        "network",
+                    )
+                }
+            }
             Submenu::Bluetooth => (
                 "Bluetooth",
                 Some(self.control.bluetooth == Some(true)),
@@ -713,15 +728,19 @@ impl Panel {
 
         // ---- Header ----
         let hy = y0 + 4.0;
-        let back_rect = (x0 + 6.0, hy + 4.0, if toggle_state.is_some() { CC_WIDTH - 68.0 } else { CC_WIDTH - 12.0 }, 36.0);
-        let back_hovered = self.hovered(back_rect.0, back_rect.1, back_rect.2, back_rect.3);
-        if back_hovered {
-            fill_rounded(pm, back_rect.0 * s, back_rect.1 * s, back_rect.2 * s, back_rect.3 * s, 8.0 * s, hover_bg);
-        }
-        chevron_left(pm, (x0 + 18.0 + slide_x) * s, (hy + 22.0) * s, 4.5 * s, if back_hovered { text } else { sub_text });
         let hb = fonts.baseline_centered(hy * s, header_h * s, 13.5 * s, Weight::Bold);
-        fonts.draw(pm, title, (x0 + 30.0 + slide_x) * s, hb, 13.5 * s, Weight::Bold, text);
-        self.targets.push((back_rect, Target::SubmenuBack));
+        if self.standalone {
+            fonts.draw(pm, title, (x0 + 14.0) * s, hb, 13.5 * s, Weight::Bold, text);
+        } else {
+            let back_rect = (x0 + 6.0, hy + 4.0, if toggle_state.is_some() { CC_WIDTH - 68.0 } else { CC_WIDTH - 12.0 }, 36.0);
+            let back_hovered = self.hovered(back_rect.0, back_rect.1, back_rect.2, back_rect.3);
+            if back_hovered {
+                fill_rounded(pm, back_rect.0 * s, back_rect.1 * s, back_rect.2 * s, back_rect.3 * s, 8.0 * s, hover_bg);
+            }
+            chevron_left(pm, (x0 + 18.0 + slide_x) * s, (hy + 22.0) * s, 4.5 * s, if back_hovered { text } else { sub_text });
+            fonts.draw(pm, title, (x0 + 30.0 + slide_x) * s, hb, 13.5 * s, Weight::Bold, text);
+            self.targets.push((back_rect, Target::SubmenuBack));
+        }
 
         if let (Some(on), Some(t_target)) = (toggle_state, toggle_target) {
             let sx = x0 + CC_WIDTH - 14.0 - 38.0;
