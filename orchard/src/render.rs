@@ -985,10 +985,10 @@ fn output_elements_inner(
         .filter(|_| !mc_here)
     {
         let hide_shot = ctx.fx.hide_screenshot_ui;
-        layer_elements_filtered(renderer, output, Layer::Overlay, scale, false, backdrops, &mut Vec::new(), &mut out, |ns, _| {
+        let mut pending = Vec::new();
+        layer_elements_filtered(renderer, output, Layer::Overlay, scale, true, backdrops, &mut pending, &mut out, |ns, _| {
             !(hide_shot && ns == "orchard-screenshot")
         });
-        let mut pending = Vec::new();
         fs_reveal_elements(renderer, output, output_geo, &window, scale, backdrops, &mut pending, &mut out);
         window_elements(renderer, output_geo, &window, output_geo.loc, 0.0, scale, now, &mut out);
         if !pending.is_empty() {

@@ -1,9 +1,9 @@
 //! Drop-down menus (menu bar menus, Dock context menus).
 
-use tiny_skia::Pixmap;
+use tiny_skia::{BlendMode, FillRule, Pixmap, Transform};
 
 use crate::{
-    draw::{fill_rounded, stroke_rounded},
+    draw::{fill_rounded, paint, rounded_rect, stroke_rounded},
     text::{Fonts, Weight},
     theme::Theme,
 };
@@ -243,7 +243,13 @@ impl Menu {
         for (i, a) in [(6.0, 12u8), (3.0, 20), (1.0, 30)] {
             fill_rounded(pm, (self.x - i) * s, (self.y - i + 3.0) * s, (w + 2.0 * i) * s, (h + 2.0 * i) * s, (8.0 + i) * s, [0, 0, 0, a]);
         }
-        fill_rounded(pm, self.x * s, self.y * s, w * s, h * s, 8.0 * s, theme.menu_bg);
+        // Replace the interior rather than blending over the shadow so the
+        // compositor's frosted-glass blur stays clear behind the menu tint.
+        if let Some(p) = rounded_rect(self.x * s, self.y * s, w * s, h * s, 8.0 * s) {
+            let mut bg = paint(theme.menu_bg);
+            bg.blend_mode = BlendMode::Source;
+            pm.fill_path(&p, &bg, FillRule::Winding, Transform::identity(), None);
+        }
         stroke_rounded(pm, self.x * s + 0.5, self.y * s + 0.5, w * s - 1.0, h * s - 1.0, 8.0 * s, 1.0, theme.menu_border);
         let mut top = self.y + PAD;
         let px = FONT * s;
