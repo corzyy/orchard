@@ -47,11 +47,26 @@ Rust 1.95 or newer (edition 2024). On Fedora:
 ```sh
 sudo dnf install libdisplay-info-devel libinput-devel libseat-devel systemd-devel \
     wayland-devel mesa-libgbm-devel libxkbcommon-devel mesa-libEGL-devel \
-    mesa-libGLES-devel
+    mesa-libGLES-devel pixman-devel
 ```
 
-`libdisplay-info-devel` is the one Orchard does not already need. Without it the
-`libdisplay-info` build script fails with a pkg-config error.
+`libdisplay-info-devel` and `pixman-devel` are the ones Orchard does not already need.
+Without them the `libdisplay-info` build script fails with a pkg-config error, or the final
+link fails with `cannot find -lpixman-1`.
+
+`xorg-x11-xrdb` is optional; without it the fork logs `xrdb not found` and skips Xresources.
+
+### Verified build
+
+On Fedora 45 with Rust 1.100 (the upstream tree pins 1.95 in `rust-toolchain.toml`, which the
+system cargo ignores), `cargo check --manifest-path compositor/Cargo.toml` and a full debug
+`cargo build` succeed. The local verification used an extracted `libdisplay-info-devel` and
+`pixman-devel` because passwordless sudo was not available; installing the RPMs above is the
+normal path.
+
+A 15-second nested run (`dist/comp-nested.sh run`, winit backend, NVIDIA GTX 1660 Ti) created
+a `WINIT-0` output, initialised GLES, a libinput seat and Xwayland. Expected noise in a nested
+session: one `EGL_BAD_SURFACE` warning at startup and `xrdb not found`.
 
 The upstream Nix packaging is kept for reference; Orchard does not use it. The upstream
 `debian/` directory was excluded from the import because Orchard packages through `dist/`.
