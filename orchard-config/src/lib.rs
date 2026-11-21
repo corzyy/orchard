@@ -327,6 +327,49 @@ impl Default for WindowSettings {
     }
 }
 
+/// Spotlight (⌘Space) behaviour and result sources.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchSettings {
+    /// Include installed applications.
+    pub show_apps: bool,
+    /// Include System Settings panes.
+    pub show_settings: bool,
+    /// Include system actions (Lock Screen, Restart, …).
+    pub show_actions: bool,
+    /// Include files and folders from the home folder.
+    pub show_files: bool,
+    /// Offer a web search when nothing else fits.
+    pub show_web: bool,
+    /// Reopen Spotlight with the previous search selected.
+    pub keep_query: bool,
+    /// Rebuild the file index when it is older than this many minutes.
+    pub index_minutes: u32,
+}
+
+impl SearchSettings {
+    pub const INDEX_MINUTES: [u32; 5] = [5, 10, 30, 60, 180];
+
+    /// The interval the shell uses, clamped to a sane range.
+    pub fn reindex_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.index_minutes.clamp(1, 24 * 60) as u64 * 60)
+    }
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            show_apps: true,
+            show_settings: true,
+            show_actions: true,
+            show_files: true,
+            show_web: true,
+            keep_query: true,
+            index_minutes: 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct KeyboardSettings {
@@ -877,6 +920,7 @@ pub struct Settings {
     pub menu_bar: MenuBarSettings,
     pub windows: WindowSettings,
     pub tiling: TilingSettings,
+    pub search: SearchSettings,
     pub keyboard: KeyboardSettings,
     pub pointer: PointerSettings,
     pub desktop: DesktopSettings,

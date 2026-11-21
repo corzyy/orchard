@@ -49,14 +49,11 @@ fn load_file(file: String, index: u32) -> Option<Font> {
 pub enum Weight {
     Regular,
     Bold,
-    /// large display text (Spotlight's search field)
-    Light,
 }
 
 pub struct Fonts {
     regular: Font,
     bold: Font,
-    light: Font,
     cache: RefCell<HashMap<(Weight, char, u32), Rc<(Metrics, Vec<u8>)>>>,
 }
 
@@ -70,10 +67,7 @@ impl Fonts {
         let bold = load_family("SF Pro Text:style=Semibold", "sf-pro")
             .or_else(|| load("Inter:weight=bold"))
             .or_else(|| load("sans-serif:bold"));
-        let light = load_family("SF Pro Display:style=Light", "sf-pro")
-            .or_else(|| load("Inter:weight=light")).or_else(|| load("Inter")).or_else(|| load("sans-serif"));
         Fonts {
-            light: light.unwrap_or_else(|| regular.clone()),
             bold: bold.unwrap_or_else(|| regular.clone()),
             regular,
             cache: RefCell::new(HashMap::new()),
@@ -84,7 +78,6 @@ impl Fonts {
         match w {
             Weight::Regular => &self.regular,
             Weight::Bold => &self.bold,
-            Weight::Light => &self.light,
         }
     }
 

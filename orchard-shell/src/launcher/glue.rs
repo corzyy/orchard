@@ -1,6 +1,8 @@
-//! Spotlight inside the shell: its layer surface, animations, keyboard and
-//! pointer input, opening results, and the background work (file index,
-//! previews, clipboard).
+//! Spotlight inside the shell: its layer surface, keyboard and pointer input,
+//! opening results, and the background work (file index, clipboard).
+//!
+//! Opening and closing are instant: the surface appears fully drawn and goes
+//! away the moment Spotlight closes. Only the result list animates.
 
 use std::{
     sync::Arc,
@@ -9,7 +11,6 @@ use std::{
 
 use serde_json::json;
 use smithay_client_toolkit::{
-    compositor::Region,
     reexports::calloop::{
         channel::Sender,
         timer::{TimeoutAction, Timer},
@@ -22,18 +23,15 @@ use smithay_client_toolkit::{
 };
 use tiny_skia::Pixmap;
 
-use super::{files, Act, Launcher, Outcome, Preview, Usage, BODY_H, FIELD_H, RADIUS, WIDTH};
+use super::{files, Act, Launcher, Outcome, Usage, BODY_H, FIELD_H, FOOTER_H, RADIUS, WIDTH};
 use crate::{apps::ExtraIcons, menu::Action, menubar, App, Surf, Which, BTN_LEFT};
 
-/// Rebuild the file index when Spotlight opens and it is older than this.
-const REINDEX_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Reopening within this time shows the previous search again (selected).
 const KEEP_QUERY: Duration = Duration::from_secs(10 * 60);
 
 /// Results of background work, delivered on the shell's event loop.
 pub enum Msg {
     Index(Arc<files::FileIndex>, Option<(Option<String>, ExtraIcons)>),
-    Preview(String, files::PreviewData),
     Paste(String),
 }
 
@@ -96,24 +94,10 @@ impl App {
                 super::FILE_ICON_DB.with(|db| *db.borrow_mut() = Some(ix.clone()));
                 self.spot.index = Some(ix);
                 // show file results that were missing while the index was built
-                let refresh = self.launcher.as_ref().is_some_and(|l| !l.closing && !l.query.is_empty() && l.selected == 0);
+                let refresh = self.launcher.as_ref().is_some_and(|l| !l.query.is_empty() && l.selected == 0);
                 if refresh {
                     self.launcher_changed();
                 }
-            }
-            Msg::Preview(path, data) => {
-                let Some(l) = self.launcher.as_mut() else { return };
-                let p = match data {
-                    files::PreviewData::Image { w, h, rgba } => tiny_skia::IntSize::from_wh(w, h)
-                        .and_then(|sz| Pixmap::from_vec(rgba, sz))
-                        .map(|p| Preview::Image(std::rc::Rc::new(p)))
-                        .unwrap_or(Preview::Nothing),
-                    files::PreviewData::Text(t) => Preview::Text(t),
-                    files::PreviewData::Folder { items } => Preview::Folder(items),
-                    files::PreviewData::Nothing => Preview::Nothing,
-                };
-                l.previews.insert(path, p);
-                self.redraw(Which::Launcher);
             }
             Msg::Paste(text) => {
                 let Some(l) = self.launcher.as_mut() else { return };
@@ -134,27 +118,14 @@ impl App {
             .filter(|s| s.configured)
             .map(|s| (s.width as f32, s.height as f32))
             .unwrap_or((self.output_size.0 as f32, self.output_size.1 as f32));
-        let full = FIELD_H + BODY_H;
+        let full = FIELD_H + 1.0 + BODY_H + FOOTER_H;
         let y = (h * 0.2).max(menubar::HEIGHT + 24.0).min((h - full - 40.0).max(menubar::HEIGHT + 8.0));
         (((w - WIDTH) / 2.0).round(), y.round())
     }
 
     pub(crate) fn toggle_launcher(&mut self) {
-        if let Some(l) = self.launcher.as_mut() {
-            if l.closing {
-                // ⌘Space again while it fades out: bring it back
-                l.closing = false;
-                l.last_step_reset();
-                if let Some(s) = self.launcher_surf.as_ref() {
-                    s.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-                    s.layer.wl_surface().set_input_region(None);
-                    s.layer.commit();
-                }
-                self.refresh_apps();
-                self.redraw(Which::Launcher);
-                return;
-            }
-            self.close_launcher();
+        if self.launcher.is_some() {
+            self.close_launcher_now();
             return;
         }
         if self.launchpad.is_some() {
@@ -162,7 +133,7 @@ impl App {
         }
         self.close_menu();
         self.refresh_apps();
-        let keep = self.spot.last_close.map(|t| t.elapsed() < KEEP_QUERY).unwrap_or(false);
+        let keep = self.search.keep_query && self.spot.last_close.map(|t| t.elapsed() < KEEP_QUERY).unwrap_or(false);
         let last = if keep { self.spot.last_query.clone() } else { String::new() };
         self.spot.gen += 1;
         let gen = self.spot.gen;
@@ -171,9 +142,11 @@ impl App {
         if !last.is_empty() {
             self.launcher_search();
         }
-        let stale = self.spot.index.as_ref().map(|ix| ix.built.elapsed() > REINDEX_AFTER).unwrap_or(true);
-        if stale {
-            self.spot_index(Duration::ZERO);
+        if self.search.show_files {
+            let stale = self.spot.index.as_ref().map(|ix| ix.built.elapsed() > self.search.reindex_after()).unwrap_or(true);
+            if stale {
+                self.spot_index(Duration::ZERO);
+            }
         }
 
         let surface = self.compositor.create_surface(&self.qh);
@@ -187,7 +160,7 @@ impl App {
         // blinking caret
         let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(530)), move |_, _, app: &mut App| {
             match app.launcher.as_mut() {
-                Some(l) if l.gen == gen && !l.closing => {
+                Some(l) if l.gen == gen => {
                     l.caret_on = !l.caret_on;
                     app.redraw(Which::Launcher);
                     TimeoutAction::ToDuration(Duration::from_millis(530))
@@ -197,38 +170,15 @@ impl App {
         });
     }
 
-    /// Fade out; the surface goes away when the animation ends. Keyboard and
-    /// pointer are released right away.
+    /// Close Spotlight immediately (no fade).
     pub(crate) fn close_launcher(&mut self) {
-        let Some(l) = self.launcher.as_mut() else { return };
-        if l.closing {
-            return;
-        }
-        l.closing = true;
-        l.last_step_reset();
-        self.spot.last_query = l.query.clone();
-        self.spot.last_close = Some(Instant::now());
-        if let Some(s) = self.launcher_surf.as_ref() {
-            s.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-            if let Ok(r) = Region::new(&self.compositor) {
-                s.layer.wl_surface().set_input_region(Some(r.wl_region()));
-            }
-            s.layer.commit();
-        }
-        if self.launcher_surf.as_ref().map(|s| s.configured).unwrap_or(false) {
-            self.redraw(Which::Launcher);
-        } else {
-            self.close_launcher_now();
-        }
+        self.close_launcher_now();
     }
 
-    /// Remove Spotlight without animation.
     pub(crate) fn close_launcher_now(&mut self) {
         if let Some(l) = self.launcher.take() {
-            if !l.closing {
-                self.spot.last_query = l.query.clone();
-                self.spot.last_close = Some(Instant::now());
-            }
+            self.spot.last_query = l.query;
+            self.spot.last_close = Some(Instant::now());
         }
         self.launcher_surf = None;
         self.spot.backdrop = None;
@@ -237,7 +187,7 @@ impl App {
 
     fn launcher_search(&mut self) {
         if let Some(l) = self.launcher.as_mut() {
-            l.update(&self.apps, self.spot.index.as_ref(), &self.spot.usage);
+            l.update(&self.apps, self.spot.index.as_ref(), &self.spot.usage, &self.search);
         }
     }
 
@@ -247,24 +197,16 @@ impl App {
         self.redraw(Which::Launcher);
     }
 
-    /// Paint Spotlight onto its surface. `None` when it finished closing.
+    /// Paint Spotlight onto its surface. Returns whether the list is resizing.
     pub(crate) fn paint_launcher(&mut self, pm: &mut Pixmap, scale: f32) -> Option<bool> {
         let animating = self.launcher.as_mut()?.step();
-        if self.launcher.as_ref().is_some_and(|l| l.is_closed()) {
-            self.close_launcher_now();
-            return None;
-        }
-        self.spot_request_preview(scale);
         let (x, y) = self.launcher_origin();
         let l = self.launcher.as_ref()?;
-        l.paint(pm, x, y, scale, &self.apps, &self.fonts, &self.theme, self.spot.index.as_deref(), &self.spot.usage);
+        l.paint(pm, x, y, scale, &self.apps, &self.fonts, &self.theme);
 
-        // frosted glass behind it, following the fade and zoom
-        let (alpha, k) = l.anim();
+        // frosted glass behind the panel (alpha stays 1: no fade animation)
         let h = l.shown_height();
-        let cx = x + WIDTH / 2.0;
-        let cy = y + FIELD_H / 2.0;
-        let rect = [cx + (x - cx) * k, cy + (y - cy) * k, WIDTH * k, h * k, RADIUS * k, alpha];
+        let rect = [x, y, WIDTH, h, RADIUS, 1.0];
         let changed = self.spot.backdrop.map(|b| b.iter().zip(rect.iter()).any(|(a, b)| (a - b).abs() > 0.01)).unwrap_or(true);
         if changed {
             self.spot.backdrop = Some(rect);
@@ -278,23 +220,10 @@ impl App {
         Some(animating)
     }
 
-    /// Load the selected file's preview on a helper thread.
-    fn spot_request_preview(&mut self, scale: f32) {
-        let Some(l) = self.launcher.as_mut() else { return };
-        let Some((path, is_dir, class)) = l.wanted_preview() else { return };
-        l.previews.insert(path.clone(), Preview::Loading);
-        let tx = self.spot.tx.clone();
-        let max = (440.0 * scale) as u32;
-        let _ = std::thread::Builder::new().name("spotlight-preview".into()).spawn(move || {
-            let data = files::load_preview(&path, is_dir, class, max);
-            let _ = tx.send(Msg::Preview(path, data));
-        });
-    }
-
     // ---- input ------------------------------------------------------------------
 
     pub(crate) fn launcher_active(&self) -> bool {
-        self.launcher.as_ref().is_some_and(|l| !l.closing)
+        self.launcher.is_some()
     }
 
     pub(crate) fn launcher_key(&mut self, event: &KeyEvent) {
@@ -373,8 +302,9 @@ impl App {
                 _ => self.spawn(&cmd),
             },
             Act::Wm(name) => {
-                // after Spotlight has faded out (a screenshot must not show it)
-                let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(180)), move |_, _, app: &mut App| {
+                // give the compositor a beat to unmap the overlay (a screenshot
+                // must not show it)
+                let _ = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(60)), move |_, _, app: &mut App| {
                     app.perform(Action::Wm(name));
                     TimeoutAction::Drop
                 });
@@ -427,7 +357,7 @@ impl App {
                 }
             }
             PointerEventKind::Axis { vertical, .. } => {
-                if inside && ly > FIELD_H {
+                if inside && ly > FIELD_H + 1.0 && ly < l.shown_height() - FOOTER_H {
                     let dy = if vertical.absolute != 0.0 { vertical.absolute as f32 } else { vertical.discrete as f32 * 28.0 };
                     l.scroll_by(dy);
                     self.redraw(Which::Launcher);
@@ -435,13 +365,6 @@ impl App {
             }
             _ => {}
         }
-    }
-}
-
-impl Launcher {
-    /// Restart animation timing (after a pause, `step` must not jump).
-    pub(crate) fn last_step_reset(&mut self) {
-        self.last_step = Instant::now();
     }
 }
 

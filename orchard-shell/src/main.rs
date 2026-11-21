@@ -193,6 +193,7 @@ struct App {
     fonts: Fonts,
     theme: Theme,
     perf: orchard_config::PerformanceSettings,
+    search: orchard_config::SearchSettings,
     ipc: Option<Ipc>,
     last_step: Instant,
     last_backdrop: Option<(f32, f32, f32, f32)>,
@@ -409,6 +410,7 @@ fn main() {
         fonts: Fonts::load(),
         theme,
         perf: settings.performance.clone(),
+        search: settings.search.clone(),
         ipc,
         last_step: Instant::now(),
         last_backdrop: None,
@@ -1300,6 +1302,16 @@ impl App {
         self.theme = Theme::from_settings(&s);
         let theme_changed = self.theme != old_theme;
         self.perf = s.performance.clone();
+        self.search = s.search.clone();
+        if self.launcher.is_some() {
+            if self.search.show_files {
+                let stale = self.spot.index.as_ref().map(|ix| ix.built.elapsed() > self.search.reindex_after()).unwrap_or(true);
+                if stale {
+                    self.spot_index(Duration::ZERO);
+                }
+            }
+            self.launcher_changed();
+        }
         let icons_changed = self.apps.set_icon_theme(s.appearance.icon_theme.clone());
         let was_showing_volume = self.menubar.cfg.show_volume;
         let old_bar_cfg = self.menubar.cfg.clone();

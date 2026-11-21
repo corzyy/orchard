@@ -24,8 +24,6 @@ pub struct DesktopEntry {
     pub comment: Option<String>,
     /// search keywords (localized and English)
     pub keywords: Vec<String>,
-    /// freedesktop categories ("Utility", "Development" …)
-    pub categories: Vec<String>,
 }
 
 impl DesktopEntry {
@@ -168,7 +166,6 @@ fn parse_entry(path: &Path, id: String, locale: &[String]) -> Option<DesktopEntr
         generic_name: localized(&map, "GenericName", locale),
         comment: localized(&map, "Comment", locale),
         keywords,
-        categories: list(map.get("Categories").cloned()),
         id,
         name,
         icon: map.get("Icon").cloned(),

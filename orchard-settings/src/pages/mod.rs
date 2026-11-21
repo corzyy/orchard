@@ -6,6 +6,7 @@ pub mod art;
 pub mod connectivity;
 pub mod desktop;
 pub mod input;
+pub mod search;
 pub mod system;
 pub mod tiling;
 pub mod updates;
@@ -67,6 +68,7 @@ pub enum Page {
     Sound,
     // General & subpages
     General,
+    Search,
     About,
     SoftwareUpdate,
     DateTime,
@@ -96,7 +98,7 @@ use Page::*;
 pub const SIDEBAR: &[(&str, &[Page])] = &[
     ("Network", &[Wifi, Bluetooth, Network]),
     ("Devices", &[Sound, Displays, Keyboard, Mouse, Trackpad]),
-    ("System", &[General, Accessibility, LockScreen, Battery]),
+    ("System", &[General, Search, Accessibility, LockScreen, Battery]),
     ("Appearance & Desktop", &[Appearance, Wallpaper, MenuBar, DesktopDock, Tiling]),
 ];
 
@@ -107,6 +109,7 @@ pub const ALL_PAGES: &[Page] = &[
     Network,
     Sound,
     General,
+    Search,
     About,
     SoftwareUpdate,
     DateTime,
@@ -142,6 +145,7 @@ impl Page {
             Network => "Network",
             Sound => "Sound",
             General => "General",
+            Search => "Spotlight",
             About => "About",
             SoftwareUpdate => "Software Update",
             DateTime => "Date & Time",
@@ -173,6 +177,7 @@ impl Page {
             Network => ("network-workgroup", blue),
             Sound => ("audio-volume-high", rgb([0xFF, 0x37, 0x5F])),
             General => ("emblem-system", gray),
+            Search => ("system-search", blue),
             About => ("computer", gray),
             SoftwareUpdate => ("software-update-available", gray),
             DateTime => ("preferences-system-time", blue),
@@ -208,6 +213,7 @@ impl Page {
             Network => "network ethernet vpn wireguard wired lan ip",
             Sound => "sound volume audio output input microphone speakers mute",
             General => "general system about software update date time login items default apps",
+            Search => "spotlight search launcher find files results web actions apps index command space",
             About => "about hardware cpu processor graphics memory os kernel hostname computer",
             SoftwareUpdate => "software update updates upgrade dnf flatpak packages install",
             DateTime => "date time timezone ntp clock",
@@ -241,6 +247,7 @@ impl Page {
             "network" | "ethernet" | "vpn" => Some(Network),
             "sound" | "audio" | "volume" => Some(Sound),
             "general" | "system" | "users" | "usersgroups" | "language" | "languageregion" => Some(General),
+            "spotlight" | "search" | "launcher" => Some(Search),
             "about" | "storage" => Some(About),
             "softwareupdate" | "update" | "updates" | "upgrade" => Some(SoftwareUpdate),
             "datetime" | "time" | "timezone" => Some(DateTime),
@@ -283,6 +290,7 @@ pub fn show(page: Page, s: &Settings, st: &mut PageState, wake: &Wake) -> El {
         Network => connectivity::network(&mut st.conn, wake),
         Sound => connectivity::sound(&mut st.conn, wake),
         General => system::general(),
+        Search => search::search(s),
         About => system::about(&mut st.system, wake),
         SoftwareUpdate => updates::software_update(&mut st.updates, wake),
         DateTime => system::date_time(&mut st.system, wake),
@@ -322,6 +330,8 @@ mod tests {
         assert_eq!(Page::from_arg("wifi"), Some(Page::Wifi));
         assert_eq!(Page::from_arg("Network"), Some(Page::Network));
         assert_eq!(Page::from_arg("General"), Some(Page::General));
+        assert_eq!(Page::from_arg("Spotlight"), Some(Page::Search));
+        assert_eq!(Page::from_arg("search"), Some(Page::Search));
         assert_eq!(Page::from_arg("About"), Some(Page::About));
         assert_eq!(Page::from_arg("Accessibility"), Some(Page::Accessibility));
         assert_eq!(Page::from_arg("Desktop & Dock"), Some(Page::DesktopDock));

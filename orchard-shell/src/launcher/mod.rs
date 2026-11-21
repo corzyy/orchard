@@ -1,11 +1,10 @@
 //! Spotlight: one search field for apps, System Settings panes, system
 //! commands, files and folders, a calculator, unit conversions and the web.
 //!
-//! The panel floats in the upper part of the screen on frosted glass. While
-//! you type, the best match (the Top Hit) is completed inline in the field and
-//! results are grouped by category on the left, with a preview of the
-//! selected one on the right. Spotlight learns: what you pick for a query
-//! ranks first the next time you type it.
+//! A compact, Raycast-style command palette: one full-width result list with
+//! section headings and a footer that shows what ⏎ will do. Opening and
+//! closing are instant; only the result list grows and shrinks. Spotlight
+//! learns: what you pick for a query ranks first the next time you type it.
 //!
 //! This module holds the model and the drawing; `glue.rs` wires it into the
 //! shell (surface, keyboard, pointer, background work).
@@ -35,23 +34,21 @@ use crate::{
     theme::Theme,
 };
 use files::{FileClass, FileHit, FileIndex};
+use orchard_config::SearchSettings;
 
 // ---- geometry (logical px) ---------------------------------------------------
 
-pub const WIDTH: f32 = 760.0;
-pub const FIELD_H: f32 = 58.0;
-pub const BODY_H: f32 = 402.0;
-pub const RADIUS: f32 = 18.0;
-const LIST_W: f32 = 296.0;
-const HEADER_H: f32 = 26.0;
-const ROW_H: f32 = 28.0;
+pub const WIDTH: f32 = 640.0;
+pub const FIELD_H: f32 = 52.0;
+/// Height of the result area (below the field, above the footer).
+pub const BODY_H: f32 = 356.0;
+/// Action hints at the bottom of the panel.
+pub const FOOTER_H: f32 = 32.0;
+pub const RADIUS: f32 = 14.0;
+const HEADER_H: f32 = 24.0;
+const ROW_H: f32 = 34.0;
 const TOP_ROW_H: f32 = 44.0;
-const LIST_PAD: f32 = 6.0;
-/// room around the panel for its shadow
-const MARGIN: f32 = 56.0;
-
-const OPEN_SECS: f32 = 0.16;
-const CLOSE_SECS: f32 = 0.11;
+const LIST_PAD: f32 = 4.0;
 
 /// Ranking for the launcher and Launchpad search: prefix match > word-prefix
 /// match > substring > subsequence.
@@ -106,6 +103,7 @@ pub const PANES: &[Pane] = &[
     Pane { title: "Network", de: "Netzwerk", icon: "network-workgroup", color: BLUE, keywords: "ethernet vpn ip proxy wired lan netzwerk" },
     Pane { title: "Sound", de: "Ton", icon: "audio-volume-high", color: [0xFF, 0x37, 0x5F], keywords: "volume audio output input microphone speakers mute lautstärke mikrofon" },
     Pane { title: "General", de: "Allgemein", icon: "emblem-system", color: GRAY, keywords: "about software system allgemein" },
+    Pane { title: "Spotlight", de: "Spotlight", icon: "system-search", color: BLUE, keywords: "spotlight search launcher find files results web actions apps index" },
     Pane { title: "About", de: "Info", icon: "computer", color: GRAY, keywords: "system hardware cpu memory version hostname computer über" },
     Pane { title: "Date & Time", de: "Datum & Uhrzeit", icon: "preferences-system-time", color: BLUE, keywords: "clock time zone ntp 24-hour uhr zeitzone datum" },
     Pane { title: "Language & Region", de: "Sprache & Region", icon: "preferences-desktop-locale", color: BLUE, keywords: "locale region format sprache" },
@@ -115,7 +113,7 @@ pub const PANES: &[Pane] = &[
     Pane { title: "Appearance", de: "Erscheinungsbild", icon: "preferences-desktop-appearance", color: BLACK, keywords: "dark light mode accent colour color theme dunkel hell akzentfarbe" },
     Pane { title: "Accessibility", de: "Bedienungshilfen", icon: "preferences-desktop-accessibility", color: BLUE, keywords: "reduce motion transparency animation" },
     Pane { title: "Menu Bar", de: "Menüleiste", icon: "open-menu", color: GRAY, keywords: "clock control center battery percentage date seconds menüleiste" },
-    Pane { title: "Desktop & Dock", de: "Schreibtisch & Dock", icon: "view-app-grid", color: BLACK, keywords: "dock magnification minimize hot corners mission control windows title bar focus schreibtisch" },
+    Pane { title: "Desktop & Dock", de: "Schreibtisch & Dock", icon: "view-app-grid", color: BLACK, keywords: "dock magnification minimize trash bin hot corners mission control windows title bar focus schreibtisch" },
     Pane { title: "Displays", de: "Displays", icon: "video-display", color: BLUE, keywords: "screen monitor resolution scale hidpi vrr freesync gsync adaptive sync bildschirm auflösung" },
     Pane { title: "Wallpaper", de: "Hintergrundbild", icon: "preferences-desktop-wallpaper", color: [0x32, 0xAD, 0xE6], keywords: "background desktop picture hintergrund" },
     Pane { title: "Lock Screen", de: "Sperrbildschirm", icon: "system-lock-screen", color: BLACK, keywords: "lock idle screensaver password sperren" },
@@ -140,8 +138,6 @@ pub struct Cmd {
     pub icon: &'static str,
     pub color: [u8; 3],
     pub keywords: &'static str,
-    pub about_en: &'static str,
-    pub about_de: &'static str,
     pub action: CmdAction,
 }
 
@@ -153,8 +149,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "system-lock-screen",
         color: BLACK,
         keywords: "lock sperren",
-        about_en: "Locks the screen. Your apps keep running.",
-        about_de: "Sperrt den Bildschirm. Deine Apps laufen weiter.",
         action: CmdAction::Shell("${ORCHARD_LOCKER:-swaylock -f -c 1e1e1e}"),
     },
     Cmd {
@@ -164,8 +158,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "system-suspend",
         color: [0x5E, 0x5C, 0xE6],
         keywords: "sleep suspend standby ruhezustand",
-        about_en: "Puts the computer to sleep.",
-        about_de: "Versetzt den Computer in den Ruhezustand.",
         action: CmdAction::Shell("systemctl suspend"),
     },
     Cmd {
@@ -175,8 +167,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "system-reboot",
         color: GRAY,
         keywords: "restart reboot neustart neu starten",
-        about_en: "Restarts the computer.",
-        about_de: "Startet den Computer neu.",
         action: CmdAction::Shell("systemctl reboot"),
     },
     Cmd {
@@ -186,8 +176,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "system-shutdown",
         color: [0xFF, 0x45, 0x3A],
         keywords: "shut down shutdown power off poweroff ausschalten herunterfahren",
-        about_en: "Turns the computer off.",
-        about_de: "Schaltet den Computer aus.",
         action: CmdAction::Shell("systemctl poweroff"),
     },
     Cmd {
@@ -197,8 +185,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "system-log-out",
         color: GRAY,
         keywords: "log out logout sign out abmelden",
-        about_en: "Quits all apps and ends the Orchard session.",
-        about_de: "Beendet alle Apps und die Orchard-Sitzung.",
         action: CmdAction::LogOut,
     },
     Cmd {
@@ -208,8 +194,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "user-trash",
         color: GRAY,
         keywords: "empty trash bin papierkorb leeren",
-        about_en: "Deletes the items in the Trash for good.",
-        about_de: "Löscht die Objekte im Papierkorb endgültig.",
         action: CmdAction::Shell("gio trash --empty"),
     },
     Cmd {
@@ -219,8 +203,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "applets-screenshooter",
         color: GRAY,
         keywords: "screenshot capture screen bildschirmfoto foto",
-        about_en: "Takes a picture of the whole screen (⇧⌘3).",
-        about_de: "Fotografiert den ganzen Bildschirm (⇧⌘3).",
         action: CmdAction::Wm("screenshot"),
     },
     Cmd {
@@ -230,8 +212,6 @@ pub const CMDS: &[Cmd] = &[
         icon: "preferences-system-windows",
         color: [0x5A, 0xC8, 0xFA],
         keywords: "mission control windows spaces exposé fenster",
-        about_en: "Shows all open windows and Spaces.",
-        about_de: "Zeigt alle offenen Fenster und Spaces.",
         action: CmdAction::Wm("mission-control"),
     },
 ];
@@ -303,10 +283,6 @@ impl Usage {
             }
         }
         self.save();
-    }
-
-    pub fn last_used(&self, key: &str) -> Option<i64> {
-        self.launches.get(key).map(|(_, t)| *t)
     }
 
     /// Extra rank for `key` when searching `query`.
@@ -454,14 +430,6 @@ pub enum Outcome {
     WebSearch,
 }
 
-pub enum Preview {
-    Loading,
-    Image(Rc<Pixmap>),
-    Text(String),
-    Folder(usize),
-    Nothing,
-}
-
 pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -526,13 +494,9 @@ pub struct Launcher {
     pub caret_on: bool,
     /// id of this opening (stale timers check it)
     pub gen: u64,
-    /// 0 → 1 while opening; back to 0 while closing
-    pub open: f32,
-    pub closing: bool,
     shown_h: f32,
     last_step: Instant,
     last_click: Option<(usize, Instant)>,
-    pub previews: HashMap<String, Preview>,
     german: bool,
     /// recoloured symbolic icons
     tiles: RefCell<HashMap<(String, u32), Option<Rc<Pixmap>>>>,
@@ -552,12 +516,9 @@ impl Launcher {
             scroll: 0.0,
             caret_on: true,
             gen,
-            open: 0.0,
-            closing: false,
-            shown_h: FIELD_H,
+            shown_h: FIELD_H + 1.0 + FOOTER_H,
             last_step: Instant::now(),
             last_click: None,
-            previews: HashMap::new(),
             german,
             tiles: RefCell::new(HashMap::new()),
         }
@@ -569,8 +530,8 @@ impl Launcher {
 
     // ---- search ----------------------------------------------------------
 
-    pub fn update(&mut self, apps: &Apps, index: Option<&Arc<FileIndex>>, usage: &Usage) {
-        self.items = self.search(apps, index, usage);
+    pub fn update(&mut self, apps: &Apps, index: Option<&Arc<FileIndex>>, usage: &Usage, cfg: &SearchSettings) {
+        self.items = self.search(apps, index, usage, cfg);
         self.layout();
         // like macOS, every keystroke selects the (new) best result
         self.selected = 0;
@@ -578,7 +539,7 @@ impl Launcher {
         self.hover = None;
     }
 
-    fn search(&self, apps: &Apps, index: Option<&Arc<FileIndex>>, usage: &Usage) -> Vec<Item> {
+    fn search(&self, apps: &Apps, index: Option<&Arc<FileIndex>>, usage: &Usage, cfg: &SearchSettings) -> Vec<Item> {
         let q = self.query.trim();
         if q.is_empty() {
             return Vec::new();
@@ -588,73 +549,79 @@ impl Launcher {
         let mut cands: Vec<Item> = Vec::new();
 
         // apps
-        for (i, e) in apps.entries.iter().enumerate() {
-            if e.no_display || e.exec.is_none() {
-                continue;
-            }
-            let mut best: Option<i64> = name_score(&e.name, q);
-            let mut consider = |v: Option<i64>| {
-                if let Some(v) = v {
-                    best = Some(best.map_or(v, |b| b.max(v)));
+        if cfg.show_apps {
+            for (i, e) in apps.entries.iter().enumerate() {
+                if e.no_display || e.exec.is_none() {
+                    continue;
                 }
-            };
-            consider(e.generic_name.as_deref().and_then(|g| score(g, q)).filter(|s| *s >= 200).map(|s| s as i64 * 2));
-            if ql.len() >= 2 {
-                consider(e.keywords.iter().any(|k| k.to_lowercase().starts_with(&ql)).then_some(560));
-                consider(score(&e.id, q).filter(|s| *s >= 300).map(|s| s as i64 * 2));
+                let mut best: Option<i64> = name_score(&e.name, q);
+                let mut consider = |v: Option<i64>| {
+                    if let Some(v) = v {
+                        best = Some(best.map_or(v, |b| b.max(v)));
+                    }
+                };
+                consider(e.generic_name.as_deref().and_then(|g| score(g, q)).filter(|s| *s >= 200).map(|s| s as i64 * 2));
+                if ql.len() >= 2 {
+                    consider(e.keywords.iter().any(|k| k.to_lowercase().starts_with(&ql)).then_some(560));
+                    consider(score(&e.id, q).filter(|s| *s >= 300).map(|s| s as i64 * 2));
+                }
+                if ql.len() >= 3 {
+                    consider(e.comment.as_deref().filter(|c| c.to_lowercase().contains(&ql)).map(|_| 260));
+                }
+                let Some(s) = best else { continue };
+                let mut it = Item {
+                    target: Target::App(i),
+                    title: e.name.clone(),
+                    kind: self.t("Application", "Programm").into(),
+                    rank: s + 300,
+                    section: Section::Apps,
+                };
+                it.rank += usage.boost(q, &it.key(apps));
+                cands.push(it);
             }
-            if ql.len() >= 3 {
-                consider(e.comment.as_deref().filter(|c| c.to_lowercase().contains(&ql)).map(|_| 260));
-            }
-            let Some(s) = best else { continue };
-            let mut it = Item {
-                target: Target::App(i),
-                title: e.name.clone(),
-                kind: self.t("Application", "Programm").into(),
-                rank: s + 300,
-                section: Section::Apps,
-            };
-            it.rank += usage.boost(q, &it.key(apps));
-            cands.push(it);
         }
 
         // System Settings panes
-        for p in PANES {
-            let title = if german { p.de } else { p.title };
-            let mut best = name_score(title, q).or_else(|| name_score(p.title, q));
-            if ql.len() >= 2 && p.keywords.split_whitespace().any(|k| k.starts_with(&ql)) {
-                best = Some(best.unwrap_or(0).max(520));
+        if cfg.show_settings {
+            for p in PANES {
+                let title = if german { p.de } else { p.title };
+                let mut best = name_score(title, q).or_else(|| name_score(p.title, q));
+                if ql.len() >= 2 && p.keywords.split_whitespace().any(|k| k.starts_with(&ql)) {
+                    best = Some(best.unwrap_or(0).max(520));
+                }
+                let Some(s) = best.filter(|s| *s >= 300) else { continue };
+                let mut it = Item {
+                    target: Target::Setting(p),
+                    title: title.to_string(),
+                    kind: self.t("System Settings", "Systemeinstellungen").into(),
+                    rank: s,
+                    section: Section::Settings,
+                };
+                it.rank += usage.boost(q, &it.key(apps));
+                cands.push(it);
             }
-            let Some(s) = best.filter(|s| *s >= 300) else { continue };
-            let mut it = Item {
-                target: Target::Setting(p),
-                title: title.to_string(),
-                kind: self.t("System Settings", "Systemeinstellungen").into(),
-                rank: s,
-                section: Section::Settings,
-            };
-            it.rank += usage.boost(q, &it.key(apps));
-            cands.push(it);
         }
 
         // commands
-        for c in CMDS {
-            let title = if german { c.de } else { c.en };
-            let mut best = name_score(title, q).or_else(|| name_score(c.en, q));
-            if ql.len() >= 2 && c.keywords.split_whitespace().any(|k| k.starts_with(&ql)) {
-                best = Some(best.unwrap_or(0).max(520));
+        if cfg.show_actions {
+            for c in CMDS {
+                let title = if german { c.de } else { c.en };
+                let mut best = name_score(title, q).or_else(|| name_score(c.en, q));
+                if ql.len() >= 2 && c.keywords.split_whitespace().any(|k| k.starts_with(&ql)) {
+                    best = Some(best.unwrap_or(0).max(520));
+                }
+                let Some(s) = best.filter(|s| *s >= 600) else { continue };
+                let mut it = Item {
+                    target: Target::Command(c),
+                    title: title.to_string(),
+                    kind: self.t("Action", "Aktion").into(),
+                    // "lock" means locking, not the Lock Screen settings
+                    rank: s + 40,
+                    section: Section::Commands,
+                };
+                it.rank += usage.boost(q, &it.key(apps));
+                cands.push(it);
             }
-            let Some(s) = best.filter(|s| *s >= 600) else { continue };
-            let mut it = Item {
-                target: Target::Command(c),
-                title: title.to_string(),
-                kind: self.t("Action", "Aktion").into(),
-                // "lock" means locking, not the Lock Screen settings
-                rank: s + 40,
-                section: Section::Commands,
-            };
-            it.rank += usage.boost(q, &it.key(apps));
-            cands.push(it);
         }
 
         // a typed path or URL
@@ -683,25 +650,27 @@ impl Launcher {
         }
 
         // files
-        if let Some(ix) = index {
-            let per_class = 4;
-            let mut counts: HashMap<FileClass, usize> = HashMap::new();
-            for h in files::search(ix, q, 120) {
-                let c = counts.entry(h.class).or_insert(0);
-                if *c >= per_class {
-                    continue;
+        if cfg.show_files {
+            if let Some(ix) = index {
+                let per_class = 4;
+                let mut counts: HashMap<FileClass, usize> = HashMap::new();
+                for h in files::search(ix, q, 120) {
+                    let c = counts.entry(h.class).or_insert(0);
+                    if *c >= per_class {
+                        continue;
+                    }
+                    *c += 1;
+                    let name = h.entry.name().to_string();
+                    let mut it = Item {
+                        kind: ix.mime.kind_label(&name, h.entry.is_dir, german),
+                        title: name,
+                        rank: h.score,
+                        section: Section::Files(h.class),
+                        target: Target::File(h),
+                    };
+                    it.rank += usage.boost(q, &it.key(apps));
+                    cands.push(it);
                 }
-                *c += 1;
-                let name = h.entry.name().to_string();
-                let mut it = Item {
-                    kind: ix.mime.kind_label(&name, h.entry.is_dir, german),
-                    title: name,
-                    rank: h.score,
-                    section: Section::Files(h.class),
-                    target: Target::File(h),
-                };
-                it.rank += usage.boost(q, &it.key(apps));
-                cands.push(it);
             }
         }
 
@@ -764,13 +733,15 @@ impl Launcher {
             take(Section::Files(fc), 4, &mut cands, &mut out);
         }
 
-        out.push(Item {
-            target: Target::Web(q.to_string()),
-            title: if german { format!("„{q}“ im Web suchen") } else { format!("Search the web for “{q}”") },
-            kind: self.t("Web search", "Websuche").into(),
-            rank: 0,
-            section: Section::Web,
-        });
+        if cfg.show_web {
+            out.push(Item {
+                target: Target::Web(q.to_string()),
+                title: if german { format!("„{q}“ im Web suchen") } else { format!("Search the web for “{q}”") },
+                kind: self.t("Web search", "Websuche").into(),
+                rank: 0,
+                section: Section::Web,
+            });
+        }
         // a lone URL item and the web search share the Web section; keep the
         // order: URL, then search
         out
@@ -793,11 +764,16 @@ impl Launcher {
         self.content_h = y + LIST_PAD;
     }
 
+    /// Height of the result area right now: the content, up to the maximum.
+    fn view_h(&self) -> f32 {
+        self.content_h.min(BODY_H)
+    }
+
     pub fn target_height(&self) -> f32 {
         if self.items.is_empty() {
-            FIELD_H
+            FIELD_H + 1.0 + FOOTER_H
         } else {
-            FIELD_H + BODY_H
+            FIELD_H + 1.0 + self.view_h() + FOOTER_H
         }
     }
 
@@ -809,36 +785,18 @@ impl Launcher {
         self.items.get(self.selected)
     }
 
-    /// Advance the open / close / resize animation. Returns true while moving.
+    /// Advance the result-list resize animation. Returns true while moving.
     pub fn step(&mut self) -> bool {
         let now = Instant::now();
         let dt = now.duration_since(self.last_step).as_secs_f32().min(0.05);
         self.last_step = now;
-        if self.closing {
-            self.open = (self.open - dt / CLOSE_SECS).max(0.0);
-        } else {
-            self.open = (self.open + dt / OPEN_SECS).min(1.0);
-        }
         let target = self.target_height();
-        let k = 1.0 - (-dt * 28.0).exp();
+        let k = 1.0 - (-dt * 42.0).exp();
         self.shown_h += (target - self.shown_h) * k;
         if (target - self.shown_h).abs() < 0.5 {
             self.shown_h = target;
         }
-        let opening = !self.closing && self.open < 1.0;
-        let closing = self.closing && self.open > 0.0;
-        opening || closing || self.shown_h != target
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.closing && self.open <= 0.0
-    }
-
-    /// Opacity and scale of the panel right now.
-    pub fn anim(&self) -> (f32, f32) {
-        let t = self.open.clamp(0.0, 1.0);
-        let e = 1.0 - (1.0 - t).powi(3);
-        (e, 0.965 + 0.035 * e)
+        self.shown_h != target
     }
 
     // ---- selection ----------------------------------------------------------
@@ -1197,28 +1155,16 @@ impl Launcher {
         Some((act, key))
     }
 
-    /// Path the preview pane wants loaded (not loaded or loading yet).
-    pub fn wanted_preview(&self) -> Option<(String, bool, FileClass)> {
-        let it = self.selected_item()?;
-        let (path, is_dir) = it.file()?;
-        if self.previews.contains_key(path) {
-            return None;
-        }
-        let class = match &it.target {
-            Target::File(h) => h.class,
-            _ => c_of(it.section).unwrap_or(if is_dir { FileClass::Folder } else { FileClass::Other }),
-        };
-        Some((path.to_string(), is_dir, class))
-    }
-
     // ---- pointer -------------------------------------------------------------------
 
     /// Item under a point in panel coordinates.
     pub fn item_at(&self, x: f32, y: f32) -> Option<usize> {
-        if x < 0.0 || x > LIST_W || y < FIELD_H || y > self.shown_h {
+        let body_top = FIELD_H + 1.0;
+        let body_h = (self.shown_h - body_top - FOOTER_H).max(0.0);
+        if x < 0.0 || x > WIDTH || y < body_top || y > body_top + body_h {
             return None;
         }
-        let ly = y - FIELD_H + self.scroll;
+        let ly = y - body_top + self.scroll;
         self.rows.iter().find_map(|r| match r.kind {
             RowKind::Item(i) if ly >= r.y && ly < r.y + r.h => Some(i),
             _ => None,
@@ -1250,69 +1196,42 @@ impl Launcher {
     // ---- painting ---------------------------------------------------------------------
 
     /// Paint the panel with its top-left at (x, y) on a full-output surface.
-    #[allow(clippy::too_many_arguments)]
-    pub fn paint(&self, pm: &mut Pixmap, x: f32, y: f32, scale: f32, apps: &Apps, fonts: &Fonts, theme: &Theme, index: Option<&FileIndex>, usage: &Usage) {
+    /// Drawing goes straight into the target: no intermediate panel buffer and
+    /// no open/close fade, so a keystroke costs one small list canvas.
+    pub fn paint(&self, pm: &mut Pixmap, x: f32, y: f32, scale: f32, apps: &Apps, fonts: &Fonts, theme: &Theme) {
         let s = scale;
-        let h = self.shown_h.max(FIELD_H);
-        let (alpha, k) = self.anim();
-        if alpha <= 0.001 {
-            return;
-        }
-        let pw = ((WIDTH + 2.0 * MARGIN) * s).ceil() as u32;
-        let ph = ((h + 2.0 * MARGIN) * s).ceil() as u32;
-        let Some(mut layer) = Pixmap::new(pw, ph) else { return };
+        let h = self.shown_h.max(FIELD_H + 1.0 + FOOTER_H);
         let pal = Palette::new(theme);
 
-        self.paint_shadow(&mut layer, s, h, &pal);
-        let (px, py) = (MARGIN * s, MARGIN * s);
+        self.paint_shadow(pm, s, x, y, h, &pal);
+        let (px, py) = (x * s, y * s);
 
         // glass + borders
-        fill_rounded(&mut layer, px, py, WIDTH * s, h * s, RADIUS * s, pal.bg);
-        stroke_rounded(&mut layer, px + 0.5 * s, py + 0.5 * s, (WIDTH - 1.0) * s, (h - 1.0) * s, (RADIUS - 0.5) * s, 1.0 * s, pal.inner);
-        stroke_rounded(&mut layer, px - 0.5 * s, py - 0.5 * s, (WIDTH + 1.0) * s, (h + 1.0) * s, (RADIUS + 0.5) * s, 1.0 * s, pal.outer);
+        fill_rounded(pm, px, py, WIDTH * s, h * s, RADIUS * s, pal.bg);
+        stroke_rounded(pm, px + 0.5 * s, py + 0.5 * s, (WIDTH - 1.0) * s, (h - 1.0) * s, (RADIUS - 0.5) * s, 1.0 * s, pal.inner);
+        stroke_rounded(pm, px - 0.5 * s, py - 0.5 * s, (WIDTH + 1.0) * s, (h + 1.0) * s, (RADIUS + 0.5) * s, 1.0 * s, pal.outer);
 
-        self.paint_field(&mut layer, px, py, s, apps, fonts, &pal);
+        self.paint_field(pm, px, py, s, apps, fonts, &pal);
+        fill_rounded(pm, px, py + FIELD_H * s, WIDTH * s, (1.0 * s).max(1.0), 0.0, pal.sep);
 
-        if h > FIELD_H + 1.0 && !self.items.is_empty() {
-            fill_rounded(&mut layer, px, py + FIELD_H * s, WIDTH * s, (1.0 * s).max(1.0), 0.0, pal.sep);
-            let body_h = (h - FIELD_H - 1.0).max(1.0);
-            // the list, clipped to its column
-            if let Some(mut list) = Pixmap::new((LIST_W * s).ceil() as u32, (body_h * s).ceil() as u32) {
+        let body_top = FIELD_H + 1.0;
+        let body_h = (h - body_top - FOOTER_H).max(0.0);
+        if body_h > 0.5 && !self.items.is_empty() {
+            // the list is the only off-screen canvas: it clips rows while the
+            // panel grows or shrinks
+            if let Some(mut list) = Pixmap::new((WIDTH * s).ceil() as u32, (body_h * s).ceil() as u32) {
                 self.paint_list(&mut list, s, apps, fonts, &pal);
-                layer.draw_pixmap(px as i32, (py + (FIELD_H + 1.0) * s) as i32, list.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-            }
-            fill_rounded(&mut layer, px + LIST_W * s, py + (FIELD_H + 1.0) * s, (1.0 * s).max(1.0), body_h * s, 0.0, pal.sep);
-            if let Some(mut prev) = Pixmap::new(((WIDTH - LIST_W - 1.0) * s).ceil() as u32, (body_h * s).ceil() as u32) {
-                self.paint_preview(&mut prev, s, apps, fonts, &pal, index, usage);
-                layer.draw_pixmap(
-                    (px + (LIST_W + 1.0) * s) as i32,
-                    (py + (FIELD_H + 1.0) * s) as i32,
-                    prev.as_ref(),
-                    &PixmapPaint::default(),
-                    Transform::identity(),
-                    None,
-                );
+                pm.draw_pixmap(px as i32, ((y + body_top) * s) as i32, list.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
             }
         }
 
-        // composite: fade + slight zoom around the field's centre
-        let cx = (x + WIDTH / 2.0) * s;
-        let cy = (y + FIELD_H / 2.0) * s;
-        let ox = (x - MARGIN) * s;
-        let oy = (y - MARGIN) * s;
-        let t = Transform::from_row(k, 0.0, 0.0, k, cx + (ox - cx) * k, cy + (oy - cy) * k);
-        let p = PixmapPaint {
-            opacity: alpha,
-            quality: if (k - 1.0).abs() < 1e-4 { FilterQuality::Nearest } else { FilterQuality::Bilinear },
-            ..Default::default()
-        };
-        pm.draw_pixmap(0, 0, layer.as_ref(), &p, t, None);
+        self.paint_footer(pm, x, y, h, s, fonts, &pal);
     }
 
     /// A soft, slightly lowered shadow (nine-slice of one blurred sprite),
     /// with the panel's own area cut out so the glass stays clear.
-    fn paint_shadow(&self, layer: &mut Pixmap, s: f32, h: f32, pal: &Palette) {
-        let blur = (30.0 * s).round().max(2.0) as usize;
+    fn paint_shadow(&self, pm: &mut Pixmap, s: f32, x: f32, y: f32, h: f32, pal: &Palette) {
+        let blur = (22.0 * s).round().max(2.0) as usize;
         let r = (RADIUS * s).round() as usize;
         let key = (s * 1000.0) as u32 ^ ((pal.shadow as u32) << 20);
         let sprite = {
@@ -1330,8 +1249,8 @@ impl Launcher {
         let Some(sprite) = sprite else { return };
         let c = blur + r + 1; // corner piece size
         let full = sprite.width() as usize; // 2c + 1 … middle column at c
-        let x0 = (MARGIN * s) as i32 - blur as i32;
-        let y0 = (MARGIN * s + 12.0 * s) as i32 - blur as i32;
+        let x0 = (x * s) as i32 - blur as i32;
+        let y0 = ((y + 9.0) * s) as i32 - blur as i32;
         let w = (WIDTH * s) as i32 + 2 * blur as i32;
         let hh = (h * s) as i32 + 2 * blur as i32;
         let cut = |x: usize, y: usize, cw: usize, ch: usize| -> Option<Pixmap> {
@@ -1348,7 +1267,7 @@ impl Launcher {
         // corners
         for (sx, sy, dx, dy) in [(0, 0, x0, y0), (full - c, 0, x0 + w - c32, y0), (0, full - c, x0, y0 + hh - c32), (full - c, full - c, x0 + w - c32, y0 + hh - c32)] {
             if let Some(p) = cut(sx, sy, c, c) {
-                layer.draw_pixmap(dx, dy, p.as_ref(), &paint_px, Transform::identity(), None);
+                pm.draw_pixmap(dx, dy, p.as_ref(), &paint_px, Transform::identity(), None);
             }
         }
         // edges, stretched from the 1px middle row / column
@@ -1356,109 +1275,77 @@ impl Launcher {
         let ew = (w - 2 * c32) as f32;
         let eh = (hh - 2 * c32) as f32;
         if let Some(p) = cut(mid, 0, 1, c) {
-            layer.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(ew, 0.0, 0.0, 1.0, (x0 + c32) as f32, y0 as f32), None);
+            pm.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(ew, 0.0, 0.0, 1.0, (x0 + c32) as f32, y0 as f32), None);
         }
         if let Some(p) = cut(mid, full - c, 1, c) {
-            layer.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(ew, 0.0, 0.0, 1.0, (x0 + c32) as f32, (y0 + hh - c32) as f32), None);
+            pm.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(ew, 0.0, 0.0, 1.0, (x0 + c32) as f32, (y0 + hh - c32) as f32), None);
         }
         if let Some(p) = cut(0, mid, c, 1) {
-            layer.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(1.0, 0.0, 0.0, eh, x0 as f32, (y0 + c32) as f32), None);
+            pm.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(1.0, 0.0, 0.0, eh, x0 as f32, (y0 + c32) as f32), None);
         }
         if let Some(p) = cut(full - c, mid, c, 1) {
-            layer.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(1.0, 0.0, 0.0, eh, (x0 + w - c32) as f32, (y0 + c32) as f32), None);
+            pm.draw_pixmap(0, 0, p.as_ref(), &paint_px, Transform::from_row(1.0, 0.0, 0.0, eh, (x0 + w - c32) as f32, (y0 + c32) as f32), None);
         }
         // the centre stays empty; cut the panel's shape out of the shadow
-        if let Some(path) = rounded_rect(MARGIN * s, MARGIN * s, WIDTH * s, h * s, RADIUS * s) {
+        if let Some(path) = rounded_rect(x * s, y * s, WIDTH * s, h * s, RADIUS * s) {
             let mut clear = paint([0, 0, 0, 255]);
             clear.blend_mode = BlendMode::Clear;
-            layer.fill_path(&path, &clear, FillRule::Winding, Transform::identity(), None);
+            pm.fill_path(&path, &clear, FillRule::Winding, Transform::identity(), None);
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn paint_field(&self, layer: &mut Pixmap, px: f32, py: f32, s: f32, apps: &Apps, fonts: &Fonts, pal: &Palette) {
+    fn paint_field(&self, pm: &mut Pixmap, px: f32, py: f32, s: f32, _apps: &Apps, fonts: &Fonts, pal: &Palette) {
         // magnifying glass
-        let gx = px + 27.0 * s;
-        let gy = py + (FIELD_H / 2.0 - 2.0) * s;
+        let gx = px + 21.0 * s;
+        let gy = py + (FIELD_H / 2.0 - 1.0) * s;
         let st = Stroke {
-            width: 2.1 * s,
+            width: 1.9 * s,
             line_cap: tiny_skia::LineCap::Round,
             ..Default::default()
         };
-        if let Some(circle) = tiny_skia::PathBuilder::from_circle(gx, gy, 7.5 * s) {
-            layer.stroke_path(&circle, &paint(pal.secondary), &st, Transform::identity(), None);
+        if let Some(circle) = tiny_skia::PathBuilder::from_circle(gx, gy, 6.4 * s) {
+            pm.stroke_path(&circle, &paint(pal.tertiary), &st, Transform::identity(), None);
         }
         let mut pb = tiny_skia::PathBuilder::new();
-        pb.move_to(gx + 5.6 * s, gy + 5.6 * s);
-        pb.line_to(gx + 11.0 * s, gy + 11.0 * s);
+        pb.move_to(gx + 4.8 * s, gy + 4.8 * s);
+        pb.line_to(gx + 9.2 * s, gy + 9.2 * s);
         if let Some(p) = pb.finish() {
-            layer.stroke_path(&p, &paint(pal.secondary), &st, Transform::identity(), None);
-        }
-
-        // the selected result's icon on the right
-        let icon_sz = 30.0;
-        let has_icon = !self.query.is_empty() && self.selected_item().is_some();
-        if has_icon {
-            if let Some(it) = self.selected_item() {
-                self.draw_item_icon(layer, it, px + (WIDTH - 18.0 - icon_sz) * s, py + (FIELD_H - icon_sz) / 2.0 * s, icon_sz, s, apps, fonts);
-            }
+            pm.stroke_path(&p, &paint(pal.tertiary), &st, Transform::identity(), None);
         }
 
         // text, clipped to the field (scrolls left to keep the caret visible)
-        let tx0 = 52.0;
-        let avail = WIDTH - tx0 - if has_icon { 18.0 + icon_sz + 14.0 } else { 20.0 };
-        let fpx = 24.0 * s;
+        let tx0 = 40.0;
+        let avail = WIDTH - tx0 - 16.0;
+        let fpx = 17.0 * s;
         let Some(mut fld) = Pixmap::new((avail * s).ceil() as u32, (FIELD_H * s).ceil() as u32) else { return };
-        let base = fonts.baseline_centered(0.0, FIELD_H * s, fpx, Weight::Light);
+        let base = fonts.baseline_centered(0.0, FIELD_H * s, fpx, Weight::Regular);
         if self.query.is_empty() {
-            fonts.draw(&mut fld, self.t("Spotlight Search", "Spotlight-Suche"), 0.0, base, fpx, Weight::Light, pal.tertiary);
+            fonts.draw(&mut fld, self.t("Search apps, files and actions…", "Apps, Dateien und Aktionen suchen …"), 0.0, base, fpx, Weight::Regular, pal.tertiary);
         } else {
-            let full_w = fonts.measure(&self.query, fpx, Weight::Light);
-            let caret_x = fonts.measure(&self.query[..self.cursor], fpx, Weight::Light);
+            let full_w = fonts.measure(&self.query, fpx, Weight::Regular);
+            let caret_x = fonts.measure(&self.query[..self.cursor], fpx, Weight::Regular);
             let room = avail * s - 4.0 * s;
             let shift = if caret_x > room { caret_x - room } else { 0.0 };
             let tx = -shift;
             if self.sel_all {
-                let sel = [pal.accent[0], pal.accent[1], pal.accent[2], 90];
-                fill_rounded(&mut fld, tx - 1.0 * s, base - 22.0 * s, full_w + 2.0 * s, 29.0 * s, 3.0 * s, sel);
+                let sel = [pal.accent[0], pal.accent[1], pal.accent[2], 80];
+                fill_rounded(&mut fld, tx - 1.0 * s, base - 15.0 * s, full_w + 2.0 * s, 21.0 * s, 3.0 * s, sel);
             }
-            fonts.draw(&mut fld, &self.query, tx, base, fpx, Weight::Light, pal.text);
-            let mut after = tx + full_w;
-            // inline completion and the kind of the top hit
+            fonts.draw(&mut fld, &self.query, tx, base, fpx, Weight::Regular, pal.text);
+            // inline completion: the rest of the top hit's name, dimmed
             if let Some(rest) = self.completion() {
-                after += fonts.draw(&mut fld, &rest, after, base, fpx, Weight::Light, pal.secondary);
+                let after = tx + full_w;
+                fonts.draw(&mut fld, &rest, after, base, fpx, Weight::Regular, pal.secondary);
             }
-            if !self.sel_all && self.cursor == self.query.len() {
-                if let Some(it) = self.selected_item() {
-                    let suffix = match &it.target {
-                        Target::Calc(a) => Some(format!(" = {}", a.value)),
-                        _ if Some(self.selected) == self.first_hit() => {
-                            let tl = it.title.to_lowercase();
-                            if tl.starts_with(&self.query.to_lowercase()) {
-                                Some(format!(" — {}", it.kind))
-                            } else {
-                                Some(format!(" — {}", it.title))
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let Some(sfx) = suffix {
-                        let left = avail * s - after - 2.0 * s;
-                        if left > 30.0 * s {
-                            let sfx = fonts.elide(&sfx, fpx, Weight::Light, left);
-                            fonts.draw(&mut fld, &sfx, after, base, fpx, Weight::Light, pal.tertiary);
-                        }
-                    }
-                }
-            }
-            if self.caret_on && !self.sel_all && self.open >= 1.0 {
-                fill_rounded(&mut fld, (tx + caret_x).round(), base - 21.0 * s, (2.0 * s).max(2.0), 27.0 * s, 1.0 * s, pal.accent);
+            if self.caret_on && !self.sel_all {
+                fill_rounded(&mut fld, (tx + caret_x).round(), base - 14.5 * s, (2.0 * s).max(2.0), 20.0 * s, 1.0 * s, pal.accent);
             }
         }
-        if self.caret_on && self.query.is_empty() && self.open >= 1.0 {
-            fill_rounded(&mut fld, 0.0, base - 21.0 * s, (2.0 * s).max(2.0), 27.0 * s, 1.0 * s, pal.accent);
+        if self.caret_on && self.query.is_empty() {
+            fill_rounded(&mut fld, 0.0, base - 14.5 * s, (2.0 * s).max(2.0), 20.0 * s, 1.0 * s, pal.accent);
         }
-        layer.draw_pixmap((px + tx0 * s) as i32, py as i32, fld.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        pm.draw_pixmap((px + tx0 * s) as i32, py as i32, fld.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     }
 
     fn paint_list(&self, pm: &mut Pixmap, s: f32, apps: &Apps, fonts: &Fonts, pal: &Palette) {
@@ -1471,51 +1358,58 @@ impl Launcher {
             match r.kind {
                 RowKind::Header(i) => {
                     let title = self.items[i].section.title(self.german);
-                    let hpx = 11.5 * s;
-                    let bl = fonts.baseline_centered((y + 4.0) * s, (r.h - 4.0) * s, hpx, Weight::Bold);
-                    fonts.draw(pm, &title, 16.0 * s, bl, hpx, Weight::Bold, pal.secondary);
+                    let hpx = 10.5 * s;
+                    let bl = fonts.baseline_centered((y + 2.0) * s, (r.h - 2.0) * s, hpx, Weight::Bold);
+                    fonts.draw(pm, &title, 15.0 * s, bl, hpx, Weight::Bold, pal.tertiary);
                 }
                 RowKind::Item(i) => {
                     let it = &self.items[i];
                     let sel = i == self.selected;
+                    let rh = r.h - 2.0;
                     if sel {
-                        fill_rounded(pm, 8.0 * s, y * s, (LIST_W - 16.0) * s, r.h * s, 7.0 * s, pal.accent);
+                        fill_rounded(pm, 8.0 * s, (y + 1.0) * s, (WIDTH - 16.0) * s, rh * s, 6.0 * s, pal.sel_bg);
+                        stroke_rounded(pm, 8.5 * s, (y + 1.5) * s, (WIDTH - 17.0) * s, (rh - 1.0) * s, 5.5 * s, 1.0 * s, pal.sel_edge);
                     } else if self.hover == Some(i) {
-                        fill_rounded(pm, 8.0 * s, y * s, (LIST_W - 16.0) * s, r.h * s, 7.0 * s, pal.hover);
+                        fill_rounded(pm, 8.0 * s, (y + 1.0) * s, (WIDTH - 16.0) * s, rh * s, 6.0 * s, pal.hover);
                     }
                     let big = r.h >= TOP_ROW_H;
-                    let isz = if big { 32.0 } else { 20.0 };
-                    let ix = 16.0;
+                    let isz = if big { 24.0 } else { 18.0 };
+                    let ix = 14.0;
                     self.draw_item_icon(pm, it, ix * s, (y + (r.h - isz) / 2.0) * s, isz, s, apps, fonts);
                     let tx = ix + isz + 10.0;
-                    let maxw = (LIST_W - tx - 16.0) * s;
-                    let (tc, sc) = if sel { (pal.sel_text, pal.sel_secondary) } else { (pal.text, pal.secondary) };
+                    let mut right = WIDTH - 14.0;
                     if big {
-                        let tpx = 14.0 * s;
-                        let spx = 11.5 * s;
+                        let tpx = 13.5 * s;
+                        let spx = 10.5 * s;
+                        let maxw = (right - tx) * s;
                         let title = fonts.elide(&it.title, tpx, Weight::Regular, maxw);
-                        fonts.draw(pm, &title, tx * s, (y + 20.0) * s, tpx, Weight::Regular, tc);
+                        fonts.draw(pm, &title, tx * s, (y + 18.0) * s, tpx, Weight::Regular, pal.text);
                         let sub = match &it.target {
                             Target::Calc(a) => a.expr.clone(),
                             _ => it.kind.clone(),
                         };
                         let sub = fonts.elide(&sub, spx, Weight::Regular, maxw);
-                        fonts.draw(pm, &sub, tx * s, (y + 35.0) * s, spx, Weight::Regular, sc);
+                        fonts.draw(pm, &sub, tx * s, (y + 33.0) * s, spx, Weight::Regular, pal.secondary);
                     } else {
-                        let tpx = 13.5 * s;
+                        let tpx = 13.0 * s;
                         let bl = fonts.baseline_centered(y * s, r.h * s, tpx, Weight::Regular);
-                        // a file's folder after its name, dimmed
-                        let title = fonts.elide(&it.title, tpx, Weight::Regular, maxw);
-                        let w = fonts.draw(pm, &title, tx * s, bl, tpx, Weight::Regular, tc);
+                        // a file's folder, right-aligned and dimmed
                         if let Some((path, _)) = it.file() {
                             let parent = parent_name(path, self.german);
-                            let left = maxw - w - 8.0 * s;
-                            if left > 40.0 * s && !parent.is_empty() {
-                                let ppx = 12.0 * s;
-                                let p = fonts.elide(&format!("— {parent}"), ppx, Weight::Regular, left);
-                                fonts.draw(pm, &p, tx * s + w + 6.0 * s, bl, ppx, Weight::Regular, sc);
+                            if !parent.is_empty() {
+                                let ppx = 10.5 * s;
+                                let ptext = format!("— {parent}");
+                                let pw = fonts.measure(&ptext, ppx, Weight::Regular);
+                                if pw < (right - tx - 70.0) * s {
+                                    right -= pw / s + 10.0;
+                                    let p = fonts.elide(&ptext, ppx, Weight::Regular, pw + 2.0 * s);
+                                    fonts.draw(pm, &p, right * s, bl, ppx, Weight::Regular, pal.tertiary);
+                                }
                             }
                         }
+                        let maxw = (right - tx) * s;
+                        let title = fonts.elide(&it.title, tpx, Weight::Regular, maxw);
+                        fonts.draw(pm, &title, tx * s, bl, tpx, Weight::Regular, pal.text);
                     }
                 }
             }
@@ -1525,225 +1419,74 @@ impl Launcher {
             let track = view_h - 12.0;
             let bar = (view_h / self.content_h * track).max(28.0);
             let pos = self.scroll / (self.content_h - view_h) * (track - bar);
-            fill_rounded(pm, (LIST_W - 7.0) * s, (6.0 + pos) * s, 3.5 * s, bar * s, 1.75 * s, pal.scrollbar);
+            fill_rounded(pm, (WIDTH - 7.0) * s, (6.0 + pos) * s, 3.0 * s, bar * s, 1.5 * s, pal.scrollbar);
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint_preview(&self, pm: &mut Pixmap, s: f32, apps: &Apps, fonts: &Fonts, pal: &Palette, index: Option<&FileIndex>, usage: &Usage) {
-        let Some(it) = self.selected_item() else { return };
-        let w = pm.width() as f32 / s;
-        let cx = w / 2.0;
-        let pad = 26.0;
-        let german = self.german;
-
-        // centred title + subtitle under a hero area
-        let hero_bottom;
-        let mut subtitle = it.kind.clone();
-        let mut meta: Vec<(String, String)> = Vec::new();
-        let mut body: Option<String> = None;
-        let mut hint: Option<String> = None;
-
+    /// Keycaps shown in the footer for the selected result.
+    fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        let Some(it) = self.selected_item() else { return Vec::new() };
+        let t = |en, de| self.t(en, de);
         match &it.target {
-            Target::Calc(a) => {
-                // big result, the expression above it
-                let epx = 15.0 * s;
-                let e = fonts.elide(&a.expr, epx, Weight::Regular, (w - 2.0 * pad) * s);
-                let ew = fonts.measure(&e, epx, Weight::Regular);
-                fonts.draw(pm, &e, cx * s - ew / 2.0, 118.0 * s, epx, Weight::Regular, pal.secondary);
-                let mut vpx = 40.0 * s;
-                let v = format!("= {}", a.value);
-                while fonts.measure(&v, vpx, Weight::Light) > (w - 2.0 * pad) * s && vpx > 16.0 * s {
-                    vpx -= 2.0 * s;
-                }
-                let vw = fonts.measure(&v, vpx, Weight::Light);
-                fonts.draw(pm, &v, cx * s - vw / 2.0, 172.0 * s, vpx, Weight::Light, pal.text);
-                let tpx = 12.0 * s;
-                let kind = if a.kind == "Calculator" { self.t("Calculator", "Rechner").to_string() } else { a.kind.to_string() };
-                let kw = fonts.measure(&kind, tpx, Weight::Bold);
-                fonts.draw(pm, &kind, cx * s - kw / 2.0, 70.0 * s, tpx, Weight::Bold, pal.tertiary);
-                hint = Some(self.t("⏎ Copy result", "⏎ Ergebnis kopieren").into());
-                self.paint_hint(pm, s, fonts, pal, hint.as_deref());
-                return;
-            }
-            Target::File(_) | Target::Path { .. } => {
-                let (path, is_dir) = it.file().unwrap_or(("", false));
-                let md = std::fs::metadata(path).ok();
-                match self.previews.get(path) {
-                    Some(Preview::Image(img)) => {
-                        // fit into the hero box, rounded, with a hairline
-                        let (bw, bh) = (w - 2.0 * pad, 186.0);
-                        let (iw, ih) = (img.width() as f32 / s, img.height() as f32 / s);
-                        let k = (bw / iw).min(bh / ih).min(1.0 * 2.0);
-                        let (dw, dh) = (iw * k, ih * k);
-                        let dx = cx - dw / 2.0;
-                        let dy = 22.0 + (bh - dh) / 2.0;
-                        draw_image_rounded(pm, img, dx * s, dy * s, dw * s, dh * s, 6.0 * s);
-                        stroke_rounded(pm, dx * s, dy * s, dw * s, dh * s, 6.0 * s, 1.0 * s, pal.sep);
-                    }
-                    Some(Preview::Text(text)) => {
-                        // a little sheet of paper with the first lines
-                        let (bx, by, bw, bh) = (pad, 18.0, w - 2.0 * pad, 196.0);
-                        fill_rounded(pm, bx * s, by * s, bw * s, bh * s, 8.0 * s, pal.paper);
-                        stroke_rounded(pm, bx * s, by * s, bw * s, bh * s, 8.0 * s, 1.0 * s, pal.sep);
-                        let lpx = 10.5 * s;
-                        let lh = 14.0;
-                        let max_lines = ((bh - 20.0) / lh) as usize;
-                        let mut yy = by + 20.0;
-                        for line in text.lines().take(max_lines) {
-                            let l = fonts.elide(line, lpx, Weight::Regular, (bw - 24.0) * s);
-                            fonts.draw(pm, &l, (bx + 12.0) * s, yy * s, lpx, Weight::Regular, pal.paper_text);
-                            yy += lh;
-                        }
-                    }
-                    _ => {
-                        let names = file_icons(path, is_dir, index);
-                        let isz = 128.0;
-                        draw_named_icon(pm, apps, &names, (cx - isz / 2.0) * s, 40.0 * s, isz, s);
-                    }
-                }
-                hero_bottom = 226.0;
-                if let Some(Preview::Folder(n)) = self.previews.get(path) {
-                    subtitle = if german {
-                        format!("{} – {n} {}", it.kind, if *n == 1 { "Objekt" } else { "Objekte" })
-                    } else {
-                        format!("{} – {n} {}", it.kind, if *n == 1 { "item" } else { "items" })
-                    };
-                }
-                meta.push((self.t("Kind", "Art").into(), it.kind.clone()));
-                if let Some(m) = md.as_ref().filter(|_| !is_dir) {
-                    meta.push((self.t("Size", "Größe").into(), files::human_size(m.len(), german)));
-                }
-                meta.push((self.t("Where", "Ort").into(), pretty_parent(path, german)));
-                if let Some(m) = &md {
-                    if let Some(t) = m.created().ok().and_then(secs_of) {
-                        meta.push((self.t("Created", "Erstellt").into(), pretty_date(t, german)));
-                    }
-                    if let Some(t) = m.modified().ok().and_then(secs_of) {
-                        meta.push((self.t("Modified", "Geändert").into(), pretty_date(t, german)));
-                    }
-                }
-                let opened = index.and_then(|ix| ix.recent.get(path).copied()).or_else(|| usage.last_used(&format!("file:{path}")));
-                if let Some(t) = opened {
-                    meta.push((self.t("Last opened", "Zuletzt geöffnet").into(), pretty_date(t, german)));
-                }
-                hint = Some(self.t("⏎ Open    ⌘⏎ Show in folder    ⌘C Copy path", "⏎ Öffnen    ⌘⏎ Im Ordner zeigen    ⌘C Pfad kopieren").into());
-            }
-            Target::App(i) => {
-                let e = &apps.entries[*i];
-                let isz = 112.0;
-                draw_named_icon(pm, apps, &[e.icon.clone().unwrap_or_default(), "application-x-executable".into()], (cx - isz / 2.0) * s, 46.0 * s, isz, s);
-                hero_bottom = 184.0;
-                if let Some(g) = &e.generic_name {
-                    subtitle = g.clone();
-                }
-                body = e.comment.clone();
-                meta.push((self.t("Kind", "Art").into(), self.t("Application", "Programm").into()));
-                if let Some(cat) = e.categories.iter().find_map(|c| category_label(c, german)) {
-                    meta.push((self.t("Category", "Kategorie").into(), cat.into()));
-                }
-                if let Some(t) = usage.last_used(&it.key(apps)) {
-                    meta.push((self.t("Last opened", "Zuletzt geöffnet").into(), pretty_date(t, german)));
-                }
-                if let Some(c) = e.command() {
-                    meta.push((self.t("Command", "Befehl").into(), c));
-                }
-            }
-            Target::Setting(p) => {
-                let isz = 96.0;
-                self.draw_tile(pm, apps, p.icon, p.color, (cx - isz / 2.0) * s, 54.0 * s, isz, s, fonts, &it.title);
-                hero_bottom = 184.0;
-                body = Some(if german {
-                    format!("Öffnet „{}“ in den Systemeinstellungen.", it.title)
-                } else {
-                    format!("Opens {} in System Settings.", it.title)
-                });
-            }
-            Target::Command(c) => {
-                let isz = 96.0;
-                self.draw_tile(pm, apps, c.icon, c.color, (cx - isz / 2.0) * s, 54.0 * s, isz, s, fonts, &it.title);
-                hero_bottom = 184.0;
-                body = Some(tr(german, c.about_en, c.about_de).into());
-            }
-            Target::Url(u) => {
-                let isz = 96.0;
-                draw_named_icon(pm, apps, &["web-browser".into(), "internet-web-browser".into(), "applications-internet".into()], (cx - isz / 2.0) * s, 54.0 * s, isz, s);
-                hero_bottom = 184.0;
-                body = Some(u.clone());
-                subtitle = self.t("Open in your browser", "Im Browser öffnen").into();
-            }
-            Target::Web(q) => {
-                let isz = 96.0;
-                draw_named_icon(pm, apps, &["web-browser".into(), "internet-web-browser".into(), "applications-internet".into()], (cx - isz / 2.0) * s, 54.0 * s, isz, s);
-                hero_bottom = 184.0;
-                body = Some(if german {
-                    format!("Sucht „{q}“ mit DuckDuckGo in deinem Browser.")
-                } else {
-                    format!("Searches DuckDuckGo for “{q}” in your browser.")
-                });
-                hint = Some(self.t("⏎ Search    ⌘B from anywhere", "⏎ Suchen    ⌘B von überall").into());
-            }
+            Target::Calc(_) => vec![("⏎", t("Copy Result", "Ergebnis kopieren"))],
+            Target::File(_) | Target::Path { .. } => vec![
+                ("⏎", t("Open", "Öffnen")),
+                ("⌘⏎", t("Show in Folder", "Im Ordner zeigen")),
+                ("⌘C", t("Copy Path", "Pfad kopieren")),
+            ],
+            Target::App(_) => vec![("⏎", t("Open", "Öffnen"))],
+            Target::Setting(_) => vec![("⏎", t("Open Settings", "Einstellungen öffnen"))],
+            Target::Command(_) => vec![("⏎", t("Run", "Ausführen"))],
+            Target::Url(_) => vec![("⏎", t("Open in Browser", "Im Browser öffnen"))],
+            Target::Web(_) => vec![("⏎", t("Search the Web", "Im Web suchen"))],
         }
-
-        // title + subtitle
-        let tpx = 17.0 * s;
-        let mut y = hero_bottom + 24.0;
-        let title_lines = fonts.wrap(&self.preview_title(it), tpx, Weight::Bold, (w - 2.0 * pad) * s, 2);
-        for l in &title_lines {
-            let lw = fonts.measure(l, tpx, Weight::Bold);
-            fonts.draw(pm, l, cx * s - lw / 2.0, y * s, tpx, Weight::Bold, pal.text);
-            y += 21.0;
-        }
-        let spx = 12.0 * s;
-        let sub = fonts.elide(&subtitle, spx, Weight::Regular, (w - 2.0 * pad) * s);
-        let sw = fonts.measure(&sub, spx, Weight::Regular);
-        fonts.draw(pm, &sub, cx * s - sw / 2.0, (y - 2.0) * s, spx, Weight::Regular, pal.secondary);
-        y += 16.0;
-
-        if let Some(b) = body {
-            let bpx = 12.5 * s;
-            for l in fonts.wrap(&b, bpx, Weight::Regular, (w - 2.0 * pad - 10.0) * s, 3) {
-                let lw = fonts.measure(&l, bpx, Weight::Regular);
-                fonts.draw(pm, &l, cx * s - lw / 2.0, (y + 6.0) * s, bpx, Weight::Regular, pal.text_soft);
-                y += 17.0;
-            }
-            y += 4.0;
-        }
-
-        // metadata: right-aligned labels, left-aligned values
-        if !meta.is_empty() {
-            y += 8.0;
-            fill_rounded(pm, pad * s, y * s, (w - 2.0 * pad) * s, (1.0 * s).max(1.0), 0.0, pal.sep);
-            y += 20.0;
-            let mpx = 11.5 * s;
-            let col = pad + 96.0;
-            let limit = pm.height() as f32 / s - if hint.is_some() { 34.0 } else { 12.0 };
-            for (k, v) in meta {
-                if y > limit {
-                    break;
-                }
-                let kw = fonts.measure(&k, mpx, Weight::Regular);
-                fonts.draw(pm, &k, (col - 10.0) * s - kw, y * s, mpx, Weight::Regular, pal.secondary);
-                let vv = fonts.elide(&v, mpx, Weight::Regular, (w - col - pad) * s);
-                fonts.draw(pm, &vv, col * s, y * s, mpx, Weight::Regular, pal.text);
-                y += 17.0;
-            }
-        }
-        self.paint_hint(pm, s, fonts, pal, hint.as_deref());
     }
 
-    fn preview_title(&self, it: &Item) -> String {
-        it.title.clone()
+    /// A quiet action strip at the bottom: keycaps on the left, Esc on the right.
+    fn paint_footer(&self, pm: &mut Pixmap, x: f32, y: f32, h: f32, s: f32, fonts: &Fonts, pal: &Palette) {
+        if h < FIELD_H + 1.0 + FOOTER_H {
+            return;
+        }
+        let fy = y + h - FOOTER_H;
+        fill_rounded(pm, x * s, fy * s, WIDTH * s, (1.0 * s).max(1.0), 0.0, pal.sep);
+        let base = fonts.baseline_centered(fy * s, FOOTER_H * s, 10.5 * s, Weight::Regular);
+        let hints = self.hints();
+        let mut cx = x + 13.0;
+        if hints.is_empty() {
+            let label = if self.query.trim().is_empty() {
+                self.t("Type to search", "Zum Suchen tippen")
+            } else {
+                self.t("No Results", "Keine Treffer")
+            };
+            fonts.draw(pm, label, cx * s, base, 11.0 * s, Weight::Regular, pal.tertiary);
+        } else {
+            for (key, label) in hints {
+                cx = self.keycap(pm, fonts, pal, cx, fy, s, key);
+                let lw = fonts.measure(label, 10.5 * s, Weight::Regular);
+                fonts.draw(pm, label, cx * s, base, 10.5 * s, Weight::Regular, pal.secondary);
+                cx += lw / s + 14.0;
+            }
+        }
+        // Esc, right-aligned
+        let esc = "esc";
+        let label = self.t("Close", "Schließen");
+        let kw = fonts.measure(esc, 9.5 * s, Weight::Bold) + 8.0 * s;
+        let lw = fonts.measure(label, 10.5 * s, Weight::Regular);
+        let sx = x + WIDTH - 13.0 - (kw + 5.0 * s + lw) / s;
+        let kx = self.keycap(pm, fonts, pal, sx, fy, s, esc);
+        fonts.draw(pm, label, kx * s, base, 10.5 * s, Weight::Regular, pal.secondary);
     }
 
-    fn paint_hint(&self, pm: &mut Pixmap, s: f32, fonts: &Fonts, pal: &Palette, hint: Option<&str>) {
-        let Some(h) = hint else { return };
-        let w = pm.width() as f32;
-        let y = pm.height() as f32 - 14.0 * s;
-        let hpx = 11.0 * s;
-        let h = fonts.elide(h, hpx, Weight::Regular, w - 24.0 * s);
-        let hw = fonts.measure(&h, hpx, Weight::Regular);
-        fonts.draw(pm, &h, (w - hw) / 2.0, y, hpx, Weight::Regular, pal.tertiary);
+    /// Draw one keycap at `cx`; returns the x after it (plus a small gap).
+    fn keycap(&self, pm: &mut Pixmap, fonts: &Fonts, pal: &Palette, cx: f32, fy: f32, s: f32, key: &str) -> f32 {
+        let kpx = 9.5 * s;
+        let kw = fonts.measure(key, kpx, Weight::Bold) + 8.0 * s;
+        let kh = 15.0 * s;
+        let top = fy * s + (FOOTER_H * s - kh) / 2.0;
+        fill_rounded(pm, cx * s, top, kw, kh, 3.5 * s, pal.keycap);
+        let bl = fonts.baseline_centered(top, kh, kpx, Weight::Bold);
+        fonts.draw(pm, key, cx * s + 4.0 * s, bl, kpx, Weight::Bold, pal.secondary);
+        cx + (kw / s).round() + 5.0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1854,14 +1597,6 @@ fn name_score(name: &str, q: &str) -> Option<i64> {
     None
 }
 
-/// Section → file class (for typed paths).
-fn c_of(sec: Section) -> Option<FileClass> {
-    match sec {
-        Section::Files(c) => Some(c),
-        _ => None,
-    }
-}
-
 fn web_search_cmd(q: &str) -> String {
     format!("xdg-open {}", sh_quote(&format!("https://duckduckgo.com/?q={}", url_encode(q))))
 }
@@ -1922,25 +1657,6 @@ fn draw_named_icon(pm: &mut Pixmap, apps: &Apps, names: &[String], x: f32, y: f3
         }
     }
     false
-}
-
-fn draw_image_rounded(pm: &mut Pixmap, img: &Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32) {
-    let Some(path) = rounded_rect(x, y, w, h, r) else { return };
-    let kx = w / img.width() as f32;
-    let ky = h / img.height() as f32;
-    let pattern = tiny_skia::Pattern::new(
-        img.as_ref(),
-        tiny_skia::SpreadMode::Pad,
-        FilterQuality::Bicubic,
-        1.0,
-        Transform::from_row(kx, 0.0, 0.0, ky, x, y),
-    );
-    let p = tiny_skia::Paint {
-        shader: pattern,
-        anti_alias: true,
-        ..Default::default()
-    };
-    pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
 }
 
 /// One blurred rounded square: `blur` px of soft edge around a (2r+2)² box.
@@ -2006,34 +1722,6 @@ fn box_blur(a: &mut [f32], w: usize, h: usize, r: usize) {
     }
 }
 
-fn secs_of(t: SystemTime) -> Option<i64> {
-    t.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
-}
-
-/// "Today at 14:03", "Yesterday at 09:12", "3 March 2025 at 18:00".
-pub fn pretty_date(secs: i64, german: bool) -> String {
-    use chrono::{Datelike, Local, TimeZone, Timelike};
-    let Some(t) = Local.timestamp_opt(secs, 0).single() else { return String::new() };
-    let now = Local::now();
-    let hm = format!("{:02}:{:02}", t.hour(), t.minute());
-    let days = now.date_naive().signed_duration_since(t.date_naive()).num_days();
-    let at = if german { "um" } else { "at" };
-    match days {
-        0 => format!("{} {at} {hm}", tr(german, "Today", "Heute")),
-        1 => format!("{} {at} {hm}", tr(german, "Yesterday", "Gestern")),
-        _ => {
-            const EN: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-            const DE: [&str; 12] = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
-            let m = (t.month0() as usize).min(11);
-            if german {
-                format!("{}. {} {} {at} {hm}", t.day(), DE[m], t.year())
-            } else {
-                format!("{} {} {} {at} {hm}", t.day(), EN[m], t.year())
-            }
-        }
-    }
-}
-
 /// The name of the folder that holds `path` ("Downloads", "Home").
 fn parent_name(path: &str, german: bool) -> String {
     let parent = std::path::Path::new(path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2043,41 +1731,6 @@ fn parent_name(path: &str, german: bool) -> String {
     parent.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("/").to_string()
 }
 
-/// "Home › Documents › Notes" for the folder that holds `path`.
-fn pretty_parent(path: &str, german: bool) -> String {
-    let parent = std::path::Path::new(path).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    let home = files::home().to_string_lossy().into_owned();
-    let home_label = tr(german, "Home", "Benutzerordner");
-    let rest = if parent == home {
-        return home_label.into();
-    } else if let Some(r) = parent.strip_prefix(&(home.clone() + "/")) {
-        format!("{home_label}/{r}")
-    } else {
-        parent.trim_start_matches('/').to_string()
-    };
-    if rest.is_empty() {
-        return "/".into();
-    }
-    rest.split('/').collect::<Vec<_>>().join(" › ")
-}
-
-fn category_label(c: &str, german: bool) -> Option<&'static str> {
-    Some(match c {
-        "AudioVideo" | "Audio" | "Video" => tr(german, "Audio & Video", "Audio & Video"),
-        "Development" => tr(german, "Developer Tools", "Entwicklung"),
-        "Education" => tr(german, "Education", "Bildung"),
-        "Game" => tr(german, "Games", "Spiele"),
-        "Graphics" => tr(german, "Graphics & Design", "Grafik & Design"),
-        "Network" => tr(german, "Internet", "Internet"),
-        "Office" => tr(german, "Productivity", "Büro"),
-        "Science" => tr(german, "Science", "Wissenschaft"),
-        "Settings" => tr(german, "Settings", "Einstellungen"),
-        "System" => tr(german, "System", "System"),
-        "Utility" => tr(german, "Utilities", "Dienstprogramme"),
-        _ => return None,
-    })
-}
-
 /// Colours for the panel, from the shell theme.
 struct Palette {
     bg: Rgba,
@@ -2085,16 +1738,14 @@ struct Palette {
     outer: Rgba,
     sep: Rgba,
     text: Rgba,
-    text_soft: Rgba,
     secondary: Rgba,
     tertiary: Rgba,
     accent: Rgba,
     hover: Rgba,
-    sel_text: Rgba,
-    sel_secondary: Rgba,
+    sel_bg: Rgba,
+    sel_edge: Rgba,
+    keycap: Rgba,
     scrollbar: Rgba,
-    paper: Rgba,
-    paper_text: Rgba,
     shadow: u8,
 }
 
@@ -2106,41 +1757,37 @@ impl Palette {
         let with = |c: Rgba, a: u8| [c[0], c[1], c[2], a];
         if dark {
             Palette {
-                bg: if solid { [40, 40, 42, 255] } else { [34, 34, 36, 196] },
-                inner: [255, 255, 255, 34],
-                outer: [0, 0, 0, 160],
-                sep: [255, 255, 255, 26],
+                bg: if solid { [38, 38, 40, 255] } else { [28, 28, 30, 224] },
+                inner: [255, 255, 255, 30],
+                outer: [0, 0, 0, 150],
+                sep: [255, 255, 255, 24],
                 text: t,
-                text_soft: with(t, 205),
-                secondary: with(t, 140),
-                tertiary: with(t, 92),
+                secondary: with(t, 150),
+                tertiary: with(t, 100),
                 accent: theme.menu_selection,
-                hover: [255, 255, 255, 18],
-                sel_text: theme.menu_selection_text,
-                sel_secondary: [255, 255, 255, 190],
-                scrollbar: [255, 255, 255, 70],
-                paper: [28, 28, 30, 255],
-                paper_text: [220, 220, 224, 230],
-                shadow: 150,
+                hover: [255, 255, 255, 14],
+                sel_bg: [255, 255, 255, 24],
+                sel_edge: [255, 255, 255, 34],
+                keycap: [255, 255, 255, 20],
+                scrollbar: [255, 255, 255, 60],
+                shadow: 145,
             }
         } else {
             Palette {
-                bg: if solid { [244, 244, 246, 255] } else { [248, 248, 250, 196] },
-                inner: [255, 255, 255, 140],
-                outer: [0, 0, 0, 42],
-                sep: [0, 0, 0, 22],
+                bg: if solid { [246, 246, 248, 255] } else { [250, 250, 252, 230] },
+                inner: [255, 255, 255, 150],
+                outer: [0, 0, 0, 38],
+                sep: [0, 0, 0, 20],
                 text: t,
-                text_soft: with(t, 200),
-                secondary: with(t, 135),
-                tertiary: with(t, 85),
+                secondary: with(t, 145),
+                tertiary: with(t, 95),
                 accent: theme.menu_selection,
-                hover: [0, 0, 0, 12],
-                sel_text: theme.menu_selection_text,
-                sel_secondary: [255, 255, 255, 200],
-                scrollbar: [0, 0, 0, 60],
-                paper: [255, 255, 255, 255],
-                paper_text: [40, 40, 44, 230],
-                shadow: 95,
+                hover: [0, 0, 0, 10],
+                sel_bg: [0, 0, 0, 16],
+                sel_edge: [0, 0, 0, 22],
+                keycap: [0, 0, 0, 12],
+                scrollbar: [0, 0, 0, 52],
+                shadow: 90,
             }
         }
     }
@@ -2214,10 +1861,9 @@ mod tests {
     #[test]
     fn dates_and_paths() {
         let home = files::home().to_string_lossy().into_owned();
-        assert_eq!(pretty_parent(&format!("{home}/a.txt"), false), "Home");
-        assert_eq!(pretty_parent(&format!("{home}/Docs/x/a.txt"), false), "Home › Docs › x");
-        assert_eq!(pretty_parent("/etc/fstab", false), "etc");
-        assert!(pretty_date(now_secs(), false).starts_with("Today at"));
+        assert_eq!(parent_name(&format!("{home}/a.txt"), false), "Home");
+        assert_eq!(parent_name(&format!("{home}/Docs/x/a.txt"), false), "x");
+        assert_eq!(parent_name("/etc/fstab", false), "etc");
     }
 }
 
@@ -2243,21 +1889,11 @@ mod shots {
             for (qi, (q, sel)) in queries.iter().enumerate() {
                 let mut l = Launcher::new("", 1, std::env::var("LANG").map(|v| v.starts_with("de")).unwrap_or(false));
                 l.insert(q);
-                l.update(&apps, Some(&ix), &usage);
+                l.update(&apps, Some(&ix), &usage, &SearchSettings::default());
                 l.select(*sel);
-                l.open = 1.0;
                 l.shown_h = l.target_height();
                 l.caret_on = true;
-                if let Some((path, is_dir, class)) = l.wanted_preview() {
-                    let p = match files::load_preview(&path, is_dir, class, 880) {
-                        files::PreviewData::Image { w, h, rgba } => Preview::Image(Rc::new(Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(w, h).unwrap()).unwrap())),
-                        files::PreviewData::Text(t) => Preview::Text(t),
-                        files::PreviewData::Folder { items } => Preview::Folder(items),
-                        files::PreviewData::Nothing => Preview::Nothing,
-                    };
-                    l.previews.insert(path, p);
-                }
-                let (w, h) = (1000.0, 620.0);
+                let (w, h) = (840.0, 620.0);
                 let mut pm = Pixmap::new((w * scale) as u32, (h * scale) as u32).unwrap();
                 // a wallpaper-ish backdrop
                 let (a, b) = if dark { ([30, 40, 70], [80, 40, 90]) } else { ([120, 170, 230], [240, 180, 200]) };
@@ -2272,7 +1908,7 @@ mod shots {
                         d[i..i + 4].copy_from_slice(&row);
                     }
                 }
-                l.paint(&mut pm, (w - WIDTH) / 2.0, 60.0, scale, &apps, &fonts, &theme, Some(&ix), &usage);
+                l.paint(&mut pm, (w - WIDTH) / 2.0, 60.0, scale, &apps, &fonts, &theme);
                 pm.save_png(format!("{dir}/{mode}-{qi:02}.png")).unwrap();
             }
         }

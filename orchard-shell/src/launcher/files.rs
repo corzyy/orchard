@@ -492,6 +492,19 @@ pub struct FileHit {
     pub class: FileClass,
 }
 
+/// Case-insensitive substring test that does not allocate for ASCII needles
+/// (the common case when matching a query word against a parent path).
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.is_ascii() {
+        haystack.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    } else {
+        haystack.to_lowercase().contains(needle)
+    }
+}
+
 /// Search file names. Every query word has to match the name (or, for words
 /// after the first, the parent folder names), so "notes rust" finds
 /// `~/rust/notes.md`.
@@ -523,7 +536,7 @@ pub fn search(index: &FileIndex, query: &str, limit: usize) -> Vec<FileHit> {
                 } else {
                     250
                 }
-            } else if i > 0 && rel.to_lowercase().contains(w) {
+            } else if i > 0 && contains_ci(rel, w) {
                 120
             } else {
                 ok = false;
@@ -581,166 +594,9 @@ pub fn search(index: &FileIndex, query: &str, limit: usize) -> Vec<FileHit> {
         .collect()
 }
 
-// ---- thumbnails --------------------------------------------------------------
-
-/// The freedesktop thumbnail of a file, if a file manager already made one.
-pub fn cached_thumbnail(path: &str) -> Option<PathBuf> {
-    let hash = md5_hex(file_uri(path).as_bytes());
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".cache"))
-        .join("thumbnails");
-    let src_mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-    for size in ["xx-large", "x-large", "large", "normal"] {
-        let p = base.join(size).join(format!("{hash}.png"));
-        if let Ok(m) = std::fs::metadata(&p) {
-            // a thumbnail older than the file is stale
-            if m.modified().map(|t| t >= src_mtime).unwrap_or(true) {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-/// Data for the preview pane, loaded off the main thread.
-pub enum PreviewData {
-    /// premultiplied RGBA
-    Image { w: u32, h: u32, rgba: Vec<u8> },
-    Text(String),
-    Folder { items: usize },
-    Nothing,
-}
-
-/// Load what the preview pane shows for a file. `max` is the largest edge in px.
-pub fn load_preview(path: &str, is_dir: bool, class: FileClass, max: u32) -> PreviewData {
-    if is_dir {
-        let items = std::fs::read_dir(path).map(|rd| rd.take(100_000).count()).unwrap_or(0);
-        return PreviewData::Folder { items };
-    }
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let try_image = |p: &Path| -> Option<PreviewData> {
-        let img = image::open(p).ok()?;
-        let img = if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img };
-        let rgba = img.to_rgba8();
-        let (w, h) = rgba.dimensions();
-        let mut data = rgba.into_raw();
-        for px in data.chunks_exact_mut(4) {
-            let a = px[3] as u32;
-            px[0] = (px[0] as u32 * a / 255) as u8;
-            px[1] = (px[1] as u32 * a / 255) as u8;
-            px[2] = (px[2] as u32 * a / 255) as u8;
-        }
-        Some(PreviewData::Image { w, h, rgba: data })
-    };
-    if let Some(t) = cached_thumbnail(path) {
-        if let Some(p) = try_image(&t) {
-            return p;
-        }
-    }
-    let lc = path.to_lowercase();
-    if class == FileClass::Image && size < 40_000_000 && [".png", ".jpg", ".jpeg", ".webp"].iter().any(|e| lc.ends_with(e)) {
-        if let Some(p) = try_image(Path::new(path)) {
-            return p;
-        }
-    }
-    if matches!(class, FileClass::Document | FileClass::Code) || size < 64 * 1024 {
-        if let Some(text) = read_text_head(path) {
-            return PreviewData::Text(text);
-        }
-    }
-    PreviewData::Nothing
-}
-
-/// The start of a text file, or `None` if it looks binary.
-fn read_text_head(path: &str) -> Option<String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 6 * 1024];
-    let n = f.read(&mut buf).ok()?;
-    buf.truncate(n);
-    if buf.contains(&0) {
-        return None;
-    }
-    // cut a partial UTF-8 sequence at the end
-    let text = match std::str::from_utf8(&buf) {
-        Ok(t) => t.to_string(),
-        Err(e) if e.valid_up_to() + 4 >= buf.len() => String::from_utf8_lossy(&buf[..e.valid_up_to()]).into_owned(),
-        Err(_) => return None,
-    };
-    let text = text.replace('\t', "    ").replace('\r', "");
-    (!text.trim().is_empty()).then_some(text)
-}
-
-/// Item count / size text helpers.
-pub fn human_size(bytes: u64, german: bool) -> String {
-    // Finder uses decimal units
-    let units = ["bytes", "KB", "MB", "GB", "TB"];
-    if bytes < 1000 {
-        return format!("{bytes} {}", if german { "Byte" } else { "bytes" });
-    }
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1000.0 && u < units.len() - 1 {
-        v /= 1000.0;
-        u += 1;
-    }
-    let s = if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") };
-    let s = if german { s.replace('.', ",") } else { s };
-    format!("{s} {}", units[u])
-}
-
-// ---- md5 (thumbnail file names) -------------------------------------------------
-
-pub fn md5_hex(input: &[u8]) -> String {
-    const S: [u32; 64] = [
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14,
-        20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6,
-        10, 15, 21,
-    ];
-    let k: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32).collect();
-    let (mut a0, mut b0, mut c0, mut d0) = (0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32);
-    let mut msg = input.to_vec();
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_le_bytes());
-    for chunk in msg.chunks_exact(64) {
-        let m: Vec<u32> = chunk.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
-        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
-        for i in 0..64 {
-            let (f, g) = match i / 16 {
-                0 => ((b & c) | (!b & d), i),
-                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | !d), (7 * i) % 16),
-            };
-            let f = f.wrapping_add(a).wrapping_add(k[i]).wrapping_add(m[g]);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f.rotate_left(S[i]));
-        }
-        a0 = a0.wrapping_add(a);
-        b0 = b0.wrapping_add(b);
-        c0 = c0.wrapping_add(c);
-        d0 = d0.wrapping_add(d);
-    }
-    [a0, b0, c0, d0].iter().flat_map(|v| v.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn md5_known_values() {
-        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(md5_hex(b"The quick brown fox jumps over the lazy dog"), "9e107d9d372bb6826bd81d3542a419d6");
-        assert_eq!(md5_hex(b"file:///home/jakob/a.png"), md5_hex(b"file:///home/jakob/a.png"));
-    }
 
     #[test]
     fn uri_and_decode() {
@@ -754,12 +610,5 @@ mod tests {
             assert_eq!(read_mime_comment("text/markdown", "").as_deref(), Some("Markdown document"));
             assert!(read_mime_comment("text/markdown", "de").is_some());
         }
-    }
-
-    #[test]
-    fn sizes() {
-        assert_eq!(human_size(512, false), "512 bytes");
-        assert_eq!(human_size(1_500_000, false), "1.5 MB");
-        assert_eq!(human_size(25_000_000, true), "25 MB");
     }
 }
