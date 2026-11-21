@@ -4,7 +4,7 @@ members = ["orchard", "orchard-shell", "orchard-config", "orchard-settings", "or
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [profile.dev]
 opt-level = 1

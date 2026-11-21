@@ -1,15 +1,30 @@
 # Orchard
 
-A macOS-style Wayland compositor written in Rust on [Smithay](https://github.com/Smithay/smithay).
-The compositor started from Smithay's MIT-licensed `anvil` example (`orchard/LICENSE-smithay.txt`).
+A macOS-style Wayland desktop written in Rust on [Smithay](https://github.com/Smithay/smithay).
 Orchard uses no Apple assets. Fonts, icons and the wallpaper come from your own system (Inter, the icon and pointer themes you pick, your own wallpaper).
 
+The compositor is being moved onto a fork of COSMIC's `cosmic-comp`, vendored in `compositor/`.
+The existing `orchard` compositor stays the default session until the port reaches parity;
+the fork can be built and run nested on its own.
+
 ```
-orchard/        compositor   (window chrome, animations, Spaces, Mission Control, IPC)
+orchard/        current compositor (window chrome, animations, Spaces, Mission Control, IPC)
+compositor/     cosmic-comp fork, the new compositor base (its own Cargo workspace)
 orchard-shell/  menu bar, Dock, Cmd+Tab switcher, Spotlight-like launcher
 orchard-lock/   lock screen (ext-session-lock + PAM)
 dist/           login session files + installer
 ```
+
+## Compositor
+
+The new compositor lives in `compositor/` as a fork of
+[pop-os/cosmic-comp](https://github.com/pop-os/cosmic-comp). It is a separate Cargo workspace so
+its GPL-3.0-only sources and its patched Smithay revision stay independent of the current
+compositor. `compositor/FORK.md` records the upstream commit, the build dependencies, the
+differences from upstream, and the porting plan for Orchard's chrome, Spaces, IPC and shell.
+
+`dist/comp-nested.sh` runs the fork in a window inside the current Orchard session, the same way
+`dist/nested.sh` runs the current compositor. The default login session is unchanged.
 
 ## Features
 - **Window chrome**:
@@ -190,3 +205,14 @@ Apps started from the Dock or the launcher are spawned by the compositor, so the
 
 ## System Settings
 `orchard-settings` (Apple menu → System Settings…, or the Dock) edits `~/.config/orchard/settings.json` and then sends `{"request":"reload_settings"}`. It writes back only the fields you changed there, so changes made meanwhile by the Control Center, the menu bar or a text editor are kept, and it picks up outside changes while open. The compositor applies the change right away (appearance, corner radius, keyboard layout/repeat, mouse/trackpad, scroll speed, hot corners, focus follows mouse, title-bar double-click, Dock size/magnification/position/Trash, idle lock, display scale, wallpaper) and broadcasts `settings_changed`, so the shell restyles the menu bar and Dock. Choosing Light or Dark also sets `org.gnome.desktop.interface color-scheme`, so GTK/Qt apps follow. Autostart entries (`~/.config/autostart`, `/etc/xdg/autostart`, including the polkit agent) run once at login unless turned off under General.
+
+## License
+Orchard is licensed under **GPL-3.0-only**; see `LICENSE`.
+
+The compositor fork in `compositor/` is derived from
+[pop-os/cosmic-comp](https://github.com/pop-os/cosmic-comp), also GPL-3.0-only. Upstream
+copyright notices and SPDX headers are kept in that tree.
+
+The original Orchard compositor began from Smithay's MIT-licensed `anvil` example. That MIT
+notice is retained in `orchard/LICENSE-smithay.txt`; MIT is compatible with GPL-3.0, and the
+combined work is distributed under GPL-3.0-only.
