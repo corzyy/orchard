@@ -59,7 +59,7 @@ dist/           login session files + installer
   - Scrollable, with "Clear All". Click a notification to open it, or hover and click × to remove it.
   - Do Not Disturb silences banners (critical ones still show), shows a moon in the menu bar and is remembered across restarts.
 - **Control Center** (the switches icon left of the clock):
-  - An iOS 18-style grid of rounded modules: a Connectivity group with Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`), Ethernet and a network detail sheet, Focus, Night Shift, Game Mode, display brightness (laptops and DDC monitors), volume, Now Playing (`playerctl`) and display details.
+  - An iOS 18-style grid: 1×1 controls are single round buttons with just their symbol, while larger controls are rounded modules with a title and status. It includes a Connectivity group with Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`), Ethernet and a network detail sheet, Focus, Night Shift, Game Mode, display brightness (laptops and DDC monitors), volume, Now Playing (`playerctl`) and display details.
   - Fully customizable: right-click or use the pencil to enter edit mode, drag cards to reorder, hover to resize, tap − to remove, add controls or whole pages from the gallery. The layout is kept in `settings.json` (`control_center`), and every edit saves immediately.
   - Pages slide horizontally (trackpad swipe, wheel or the page dots), long pages scroll, and detail sheets slide back into the grid.
   - Opens with a macOS-style spring from the menu bar icon; modules cascade in with a short stagger. Animation frames are rendered into a reused offscreen buffer and only the panel's rectangle is repainted and damaged, so the rest of the screen is never touched.

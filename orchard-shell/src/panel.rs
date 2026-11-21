@@ -2110,6 +2110,12 @@ impl Panel {
         targets: &mut Vec<((f32, f32, f32, f32), Target)>,
     ) {
         let (x, y, w, h) = rect;
+        // iOS 18: a 1 × 1 control is just one large round button with the
+        // symbol centred. Titles and status text only appear from 2 × 1 up.
+        if w <= CC_CELL + 1.0 && h <= CC_CELL + 1.0 {
+            self.paint_round_button(pm, s, rect, kind, look, german, interactive, targets, now);
+            return;
+        }
         let hovered = self.module_hovered(x, y, w, h);
         let card = if hovered { look.card_hover } else { look.card };
         fill_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, card);
@@ -2138,6 +2144,114 @@ impl Panel {
                 self.paint_small_module(pm, s, rect, kind, look, fonts, german, interactive, targets, now);
             }
         }
+    }
+
+    /// The iOS 18 small control: one circle filling the grid cell, symbol only.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_round_button(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        kind: ControlKind,
+        look: CcLook,
+        german: bool,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+        now: Instant,
+    ) {
+        let (x, y, w, h) = rect;
+        let (on_t, on_col, pulse, target) = match kind {
+            ControlKind::Wifi => (
+                self.anim.wifi.sample(now).clamp(0.0, 1.0),
+                look.accent,
+                PULSE_WIFI,
+                if self.control.wifi.is_some() {
+                    Target::WifiToggle
+                } else {
+                    Target::OpenSubmenu(Submenu::Wifi)
+                },
+            ),
+            ControlKind::Bluetooth => (
+                self.anim.bluetooth.sample(now).clamp(0.0, 1.0),
+                look.accent,
+                PULSE_BT,
+                if self.control.bluetooth.is_some() {
+                    Target::BluetoothToggle
+                } else {
+                    Target::OpenSubmenu(Submenu::Bluetooth)
+                },
+            ),
+            ControlKind::Focus => (
+                self.anim.dnd.sample(now).clamp(0.0, 1.0),
+                [94, 92, 230, 255],
+                PULSE_DND,
+                Target::Dnd,
+            ),
+            ControlKind::NightShift => (
+                self.anim.night_shift.sample(now).clamp(0.0, 1.0),
+                [255, 149, 0, 255],
+                PULSE_NIGHT,
+                Target::NightShift,
+            ),
+            ControlKind::GameMode => (
+                self.anim.game_mode.sample(now).clamp(0.0, 1.0),
+                [52, 199, 89, 255],
+                PULSE_GAME,
+                Target::GameMode,
+            ),
+            ControlKind::Displays => (0.0, look.accent, PULSE_GAME, Target::OpenSettings("displays")),
+            ControlKind::Network => (0.0, look.accent, PULSE_WIFI, Target::OpenSubmenu(Submenu::Wifi)),
+            ControlKind::Sound => (0.0, look.accent, PULSE_WIFI, Target::OpenSubmenu(Submenu::Sound)),
+            ControlKind::Connectivity => (
+                self.anim.wifi.sample(now).clamp(0.0, 1.0),
+                look.accent,
+                PULSE_WIFI,
+                Target::OpenSubmenu(Submenu::Wifi),
+            ),
+            ControlKind::NowPlaying => (
+                if self.control.media.as_ref().is_some_and(|m| m.playing) {
+                    1.0
+                } else {
+                    0.0
+                },
+                look.accent,
+                PULSE_WIFI,
+                Target::MediaPlay,
+            ),
+            ControlKind::Brightness => (
+                if self.control.displays.is_empty() { 0.0 } else { 1.0 },
+                look.accent,
+                PULSE_GAME,
+                Target::OpenSettings("displays"),
+            ),
+            ControlKind::Volume => (
+                if self.control.volume.is_some_and(|(_, muted)| !muted) {
+                    1.0
+                } else {
+                    0.0
+                },
+                look.accent,
+                PULSE_WIFI,
+                Target::VolumeMute,
+            ),
+        };
+        let hovered = interactive && self.module_hovered(x, y, w, h);
+        let mut circle = lerp_rgba(look.off, on_col, on_t);
+        if hovered {
+            circle[3] = circle[3].saturating_add(20);
+        }
+        let d = w.min(h);
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        let r = (d / 2.0 - 1.0).max(1.0);
+        let (ps, _) = tap_scale(self.anim.pulses[pulse], now);
+        fill_circle(pm, cx * s, cy * s, r * ps * s, circle);
+        let glyph = [255, 255, 255, look.text[3]];
+        module_glyph(pm, s, kind, cx, cy, 13.0 * ps, glyph);
+        if interactive {
+            targets.push(((cx - r, cy - r, r * 2.0, r * 2.0), target));
+        }
+        let _ = german;
     }
 
     #[allow(clippy::too_many_arguments)]
