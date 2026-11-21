@@ -188,6 +188,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             }
             KeyAction::MoveToSpaceIndex(i) => self.move_focused_to_space(i, false),
             KeyAction::McNav(dx, dy) => self.mc_nav(dx, dy),
+            KeyAction::McCycle(d) => self.mc_cycle(d),
             KeyAction::McPick => self.mc_pick(),
             KeyAction::MissionControl => self.toggle_mission_control(false),
             KeyAction::Switcher(forward) => self.switcher_step(forward),
@@ -597,6 +598,13 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         let horizontal_amount_discrete = horizontal_amount_discrete.map(|v| v * factor);
         let vertical_amount_discrete = vertical_amount_discrete.map(|v| v * factor);
 
+        // Mission Control: the wheel steps through the window grid instead of
+        // scrolling a client (which has no pointer focus while it is open).
+        if self.mc.is_some() {
+            self.mc_scroll(vertical_amount);
+            return;
+        }
+
         {
             let mut frame = AxisFrame::new(evt.time_msec()).source(evt.source());
             if horizontal_amount != 0.0 {
@@ -879,6 +887,8 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             "mc-right" => KeyAction::McNav(1, 0),
             "mc-up" => KeyAction::McNav(0, -1),
             "mc-down" => KeyAction::McNav(0, 1),
+            "mc-next" => KeyAction::McCycle(1),
+            "mc-prev" => KeyAction::McCycle(-1),
             "mc-pick" => KeyAction::McPick,
             other if other.starts_with("space-") || other.starts_with("move-to-space-") => {
                 let n = other.rsplit('-').next().and_then(|n| n.parse::<usize>().ok());
@@ -1701,6 +1711,8 @@ enum KeyAction {
     MoveToSpaceIndex(usize),
     /// arrow keys in Mission Control: select a window
     McNav(i32, i32),
+    /// Tab / ⇧Tab in Mission Control: next / previous window
+    McCycle(i32),
     /// Return / Space in Mission Control: open the selected window
     McPick,
     /// Super+Up / F3
@@ -1832,6 +1844,12 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
 fn mc_key(modifiers: &ModifiersState, keysym: Keysym) -> Option<KeyAction> {
     if modifiers.logo || modifiers.ctrl || modifiers.alt {
         return None;
+    }
+    if keysym == Keysym::Tab {
+        return Some(KeyAction::McCycle(if modifiers.shift { -1 } else { 1 }));
+    }
+    if keysym == Keysym::ISO_Left_Tab {
+        return Some(KeyAction::McCycle(-1));
     }
     Some(match keysym {
         Keysym::Left => KeyAction::McNav(-1, 0),

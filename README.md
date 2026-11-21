@@ -27,11 +27,12 @@ dist/           login session files + installer
   - Separate Spaces per display, with a slide animation between them. At the first or last Space the current one nudges and springs back.
   - The number of Spaces per display is kept across logins (`~/.local/state/orchard/spaces.json`).
   - Three-finger swipes switch Spaces; swipe up for Mission Control, swipe down for App Exposé.
-- **Mission Control / App Exposé**: opens on every display at once. Windows spring into a grid; the hovered or selected window gets a blue ring and its title.
-  - The strip on top shows a miniature of each Space plus "+". Click a Space to go there, "+" to add one (Mission Control stays open).
-  - Hover a Space and click its × to remove it. Its windows move to the Space on its left (the right one for the first Space).
+- **Mission Control / App Exposé**: opens on every display at once. Windows scale into a tidy grid that fills the display; the hovered or selected window lifts under a blue outline and shows its title.
+  - The translucent bar on top shows a live miniature of each Space plus "+". Previews are rendered after the first frame (so opening is instant) and only Spaces that changed are redrawn.
+  - Hover a Space to grow it; click it to go there, or "+" to add one (Mission Control stays open). Hover a Space and click its × to remove it. Its windows move to the Space on its left (the right one for the first Space).
   - Drag a window onto a Space to move it there, onto "+" to move it to a new Space, or onto another display.
-  - Arrow keys select a window, Return or Space opens it. ⌃⌘←/→ and ⌃⌘1…9 switch Spaces without leaving Mission Control.
+  - Arrow keys select a window, Tab / ⇧Tab or the scroll wheel steps through them, Return or Space opens it, Escape leaves. ⌃⌘←/→ and ⌃⌘1…9 switch Spaces without leaving Mission Control.
+  - App Exposé shows just the active app's windows, under its name and window count.
 - **Global app menus**: KDE/Qt apps (KWrite, Kate, Dolphin, Konsole …) show their own menus in the menu bar after the app name, with shortcuts, checkmarks and submenus. Their in-window menu bar disappears.
   - Wayland apps announce their menu through `org_kde_kwin_appmenu`. X11 apps register with `com.canonical.AppMenu.Registrar`, which the shell provides.
   - GTK 3/4 apps with a GtkApplication menu bar announce it through `gtk_shell1`; Orchard reads it with `org.gtk.Menus` and runs items with `org.gtk.Actions`. Their in-window menu bar disappears.

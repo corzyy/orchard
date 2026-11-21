@@ -9,14 +9,15 @@ use smithay::{
             surface::WaylandSurfaceRenderElement,
             texture::TextureRenderElement,
             utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
-            AsRenderElements, Element, Id, Kind,
+            AsRenderElements, Element, Id, Kind, RenderElement, UnderlyingStorage,
         },
         gles::{GlesError, GlesRenderer, GlesTarget, GlesTexture},
+        utils::{CommitCounter, DamageSet, OpaqueRegions},
         Color32F, ImportAll, ImportMem, Renderer,
     },
     desktop::{layer_map_for_output, space::SpaceElement, Space},
     output::Output,
-    utils::{Logical, Physical, Point, Rectangle, Scale, Transform},
+    utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform},
     wayland::shell::wlr_layer::Layer,
 };
 
@@ -31,7 +32,9 @@ use crate::{
         wallpaper::WallpaperTextures,
         Effects,
     },
-    mission_control::MissionControl,
+    mission_control::{
+        scale_rect, MissionControl, HOVER_GROW, REMOVE_R, STRIP_H, THUMB_HOVER_GROW,
+    },
     shell::{FullscreenSurface, WindowElement, WindowRenderElement},
 };
 
@@ -71,6 +74,7 @@ smithay::backend::renderer::element::render_elements! {
     McWindow=RelocateRenderElement<RescaleRenderElement<WindowRenderElement>>,
     Solid=SolidColorRenderElement,
     Label=MemoryRenderBufferRenderElement<GlesRenderer>,
+    McLabel=McLabel,
     Night=crate::effects::night::NightShiftElement,
 }
 
@@ -610,6 +614,67 @@ fn german() -> bool {
     *GERMAN.get_or_init(|| std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false))
 }
 
+/// A compositor label with its own id and full-surface damage. The text
+/// buffers are cached and shared, so the plain `MemoryRenderBufferRenderElement`
+/// id would let a label that moves (window title, Space remove button) leave
+/// stale pixels behind.
+#[derive(Debug)]
+struct McLabel {
+    inner: MemoryRenderBufferRenderElement<GlesRenderer>,
+    id: Id,
+}
+
+impl Element for McLabel {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.inner.src()
+    }
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.inner.geometry(scale)
+    }
+    fn location(&self, scale: Scale<f64>) -> Point<i32, Physical> {
+        self.inner.location(scale)
+    }
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+    fn damage_since(&self, scale: Scale<f64>, _commit: Option<CommitCounter>) -> DamageSet<i32, Physical> {
+        // labels are small; always repaint the whole one so movement clears
+        DamageSet::from_slice(&[Rectangle::from_size(self.inner.geometry(scale).size)])
+    }
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        self.inner.opaque_regions(scale)
+    }
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for McLabel {
+    fn draw(
+        &self,
+        frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        RenderElement::<GlesRenderer>::draw(&self.inner, frame, src, dst, damage, opaque_regions)
+    }
+
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
 fn label_element(
     renderer: &mut GlesRenderer,
     fx: &mut Effects,
@@ -624,7 +689,7 @@ fn label_element(
     let loc = Point::<f64, Logical>::from((center_x - w as f64 / 2.0, top)).to_physical(scale);
     MemoryRenderBufferRenderElement::from_buffer(renderer, loc, buf, Some(alpha), None, Some((w, h).into()), Kind::Unspecified)
         .ok()
-        .map(OutputRenderElements::Label)
+        .map(|inner| OutputRenderElements::McLabel(McLabel { inner, id: Id::new() }))
 }
 
 /// A plain colour as a tiny texture, so it can be drawn with rounded corners.
@@ -708,8 +773,8 @@ fn mc_window(
 /// macOS's selection blue
 const ACCENT: [u8; 3] = [10, 132, 255];
 
-/// Mission Control on one output: windows springing into the grid, the
-/// dragged window, the Spaces strip, dimming.
+/// Mission Control on one output: windows springing into the grid, soft
+/// shadows, the highlighted window's lift, the Spaces bar, dimming.
 #[allow(clippy::too_many_arguments)]
 fn mission_control_elements(
     renderer: &mut GlesRenderer,
@@ -725,6 +790,8 @@ fn mission_control_elements(
 ) {
     let Some(si) = mc.screens.iter().position(|s| s.output == *output) else { return };
     let screen = &mc.screens[si];
+    let (active, count) = ctx.space_info;
+    let count = count.min(screen.space_count());
     let p = mc.progress(now).clamp(0.0, 1.1);
     let fade = p.clamp(0.0, 1.0) as f32;
     let origin = output_geo.loc.to_f64();
@@ -733,6 +800,11 @@ fn mission_control_elements(
     let highlighted = mc.highlighted().cloned();
     let dragging = mc.drag.as_ref().filter(|d| d.active);
     let corner = crate::chrome::theme::corner_radius() as f64;
+    let hover = if mc.closing {
+        0.0
+    } else {
+        mc.hover.value_at(now).clamp(0.0, 1.0)
+    };
 
     // the dragged window floats above everything, on whichever output it is
     if let Some(drag) = dragging {
@@ -748,30 +820,79 @@ fn mission_control_elements(
         }
     }
 
-    // title of the highlighted window
+    // App Exposé names the app above its windows
+    if let (Some(name), false) = (&mc.app_name, mc.closing) {
+        let cx = output_geo.size.w as f64 / 2.0;
+        let top = screen.top_inset + 14.0;
+        let n = screen.wins.len();
+        if let Some(e) = label_element(renderer, fx, name, LabelStyle::Header, cx, top, scale, fade) {
+            out.push(e);
+        }
+        let sub = if german() {
+            if n == 1 {
+                "1 Fenster".to_string()
+            } else {
+                format!("{n} Fenster")
+            }
+        } else if n == 1 {
+            "1 window".to_string()
+        } else {
+            format!("{n} windows")
+        };
+        if let Some(e) = label_element(renderer, fx, &sub, LabelStyle::Plain, cx, top + 30.0, scale, 0.68 * fade) {
+            out.push(e);
+        }
+    }
+
+    // an empty desktop: a quiet hint, like macOS's empty Mission Control
+    if screen.wins.is_empty() && !mc.closing && mc.app_name.is_none() {
+        let cx = screen.area.loc.x - origin.x + screen.area.size.w / 2.0;
+        let cy = screen.area.loc.y - origin.y + screen.area.size.h / 2.0;
+        let text = if german() { "Keine Fenster" } else { "No open windows" };
+        if let Some(e) = label_element(renderer, fx, text, LabelStyle::Plain, cx, cy - 9.0, scale, 0.5 * fade) {
+            out.push(e);
+        }
+    }
+
+    // title of the highlighted window (above the windows)
     if let (Some(h), false) = (&highlighted, mc.closing) {
-        if let Some(w) = screen.wins.iter().find(|w| w.window == *h) {
-            let t = w.grid_at(now);
-            let title = h.title();
-            if !title.is_empty() && p > 0.8 {
-                if let Some(e) = label_element(
-                    renderer,
-                    fx,
-                    &title,
-                    LabelStyle::Pill,
-                    t.loc.x - origin.x + t.size.w / 2.0,
-                    t.loc.y - origin.y + t.size.h + 10.0,
-                    scale,
-                    fade,
-                ) {
-                    out.push(e);
+        if hover > 0.02 {
+            if let Some(w) = screen.wins.iter().find(|w| w.window == *h) {
+                let mut t = w.rect_at(p, mc.closing, now);
+                if !w.real.size.w.is_finite() || w.real.size.w <= 0.0 {
+                    t = w.grid_at(now);
+                }
+                t = scale_rect(t, 1.0 + HOVER_GROW * hover);
+                let l = local(t);
+                let title = h.title();
+                if !title.is_empty() {
+                    let top_bound = screen.area.loc.y - origin.y;
+                    let bottom_bound = top_bound + screen.area.size.h;
+                    let below = l.loc.y + l.size.h + 8.0;
+                    let top = if below + 24.0 <= bottom_bound {
+                        below
+                    } else {
+                        (l.loc.y - 32.0).max(top_bound)
+                    };
+                    if let Some(e) = label_element(
+                        renderer,
+                        fx,
+                        &title,
+                        LabelStyle::Pill,
+                        l.loc.x + l.size.w / 2.0,
+                        top,
+                        scale,
+                        fade * hover as f32,
+                    ) {
+                        out.push(e);
+                    }
                 }
             }
         }
     }
 
-    // windows, topmost (last) first; the highlighted one gets a blue ring
-    for w in screen.wins.iter().rev() {
+    // windows, topmost (last) first; the highlighted one lifts and gets a ring
+    for (wi, w) in screen.wins.iter().rev().enumerate() {
         if dragging.map(|d| d.window == w.window).unwrap_or(false) {
             continue;
         }
@@ -785,151 +906,220 @@ fn mission_control_elements(
         if leaving {
             r.loc.x += leave_off;
         }
+        let is_hi = !mc.closing && highlighted.as_ref() == Some(&w.window);
+        if is_hi {
+            r = scale_rect(r, 1.0 + HOVER_GROW * hover);
+        }
+        let k = if w.real.size.w > 0.0 { r.size.w / w.real.size.w } else { 1.0 };
+        let radius = (corner * k).max(2.0);
         mc_window(renderer, &w.window, w.real, r, origin, scale, out);
-        if !mc.closing && highlighted.as_ref() == Some(&w.window) {
-            let k = if w.real.size.w > 0.0 { r.size.w / w.real.size.w } else { 1.0 };
-            let ring = grow(local(r), 4.0);
-            if let Some(e) = rounded_fill(renderer, fx, 90, ring, corner * k + 4.0, ACCENT, 0.95 * fade, scale) {
+        if is_hi {
+            let l = local(r);
+            if let Some(e) = rounded_fill(
+                renderer,
+                fx,
+                1000 + wi * 2,
+                grow(l, 6.0),
+                radius + 6.0,
+                ACCENT,
+                (0.22 * hover * fade as f64) as f32,
+                scale,
+            ) {
+                out.push(e);
+            }
+            if let Some(e) = rounded_fill(
+                renderer,
+                fx,
+                1001 + wi * 2,
+                grow(l, 3.0),
+                radius + 3.0,
+                ACCENT,
+                (0.95 * hover * fade as f64) as f32,
+                scale,
+            ) {
                 out.push(e);
             }
         }
     }
 
-    // Spaces strip
-    let (active, count) = ctx.space_info;
-    let count = count.min(screen.space_count());
-    for (i, thumb) in screen.thumbs.iter().enumerate() {
-        // slide in from above
-        let l = local(*thumb);
-        let l = Rectangle::new((l.loc.x, l.loc.y - (1.0 - fade as f64) * 140.0).into(), l.size);
-        let hovered = mc.hovered_thumb == Some((si, i));
-        if i == count {
-            if let Some(e) = label_element(
-                renderer,
-                fx,
-                "+",
-                LabelStyle::Glyph,
-                l.loc.x + l.size.w / 2.0,
-                l.loc.y + (l.size.h - 40.0) / 2.0,
-                scale,
-                fade,
-            ) {
-                out.push(e);
-            }
-            let (rgb, a) = match (hovered, dragging.is_some()) {
-                (true, true) => (ACCENT, 0.6),
-                (true, false) => ([255, 255, 255], 0.26),
-                _ => ([255, 255, 255], 0.14),
+    // Spaces bar: a translucent band under a row of live Space miniatures
+    if count > 0 {
+        let shown = screen.thumbs.len().min(count + 1);
+        for i in 0..shown {
+            let base = screen.thumb_rect_at(i, now);
+            let hsp = screen
+                .thumb_hover
+                .get(i)
+                .map(|s| s.value_at(now))
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let hovered = mc.hovered_thumb == Some((si, i));
+            let drop_target = hovered && dragging.is_some() && i < count;
+            let grow_k = 1.0 + if drop_target {
+                THUMB_HOVER_GROW * 1.6
+            } else {
+                THUMB_HOVER_GROW * hsp
             };
-            if let Some(e) = rounded_fill(renderer, fx, 91, l, THUMB_RADIUS, rgb, a * fade, scale) {
-                out.push(e);
+            let l = local(scale_rect(base, grow_k));
+            // thumbnails cascade down with the opening animation
+            let d = (i.min(8) as f64) * 0.03;
+            let reveal = ((p - d) / (1.0 - d)).clamp(0.0, 1.0) as f32;
+            let a = reveal * fade;
+            let l = Rectangle::new((l.loc.x, l.loc.y - (1.0 - reveal as f64) * 110.0).into(), l.size);
+
+            if i == count {
+                // "+" adds a Space, and glows when a window is dragged on it
+                let (rgb, alpha) = match (drop_target, hovered) {
+                    (true, _) => (ACCENT, 0.72),
+                    (_, true) => ([255, 255, 255], 0.24),
+                    _ => ([255, 255, 255], 0.13),
+                };
+                if let Some(e) = rounded_fill(renderer, fx, 4600, l, l.size.h * 0.5, rgb, alpha * a, scale) {
+                    out.push(e);
+                }
+                if let Some(e) = label_element(
+                    renderer,
+                    fx,
+                    "+",
+                    LabelStyle::Plus,
+                    l.loc.x + l.size.w / 2.0,
+                    l.loc.y + (l.size.h - 28.0) / 2.0,
+                    scale,
+                    a,
+                ) {
+                    out.push(e);
+                }
+                continue;
             }
-            continue;
-        }
-        // remove button on the hovered Space
-        if hovered && count > 1 && dragging.is_none() && !mc.closing {
-            let a = if mc.hovered_remove { 1.0 } else { 0.85 } * fade;
-            let style = if mc.hovered_remove { LabelStyle::CloseHot } else { LabelStyle::Close };
+
+            // remove button on the hovered Space
+            if hovered && count > 1 && dragging.is_none() && !mc.closing {
+                let alpha = a * if mc.hovered_remove { 1.0 } else { 0.85 };
+                let style = if mc.hovered_remove { LabelStyle::CloseHot } else { LabelStyle::Close };
+                if let Some(e) = label_element(
+                    renderer,
+                    fx,
+                    "",
+                    style,
+                    l.loc.x,
+                    l.loc.y - REMOVE_R,
+                    scale,
+                    alpha,
+                ) {
+                    out.push(e);
+                }
+            }
+
+            // name below the thumbnail
+            let name = if german() {
+                format!("Schreibtisch {}", i + 1)
+            } else {
+                format!("Desktop {}", i + 1)
+            };
+            let name_a = a * if i == active { 1.0 } else if hovered { 0.85 } else { 0.6 };
             if let Some(e) = label_element(
                 renderer,
                 fx,
-                "",
-                style,
-                l.loc.x,
-                l.loc.y - crate::mission_control::REMOVE_R,
+                &name,
+                LabelStyle::Plain,
+                l.loc.x + l.size.w / 2.0,
+                l.loc.y + l.size.h + 6.0,
                 scale,
-                a,
+                name_a,
             ) {
                 out.push(e);
             }
-        }
-        // name below the thumbnail
-        let name = if german() {
-            format!("Schreibtisch {}", i + 1)
-        } else {
-            format!("Desktop {}", i + 1)
-        };
-        if let Some(e) = label_element(
-            renderer,
-            fx,
-            &name,
-            LabelStyle::Plain,
-            l.loc.x + l.size.w / 2.0,
-            l.loc.y + l.size.h + 7.0,
-            scale,
-            fade,
-        ) {
-            out.push(e);
-        }
-        // the Space's miniature, or just the wallpaper
-        let phys: Rectangle<i32, Physical> = l.to_physical_precise_round(scale);
-        let thumb_tex = screen
-            .thumb_textures
-            .get(i)
-            .and_then(|t| t.as_ref())
-            .map(|t| (t.texture.clone(), (t.size.w, t.size.h), Some(t.id.clone())));
-        let src = thumb_tex.or_else(|| wallpaper_tex.clone().map(|(t, s)| (t, s, None)));
-        if let Some((tex, (tw, th), own_id)) = &src {
-            let id = own_id.clone().unwrap_or_else(|| mc_id(fx, i));
-            let tex_el = TextureRenderElement::from_static_texture(
-                id,
-                renderer.context_id(),
-                phys.loc.to_f64(),
-                tex.clone(),
-                1,
-                Transform::Normal,
-                Some(fade),
-                None,
-                Some(l.size.to_i32_round()),
-                None,
-                Kind::Unspecified,
-            );
-            match crate::effects::rounded::program(renderer) {
-                Some(prog) => out.push(OutputRenderElements::Backdrop(
-                    RoundedElement::new(tex_el, prog, (THUMB_RADIUS * scale) as f32, Corners::ALL)
-                        .with_texture_size(*tw as f64, *th as f64),
-                )),
-                None => out.push(OutputRenderElements::Texture(tex_el)),
-            }
-        }
-        // ring: current Space white, hovered dimmer, drop target blue
-        let ring = match (hovered, dragging.is_some(), i == active) {
-            (true, true, _) => Some((ACCENT, 1.0)),
-            (_, _, true) => Some(([255, 255, 255], 0.9)),
-            (true, false, false) => Some(([255, 255, 255], 0.5)),
-            _ => None,
-        };
-        if let Some((rgb, a)) = ring {
-            if let Some(e) = rounded_fill(renderer, fx, 100 + i, grow(l, 3.0), THUMB_RADIUS + 3.0, rgb, a * fade, scale) {
-                out.push(e);
-            }
-        }
-        // soft shadow under the miniature
-        soft_shadow(renderer, fx, 400 + i * 3, l, THUMB_RADIUS, 0.9 * fade, scale, out);
-    }
 
-    // the frosted shelf the Spaces sit on
-    if let (Some(first), Some(last)) = (screen.thumbs.first(), screen.thumbs.iter().take(count.max(1)).last()) {
-        let first = local(*first);
-        let last = local(*last);
-        let plus = screen.thumbs.last().map(|r| local(*r)).unwrap_or(last);
-        let x0 = first.loc.x.min(plus.loc.x) - 18.0;
-        let x1 = (last.loc.x + last.size.w).max(plus.loc.x + plus.size.w) + 18.0;
-        let y0 = first.loc.y - 10.0;
-        let y1 = first.loc.y + first.size.h + 28.0;
-        let shelf = Rectangle::<f64, Logical>::new((x0, y0 - (1.0 - fade as f64) * 140.0).into(), (x1 - x0, y1 - y0).into());
-        if let Some(e) = rounded_fill(renderer, fx, 300, grow(shelf, 0.5), 18.5, [255, 255, 255], 0.10 * fade, scale) {
-            // (a hairline brighter edge, drawn below the fill)
-            if let Some(f) = rounded_fill(renderer, fx, 301, shelf, 18.0, [0, 0, 0], 0.30 * fade, scale) {
-                out.push(f);
+            // the Space's miniature, or just the wallpaper until it is ready
+            let phys: Rectangle<i32, Physical> = l.to_physical_precise_round(scale);
+            let thumb_tex = screen
+                .thumb_textures
+                .get(i)
+                .and_then(|t| t.as_ref())
+                .map(|t| (t.texture.clone(), (t.size.w, t.size.h), Some(t.id.clone())));
+            let src = thumb_tex.or_else(|| wallpaper_tex.clone().map(|(t, s)| (t, s, None)));
+            if let Some((tex, (tw, th), own_id)) = &src {
+                let id = own_id.clone().unwrap_or_else(|| mc_id(fx, 4700 + i));
+                let tex_el = TextureRenderElement::from_static_texture(
+                    id,
+                    renderer.context_id(),
+                    phys.loc.to_f64(),
+                    tex.clone(),
+                    1,
+                    Transform::Normal,
+                    Some(a),
+                    None,
+                    Some(l.size.to_i32_round()),
+                    None,
+                    Kind::Unspecified,
+                );
+                match crate::effects::rounded::program(renderer) {
+                    Some(prog) => out.push(OutputRenderElements::Backdrop(
+                        RoundedElement::new(tex_el, prog, (THUMB_RADIUS * scale) as f32, Corners::ALL)
+                            .with_texture_size(*tw as f64, *th as f64)
+                            .with_rim([1.0, 1.0, 1.0, 0.14], scale as f32),
+                    )),
+                    None => out.push(OutputRenderElements::Texture(tex_el)),
+                }
             }
-            out.push(e);
+            // ring: current Space white, hovered dimmer, drop target blue
+            let ring = match (drop_target, i == active, hovered) {
+                (true, _, _) => Some((ACCENT, 1.0)),
+                (_, true, _) => Some(([255, 255, 255], 0.9)),
+                (_, _, true) => Some(([255, 255, 255], 0.5)),
+                _ => None,
+            };
+            if let Some((rgb, alpha)) = ring {
+                if let Some(e) = rounded_fill(
+                    renderer,
+                    fx,
+                    4003 + i * 6,
+                    grow(l, 2.5),
+                    THUMB_RADIUS + 2.5,
+                    rgb,
+                    alpha * a,
+                    scale,
+                ) {
+                    out.push(e);
+                }
+            }
+            soft_shadow(renderer, fx, 4000 + i * 6, l, THUMB_RADIUS, 0.9 * a, scale, out);
         }
+
+        // the translucent bar the Spaces sit on, with a hairline at the bottom
+        let bar = Rectangle::<f64, Logical>::new(
+            (0.0, 0.0).into(),
+            (output_geo.size.w as f64, STRIP_H).into(),
+        );
+        out.push(OutputRenderElements::Solid(solid(
+            fx,
+            1,
+            bar.to_physical_precise_round(scale),
+            [0.0, 0.0, 0.0, 0.16 * fade],
+            scale,
+        )));
+        let line = Rectangle::<f64, Logical>::new(
+            (0.0, STRIP_H - 1.0).into(),
+            (output_geo.size.w as f64, 1.0).into(),
+        );
+        out.push(OutputRenderElements::Solid(solid(
+            fx,
+            2,
+            line.to_physical_precise_round(scale),
+            [1.0, 1.0, 1.0, 0.055 * fade],
+            scale,
+        )));
     }
 
     // the desktop behind: dimmed and blurred, so the windows stand out
     let full = Rectangle::<i32, Physical>::from_size(output_geo.size.to_physical_precise_round(scale));
-    out.push(OutputRenderElements::Solid(solid(fx, 0, full, [0.0, 0.0, 0.0, 0.30 * fade], scale)));
+    out.push(OutputRenderElements::Solid(solid(
+        fx,
+        0,
+        full,
+        [0.0, 0.0, 0.0, 0.34 * fade],
+        scale,
+    )));
     let mode_size = output
         .current_mode()
         .map(|m| output.current_transform().transform_size(m.size))

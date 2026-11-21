@@ -22,6 +22,18 @@ impl SpringParams {
         response: 0.4,
         damping: 0.82,
     };
+    /// Mission Control's entrance: a little quicker than [`SMOOTH`], settling
+    /// without overshoot so windows never cross their grid cells.
+    pub const OVERVIEW: SpringParams = SpringParams {
+        response: 0.3,
+        damping: 1.0,
+    };
+    /// Small pointer-driven growth (highlighted window, Space thumbnails):
+    /// quick, with just a hint of bounce.
+    pub const HOVER: SpringParams = SpringParams {
+        response: 0.24,
+        damping: 0.85,
+    };
     /// Window frame changes (tile, zoom, restore): quick, settles without bounce.
     pub const FRAME: SpringParams = SpringParams {
         response: 0.3,
@@ -96,6 +108,11 @@ impl Spring {
     }
 
     pub fn is_done_at(&self, now: Duration) -> bool {
+        // A spring that never had anywhere to go (e.g. an idle hover spring)
+        // is settled from the start.
+        if (self.from - self.to).abs() < 1e-12 && self.initial_velocity.abs() < 1e-12 {
+            return true;
+        }
         let t = now.saturating_sub(self.start).as_secs_f64();
         let range = (self.from - self.to).abs().max(1e-6);
         // envelope based settle check: displacement and velocity both tiny
@@ -155,6 +172,13 @@ mod tests {
         let s = Spring::new(0.0, 1.0, SpringParams::SMOOTH, ms(0));
         assert!(!s.is_done_at(ms(100)));
         assert!(s.is_done_at(ms(800)), "value at 800ms {}", s.value_at(ms(800)));
+    }
+
+    #[test]
+    fn zero_length_spring_is_done() {
+        let s = Spring::new(0.0, 0.0, SpringParams::HOVER, ms(0));
+        assert!(s.is_done_at(ms(0)));
+        assert_eq!(s.value_at(ms(0)), 0.0);
     }
 
     #[test]

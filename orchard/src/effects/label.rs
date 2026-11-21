@@ -16,8 +16,12 @@ pub enum LabelStyle {
     Pill,
     /// white text with a soft shadow (Space names)
     Plain,
-    /// big glyph (the "+" button)
+    /// large white heading (App Exposé's app name)
+    Header,
+    /// big glyph (unused by Mission Control now, kept for other overlays)
     Glyph,
+    /// the "+" on the add-Space button
+    Plus,
     /// round "×" button (remove a Space); the text is ignored
     Close,
     /// the same, under the pointer
@@ -64,10 +68,16 @@ fn paint(text: &str, style: LabelStyle, scale: f64) -> Option<(Pixmap, (i32, i32
     let (px, pad_x, h) = match style {
         LabelStyle::Pill => (13.0, 10.0, 24.0),
         LabelStyle::Plain => (12.0, 4.0, 18.0),
+        LabelStyle::Header => (18.0, 6.0, 28.0),
         LabelStyle::Glyph => (34.0, 2.0, 40.0),
+        LabelStyle::Plus => (22.0, 3.0, 28.0),
         LabelStyle::Close | LabelStyle::CloseHot => return None,
     };
-    let text = font.ellipsize(text, px * s, 420.0 * s);
+    let max_w = match style {
+        LabelStyle::Header => 640.0,
+        _ => 420.0,
+    };
+    let text = font.ellipsize(text, px * s, max_w * s);
     let tw = font.measure(&text, px * s) / s;
     let w = (tw + 2.0 * pad_x).ceil();
     let mut pm = Pixmap::new((w * s).ceil() as u32, (h * s).ceil() as u32)?;
@@ -93,8 +103,12 @@ fn paint(text: &str, style: LabelStyle, scale: f64) -> Option<(Pixmap, (i32, i32
     let asc = font.ascent(px * s);
     let desc = font.descent(px * s);
     let baseline = ((h * s) + asc + desc) / 2.0;
-    if style == LabelStyle::Plain {
-        font.draw(&mut pm, &text, pad_x * s + 1.0, baseline + 1.0, px * s, [0, 0, 0, 140]);
+    if matches!(
+        style,
+        LabelStyle::Plain | LabelStyle::Header | LabelStyle::Plus | LabelStyle::Glyph
+    ) {
+        let shadow = if style == LabelStyle::Header { 170 } else { 140 };
+        font.draw(&mut pm, &text, pad_x * s + 1.0, baseline + 1.0, px * s, [0, 0, 0, shadow]);
     }
     font.draw(&mut pm, &text, pad_x * s, baseline, px * s, [255, 255, 255, 255]);
     Some((pm, (w as i32, h as i32)))
