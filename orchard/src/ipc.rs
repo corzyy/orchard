@@ -744,6 +744,10 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
         }
         for o in self.spaces.outputs.values() {
             for s in &o.slots {
+                // the full-screen window is the frontmost thing on its Space
+                for w in s.fullscreen.iter() {
+                    push(w.app_id());
+                }
                 for (w, _) in &s.windows {
                     push(w.app_id());
                 }
@@ -1002,7 +1006,13 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                 .outputs
                 .values()
                 .flat_map(|o| o.slots.iter())
-                .flat_map(|s| s.windows.iter().map(|(w, _)| w))
+                .flat_map(|s| {
+                    s.windows
+                        .iter()
+                        .map(|(w, _)| w)
+                        // a full-screen app on an inactive Space lives in its own slot
+                        .chain(s.fullscreen.iter())
+                })
                 .find(|w| w.app_id() == app_id)
                 .cloned();
             if let Some(w) = elsewhere.filter(|_| switch_space) {

@@ -436,38 +436,49 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             let output = self.space.output_under(location).next().cloned();
             if let Some(output) = output.as_ref() {
                 if let Some(output_geo) = self.space.output_geometry(output) {
-                    let revealed =
-                        crate::fs_reveal::reveal_hit(output, location - output_geo.loc.to_f64(), output_geo.size.w)
-                            .is_some();
-                    if let Some(window) = output
-                        .user_data()
-                        .get::<FullscreenSurface>()
-                        .and_then(|f| f.get())
-                        .filter(|_| !revealed)
+                    let reveal = crate::fs_reveal::reveal_hit(output, location - output_geo.loc.to_f64(), output_geo.size.w);
+                    let revealed = reveal.is_some();
+                    let fullscreen = output.user_data().get::<FullscreenSurface>().and_then(|f| f.get());
+                    let local = location - output_geo.loc.to_f64();
+
+                    // Layer surfaces sit above the full-screen window. The menu
+                    // bar and Dock are hidden by full screen, unless the menu bar
+                    // is revealed, so they don't take the click.
                     {
-                        if let Some((_, _)) =
-                            window.surface_under(location - output_geo.loc.to_f64(), WindowSurfaceType::ALL)
+                        let layers = layer_map_for_output(output);
+                        let visible = |l: &smithay::desktop::LayerSurface| {
+                            fullscreen.is_none()
+                                || !crate::render::layer_hidden_in_fullscreen(l.namespace())
+                                || (l.namespace() == "orchard-menubar"
+                                    && matches!(reveal, Some(crate::fs_reveal::RevealHit::MenuBar)))
+                        };
+                        if let Some((layer, _, _)) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, local)
+                            .or_else(|| {
+                                crate::render::layer_input_under_where(&layers, WlrLayer::Top, local, visible)
+                            })
                         {
-                            #[cfg(feature = "xwayland")]
-                            if let Some(surface) = window.0.x11_surface() {
-                                if let Some(Err(err)) = self.xwm.as_mut().map(|xwm| xwm.raise_window(surface)) {
-                                    tracing::debug!("raise X11 window: {err}");
-                                }
+                            if layer.can_receive_keyboard_focus() {
+                                drop(layers);
+                                keyboard.set_focus(self, Some(layer.into()), serial);
+                                return;
                             }
-                            keyboard.set_focus(self, Some(window.into()), serial);
-                            return;
                         }
                     }
 
-                    let layers = layer_map_for_output(output);
-                    let local = location - output_geo.loc.to_f64();
-                    if let Some((layer, _, _)) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, local)
-                        .or_else(|| crate::render::layer_input_under(&layers, WlrLayer::Top, local))
-                    {
-                        if layer.can_receive_keyboard_focus() {
-                            drop(layers);
-                            keyboard.set_focus(self, Some(layer.into()), serial);
-                            return;
+                    if !revealed {
+                        if let Some(window) = fullscreen {
+                            if let Some((_, _)) =
+                                window.surface_under(local, WindowSurfaceType::ALL)
+                            {
+                                #[cfg(feature = "xwayland")]
+                                if let Some(surface) = window.0.x11_surface() {
+                                    if let Some(Err(err)) = self.xwm.as_mut().map(|xwm| xwm.raise_window(surface)) {
+                                        tracing::debug!("raise X11 window: {err}");
+                                    }
+                                }
+                                keyboard.set_focus(self, Some(window.into()), serial);
+                                return;
+                            }
                         }
                     }
                 }
@@ -534,26 +545,37 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if matches!(reveal, Some(crate::fs_reveal::RevealHit::TitleBar)) {
             return None;
         }
-        if reveal.is_none() {
-            if let Some((surface, loc)) = output
-                .user_data()
-                .get::<FullscreenSurface>()
-                .and_then(|f| f.get())
-                .and_then(|w| w.surface_under(local, WindowSurfaceType::ALL))
-            {
-                return Some((surface, (loc + output_geo.loc).to_f64()));
-            }
-        }
+        let fullscreen = output.user_data().get::<FullscreenSurface>().and_then(|f| f.get());
+        // A full-screen window is below the shell's layer surfaces, but it
+        // hides the menu bar and the Dock: those must not take clicks there.
+        let hidden = |ns: &str| {
+            fullscreen.is_some()
+                && crate::render::layer_hidden_in_fullscreen(ns)
+                && !(ns == "orchard-menubar" && matches!(reveal, Some(crate::fs_reveal::RevealHit::MenuBar)))
+        };
 
         // Keep the per-output LayerMap mutex strictly scoped: looking up the
         // pointer target below locks `layer_map_for_output` again.
         {
             let layers = layer_map_for_output(output);
             if let Some(focus) = crate::render::layer_input_under(&layers, WlrLayer::Overlay, local)
-                .or_else(|| crate::render::layer_input_under(&layers, WlrLayer::Top, local))
+                .or_else(|| {
+                    crate::render::layer_input_under_where(&layers, WlrLayer::Top, local, |l| {
+                        !hidden(l.namespace())
+                    })
+                })
                 .map(|(_, surface, loc)| (PointerFocusTarget::from(surface), (loc + output_geo.loc).to_f64()))
             {
                 return Some(focus);
+            }
+        }
+
+        if reveal.is_none() {
+            if let Some((surface, loc)) = fullscreen
+                .as_ref()
+                .and_then(|w| w.surface_under(local, WindowSurfaceType::ALL))
+            {
+                return Some((surface, (loc + output_geo.loc).to_f64()));
             }
         }
 

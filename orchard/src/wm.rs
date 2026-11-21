@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use smithay::{
     desktop::{layer_map_for_output, space::SpaceElement, WindowSurface},
     input::{pointer::Focus, Seat},
+    output::Output,
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{IsAlive, Logical, Point, Rectangle, Serial, SERIAL_COUNTER},
     wayland::compositor::with_states,
@@ -198,7 +199,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// The green button: toggle between the user size and filling the usable area.
     pub fn toggle_zoom(&mut self, window: &WindowElement) {
-        if !window.alive() {
+        if !window.alive() || window.is_fullscreen() {
             return;
         }
         #[cfg(feature = "xwayland")]
@@ -605,6 +606,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     }
 
     pub fn focus_window(&mut self, window: &WindowElement) {
+        // another window comes forward on a display showing a full-screen app:
+        // that app has to leave full screen, or it stays glued over the newcomer
+        self.leave_fullscreen_behind(window);
         self.space.raise_element(window, true);
         if self.is_locked() {
             return;
@@ -618,6 +622,22 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 t.send_pending_configure();
             }
         });
+    }
+
+    /// Leave full screen on the display `window` is coming forward on.
+    fn leave_fullscreen_behind(&mut self, window: &WindowElement) {
+        let target = self.window_output(window);
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        for output in outputs {
+            let fullscreen = output
+                .user_data()
+                .get::<crate::shell::FullscreenSurface>()
+                .and_then(|f| f.get());
+            let Some(fullscreen) = fullscreen else { continue };
+            if &fullscreen != window && target.as_ref() == Some(&output) {
+                self.exit_fullscreen_space(&fullscreen);
+            }
+        }
     }
 
     /// Focus follows mouse: give keyboard focus to the window under the
@@ -760,6 +780,11 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     pub fn hide_app(&mut self, app_id: &str) {
         let windows: Vec<WindowElement> = self.space.elements().filter(|w| w.app_id() == app_id).cloned().collect();
         for w in windows {
+            // a full-screen window goes back to its size before it disappears,
+            // as on macOS (⌘H on a full-screen app leaves full screen)
+            if w.is_fullscreen() {
+                self.exit_fullscreen_space(&w);
+            }
             let loc = self.space.element_location(&w).unwrap_or_default();
             w.user_data().insert_if_missing(|| RefCell::new(Point::<i32, Logical>::default()));
             if let Some(p) = w.user_data().get::<RefCell<Point<i32, Logical>>>() {

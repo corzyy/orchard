@@ -413,6 +413,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// ⌥⌘R: back to the size and place from before tiling / zooming.
     pub fn untile_window(&mut self, window: &WindowElement) {
+        if window.is_fullscreen() {
+            return;
+        }
         if self.is_zoomed(window) {
             self.toggle_zoom(window);
             return;
@@ -432,6 +435,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// ⌥⌘C: center in the usable area (keeps the size).
     pub fn center_window(&mut self, window: &WindowElement) {
+        if window.is_fullscreen() {
+            return;
+        }
         let Some(area) = self.usable_area_for(window) else { return };
         if self.is_zoomed(window) {
             return;

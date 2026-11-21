@@ -78,6 +78,12 @@ smithay::backend::renderer::element::render_elements! {
     Night=crate::effects::night::NightShiftElement,
 }
 
+/// Layer surfaces that a full-screen window hides (macOS hides the menu bar
+/// and the Dock). Everything else in the Top layer stays visible.
+pub fn layer_hidden_in_fullscreen(namespace: &str) -> bool {
+    matches!(namespace, "orchard-menubar" | "orchard-dock")
+}
+
 /// Layer surfaces of one layer, topmost first. The Dock stays above the
 /// shell's other surfaces in its layer (Launchpad is drawn below it).
 pub fn layers_top_first(map: &smithay::desktop::LayerMap, layer: Layer) -> Vec<smithay::desktop::LayerSurface> {
@@ -98,7 +104,24 @@ pub fn layer_input_under(
     smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     Point<i32, Logical>,
 )> {
+    layer_input_under_where(map, layer, pos, |_| true)
+}
+
+/// Like [`layer_input_under`], but only accepts surfaces `keep` approves of.
+pub fn layer_input_under_where(
+    map: &smithay::desktop::LayerMap,
+    layer: Layer,
+    pos: Point<f64, Logical>,
+    keep: impl Fn(&smithay::desktop::LayerSurface) -> bool,
+) -> Option<(
+    smithay::desktop::LayerSurface,
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    Point<i32, Logical>,
+)> {
     layers_top_first(map, layer).into_iter().find_map(|l| {
+        if !keep(&l) {
+            return None;
+        }
         let loc = map.layer_geometry(&l)?.loc;
         let (s, sl) = l.surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)?;
         Some((l.clone(), s, sl + loc))
@@ -1264,16 +1287,26 @@ fn output_elements_inner(
 
     // (Mission Control shows the full-screen window in its grid instead)
     let mc_here = ctx.mc.map(|m| m.screen_of(output).is_some()).unwrap_or(false);
-    if let Some(window) = output
-        .user_data()
-        .get::<FullscreenSurface>()
-        .and_then(|f| f.get())
-        .filter(|_| !mc_here)
-    {
+    let fullscreen = output.user_data().get::<FullscreenSurface>().and_then(|f| f.get());
+    let sliding = ctx
+        .fx
+        .space_transition
+        .as_ref()
+        .filter(|t| t.output == output.name())
+        .is_some();
+    // A Space slide draws the full-screen window with the slide offset (and
+    // the retired Space's windows), so full screen must not take over the
+    // whole output for those frames.
+    if let Some(window) = fullscreen.clone().filter(|_| !mc_here && !sliding) {
         let hide_shot = ctx.fx.hide_screenshot_ui;
         let mut pending = Vec::new();
         layer_elements_filtered(renderer, output, Layer::Overlay, scale, true, backdrops, &mut pending, &mut out, |ns, _| {
             !(hide_shot && ns == "orchard-screenshot")
+        });
+        // Top layers that stay above a full-screen app (the Launchpad). The
+        // menu bar and Dock are hidden, except for the menu bar reveal below.
+        layer_elements_filtered(renderer, output, Layer::Top, scale, true, backdrops, &mut pending, &mut out, |ns, _| {
+            !layer_hidden_in_fullscreen(ns)
         });
         fs_reveal_elements(renderer, output, output_geo, &window, scale, backdrops, &mut pending, &mut out);
         window_elements(renderer, output_geo, &window, output_geo.loc, 0.0, scale, now, &mut out);
@@ -1313,7 +1346,12 @@ fn output_elements_inner(
     for t in ctx.fx.transients.iter().rev().filter(|t| is_genie(t) && transient_on(t)) {
         out.push(OutputRenderElements::Mesh(t.element(output_geo.loc, scale, now)));
     }
-    layer_elements(renderer, output, Layer::Top, scale, true, backdrops, &mut pending, &mut out);
+    // Sliding into a full-screen Space: the menu bar and Dock stay hidden, as
+    // they are once the slide is over.
+    let hide_shell = sliding && fullscreen.is_some();
+    layer_elements_filtered(renderer, output, Layer::Top, scale, true, backdrops, &mut pending, &mut out, |ns, _| {
+        !hide_shell || !layer_hidden_in_fullscreen(ns)
+    });
     for t in ctx.fx.transients.iter().rev().filter(|t| !is_genie(t) && transient_on(t)) {
         out.push(OutputRenderElements::Mesh(t.element(output_geo.loc, scale, now)));
     }

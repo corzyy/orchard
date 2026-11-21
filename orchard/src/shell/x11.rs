@@ -29,8 +29,8 @@ use tracing::{error, trace};
 use crate::{focus::KeyboardFocusTarget, state::Backend, OrchardState};
 
 use super::{
-    place_new_window, FullscreenSurface, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData,
-    ResizeState, SurfaceData, TouchMoveSurfaceGrab, WindowElement,
+    place_new_window, PointerMoveSurfaceGrab, PointerResizeSurfaceGrab, ResizeData, ResizeState,
+    SurfaceData, TouchMoveSurfaceGrab, WindowElement,
 };
 
 #[derive(Debug, Default)]
@@ -88,6 +88,12 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
                 self.animate_close(&elem);
             }
             self.space.unmap_elem(&elem);
+            if !window.is_override_redirect() {
+                // an X11 client that minimizes itself while full screen must
+                // not leave the display stuck in full screen
+                elem.set_fullscreen_flag(false);
+                self.release_fullscreen(&elem);
+            }
         }
         self.prefs_rt.force_toplevel_sync = true;
         self.minimized
@@ -171,50 +177,44 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(elem) = self
+        let elem = self
             .space
             .elements()
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-        {
-            let outputs_for_window = self.space.outputs_for_element(elem);
-            // the window may not be mapped yet: use the primary output instead
-            let Some(output) = outputs_for_window.first().or_else(|| self.space.outputs().next()) else {
-                return;
-            };
-            let Some(geometry) = self.space.output_geometry(output) else { return };
-
-            let _ = window.set_fullscreen(true);
-            elem.set_ssd(false);
-            let _ = window.configure(geometry);
-            output.user_data().insert_if_missing(FullscreenSurface::default);
-            if let Some(f) = output.user_data().get::<FullscreenSurface>() {
-                f.set(elem.clone());
+            .cloned();
+        match elem {
+            // same path as Wayland: remembers where to restore to, hides the
+            // title bar and lets the Space slide animate the window
+            Some(elem) => self.enter_fullscreen_space(&elem),
+            None => {
+                // not mapped (or already gone): still answer the protocol
+                let _ = window.set_fullscreen(true);
             }
-            trace!("Fullscreening: {:?}", elem);
         }
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(elem) = self
+        let elem = self
             .space
             .elements()
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-        {
-            let _ = window.set_fullscreen(false);
-            elem.set_ssd(!window.is_decorated());
-            if let Some(output) = self.space.outputs().find(|o| {
-                o.user_data()
-                    .get::<FullscreenSurface>()
-                    .and_then(|f| f.get())
-                    .map(|w| &w == elem)
-                    .unwrap_or(false)
-            }) {
-                trace!("Unfullscreening: {:?}", elem);
-                if let Some(f) = output.user_data().get::<FullscreenSurface>() {
-                    f.clear();
-                }
-                let _ = window.configure(self.space.element_bbox(elem));
-                self.backend_data.reset_buffers(output);
+            .cloned()
+            .or_else(|| {
+                self.spaces
+                    .outputs
+                    .values()
+                    .flat_map(|o| o.slots.iter())
+                    .filter_map(|s| s.fullscreen.clone())
+                    .find(|w| matches!(w.0.x11_surface(), Some(x) if x == &window))
+            });
+        match elem {
+            Some(elem) if elem.is_fullscreen() => self.exit_fullscreen_space(&elem),
+            Some(elem) => {
+                let _ = window.set_fullscreen(false);
+                elem.set_ssd(!window.is_decorated());
+            }
+            None => {
+                let _ = window.set_fullscreen(false);
             }
         }
     }

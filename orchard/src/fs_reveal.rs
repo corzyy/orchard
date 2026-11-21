@@ -62,6 +62,13 @@ fn set_reveal(output: &Output, r: Option<Reveal>) {
     *output.user_data().get::<RevealSlot>().unwrap().0.borrow_mut() = r;
 }
 
+/// Hide a reveal that is no longer wanted (left full screen, switched Space).
+pub fn clear_reveal(output: &Output) {
+    if output.user_data().get::<RevealSlot>().is_some() {
+        set_reveal(output, None);
+    }
+}
+
 /// What lies under an output-local point while a reveal is shown.
 pub enum RevealHit {
     MenuBar,

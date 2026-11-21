@@ -74,6 +74,7 @@ impl<BackendData: Backend> XdgShellHandler for OrchardState<BackendData> {
         if let Some(window) = window {
             self.animate_close(&window);
             self.space.unmap_elem(&window);
+            self.release_fullscreen(&window);
             self.prefs_rt.force_toplevel_sync = true;
         }
         self.minimized

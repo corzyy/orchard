@@ -192,14 +192,18 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         for (w, _) in &all {
             self.space.unmap_elem(w);
         }
-        // the full-screen window belongs to its slot, not the window list
+        // The full-screen window belongs to its slot, not the window list, but
+        // it still slides out with the rest of the Space.
+        let sliding: Vec<_> = all.iter().filter(|(w, _)| w.alive()).cloned().collect();
         let leaving: Vec<_> = all
-            .into_iter()
+            .iter()
             .filter(|(w, _)| Some(w) != fullscreen_leaving.as_ref())
+            .cloned()
             .collect();
+        crate::fs_reveal::clear_reveal(output);
 
         let spaces = self.spaces.for_output(&name);
-        spaces.slots[active].windows = leaving.clone();
+        spaces.slots[active].windows = leaving;
         if let Some(fs) = fullscreen_leaving {
             spaces.slots[active].fullscreen = Some(fs);
         }
@@ -227,7 +231,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         let now = self.clock.now().into();
         self.fx.space_transition = Some(SpaceTransition {
             output: name,
-            from: leaving,
+            from: sliding,
             dir: if idx > active { 1.0 } else { -1.0 },
             spring: Spring::new(0.0, 1.0, SpringParams::SMOOTH, now),
             bounce: false,
@@ -417,6 +421,17 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 }
             }
         }
+        // a full-screen window that went away takes its menu bar reveal with it
+        for output in self.space.outputs() {
+            let shown = output
+                .user_data()
+                .get::<crate::shell::FullscreenSurface>()
+                .and_then(|f| f.get())
+                .is_some();
+            if !shown {
+                crate::fs_reveal::clear_reveal(output);
+            }
+        }
     }
 
     /// All windows of an output's Spaces (for Mission Control thumbnails).
@@ -570,6 +585,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 f.clear();
             }
         }
+        crate::fs_reveal::clear_reveal(&output);
         let loc = origin.map(|o| o.loc).unwrap_or_default();
         let spaces = self.spaces.for_output(&name);
         let active = spaces.active;
@@ -586,6 +602,32 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             // left full screen while its Space is not shown: back into that Space
             slot.windows.retain(|(w, _)| w != window);
             slot.windows.push((window.clone(), loc));
+        }
+    }
+
+    /// A window stopped being full screen because it closed, minimized itself
+    /// or was hidden: no output may keep painting it over the whole display.
+    pub fn release_fullscreen(&mut self, window: &WindowElement) {
+        let mut shown_on = Vec::new();
+        for output in self.space.outputs() {
+            let fullscreen = output.user_data().get::<crate::shell::FullscreenSurface>();
+            if fullscreen.and_then(|f| f.get()).as_ref() == Some(window) {
+                if let Some(f) = fullscreen {
+                    f.clear();
+                }
+                crate::fs_reveal::clear_reveal(output);
+                shown_on.push(output.clone());
+            }
+        }
+        for spaces in self.spaces.outputs.values_mut() {
+            for slot in &mut spaces.slots {
+                if slot.fullscreen.as_ref() == Some(window) {
+                    slot.fullscreen = None;
+                }
+            }
+        }
+        for output in shown_on {
+            self.backend_data.reset_buffers(&output);
         }
     }
 }
