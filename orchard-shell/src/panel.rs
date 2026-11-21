@@ -20,8 +20,8 @@ use crate::{
 };
 
 pub const NC_WIDTH: f32 = 356.0;
-/// Width of the iOS-style Control Center grid: four 76 px columns, 10 px
-/// gutters and 14 px side padding.
+/// Width of the iOS-style Control Center grid: four 75 px columns, 10 px
+/// gutters and 16 px side padding.
 pub const CC_WIDTH: f32 = 362.0;
 const MARGIN: f32 = 10.0;
 const SLIDE_NC_OPEN: Duration = Duration::from_millis(240);
@@ -32,14 +32,20 @@ const SUBMENU_ANIM: Duration = Duration::from_millis(210);
 const PAGE_ANIM: Duration = Duration::from_millis(260);
 
 const CC_COLS: usize = 4;
-const CC_PAD: f32 = 14.0;
+/// Outer page padding: the same inset on all sides of the grid.
+const CC_PAD: f32 = 16.0;
 const CC_GAP: f32 = 10.0;
-const CC_CELL: f32 = 76.0;
-const CC_TOP: f32 = 14.0;
-const CC_BOTTOM: f32 = 10.0;
-const CC_FOOTER: f32 = 32.0;
+const CC_CELL: f32 = 75.0;
+const CC_TOP: f32 = 16.0;
+const CC_BOTTOM: f32 = 12.0;
+const CC_FOOTER: f32 = 34.0;
 const CC_RADIUS: f32 = 28.0;
 const MODULE_RADIUS: f32 = 22.0;
+/// Inner padding shared by large modules (media, sliders, wide controls).
+const MODULE_PAD: f32 = 16.0;
+const GROUP_PAD: f32 = 12.0;
+const GROUP_GAP: f32 = 8.0;
+const GALLERY_HEADER: f32 = 34.0;
 const PAGE_DOT: f32 = 3.5;
 
 /// iOS-style per-module entrance delay while the panel opens.
@@ -853,7 +859,7 @@ impl Panel {
             if rows == 0 {
                 96.0
             } else {
-                rows as f32 * CC_CELL + (rows - 1) as f32 * CC_GAP + 54.0
+                rows as f32 * CC_CELL + (rows - 1).max(0) as f32 * CC_GAP + GALLERY_HEADER + 20.0
             }
         } else if self.cc.placed.is_empty() {
             132.0
@@ -874,7 +880,7 @@ impl Panel {
     fn update_scroll_target(&mut self) {
         let content = if self.cc.gallery {
             let rows = content_rows(&self.cc.placed);
-            (rows as f32 * CC_CELL + (rows - 1).max(0) as f32 * CC_GAP + 54.0).max(0.0)
+            (rows as f32 * CC_CELL + (rows - 1).max(0) as f32 * CC_GAP + GALLERY_HEADER + 20.0).max(0.0)
         } else if self.cc.placed.is_empty() {
             132.0
         } else {
@@ -1943,7 +1949,7 @@ impl Panel {
         fonts.draw(pm, label, (np.0 + 12.0) * s, nb, 11.0 * s, Weight::Bold, look.text);
         self.targets.push((np, Target::PageAdd));
 
-        let grid_y = y + 34.0;
+        let grid_y = y + GALLERY_HEADER;
         let scroll = self.cc.scroll.sample(now);
         let placed = std::mem::take(&mut self.cc.placed);
         if placed.is_empty() {
@@ -2006,12 +2012,12 @@ impl Panel {
             if hovered { look.card_hover } else { look.card },
         );
         stroke_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, 1.0 * s, look.border);
-        let (cx, cy) = (x + w / 2.0, y + 25.0);
+        let (cx, cy) = (x + w / 2.0, y + 26.0);
         fill_circle(pm, cx * s, cy * s, 15.0 * s, look.off);
         module_glyph(pm, s, kind, cx, cy, 6.5, look.text);
         let label = module_name(kind, german);
         let lw = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
-        let base = fonts.baseline_centered((y + 46.0) * s, 24.0 * s, 10.0 * s, Weight::Bold);
+        let base = fonts.baseline_centered((y + 45.0) * s, 24.0 * s, 10.0 * s, Weight::Bold);
         fonts.draw(pm, label, (x + (w - lw) / 2.0) * s, base, 10.0 * s, Weight::Bold, look.text);
         // Add / already-added badge.
         let (bx, by) = (x + w - 10.0, y + 10.0);
@@ -2038,7 +2044,7 @@ impl Panel {
         if self.cc.gallery {
             let label = "Done";
             let w = fonts.measure(label, 11.5 * s, Weight::Bold) / s + 26.0;
-            let r = (x0 + CC_WIDTH - CC_PAD - w, y + 3.0, w, 26.0);
+            let r = (x0 + CC_WIDTH - CC_PAD - w, y + 4.0, w, 26.0);
             let hov = self.hovered(r.0, r.1, r.2, r.3);
             fill_rounded(pm, r.0 * s, r.1 * s, r.2 * s, r.3 * s, 13.0 * s, if hov { look.accent } else { look.card_hover });
             let b = fonts.baseline_centered(r.1 * s, r.3 * s, 11.5 * s, Weight::Bold);
@@ -2069,24 +2075,24 @@ impl Panel {
 
         if self.cc.edit {
             if self.cc.pages.len() > 1 {
-                let r = (x0 + CC_PAD, y + 4.0, 24.0, 24.0);
+                let r = (x0 + CC_PAD, y + 5.0, 24.0, 24.0);
                 let hov = self.hovered(r.0, r.1, r.2, r.3);
                 fill_circle(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 12.0 * s, if hov { [255, 69, 58, 45] } else { [0, 0, 0, 0] });
                 trash(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 5.6 * s, if hov { [255, 69, 58, 255] } else { look.sub });
                 self.targets.push((r, Target::PageRemove));
             }
-            let plus_r = (x0 + CC_WIDTH - CC_PAD - 24.0, y + 4.0, 24.0, 24.0);
+            let plus_r = (x0 + CC_WIDTH - CC_PAD - 24.0, y + 5.0, 24.0, 24.0);
             let hov = self.hovered(plus_r.0, plus_r.1, plus_r.2, plus_r.3);
             fill_circle(pm, (plus_r.0 + 12.0) * s, (plus_r.1 + 12.0) * s, 12.0 * s, if hov { look.accent } else { look.card_hover });
             plus(pm, (plus_r.0 + 12.0) * s, (plus_r.1 + 12.0) * s, 5.0 * s, if hov { [255, 255, 255, 255] } else { look.text });
             self.targets.push((plus_r, Target::OpenGallery));
-            let done = (x0 + CC_WIDTH - CC_PAD - 24.0 - 30.0, y + 4.0, 24.0, 24.0);
+            let done = (x0 + CC_WIDTH - CC_PAD - 24.0 - 30.0, y + 5.0, 24.0, 24.0);
             let hov = self.hovered(done.0, done.1, done.2, done.3);
             fill_circle(pm, (done.0 + 12.0) * s, (done.1 + 12.0) * s, 12.0 * s, if hov { look.accent } else { look.card_hover });
             check(pm, (done.0 + 12.0) * s, (done.1 + 12.0) * s, 5.0 * s, if hov { [255, 255, 255, 255] } else { look.text });
             self.targets.push((done, Target::ToggleEdit));
         } else {
-            let r = (x0 + CC_WIDTH - CC_PAD - 24.0, y + 4.0, 24.0, 24.0);
+            let r = (x0 + CC_WIDTH - CC_PAD - 24.0, y + 5.0, 24.0, 24.0);
             let hov = self.hovered(r.0, r.1, r.2, r.3);
             fill_circle(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 12.0 * s, if hov { look.card_hover } else { [0, 0, 0, 0] });
             pencil(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 5.4 * s, if hov { look.text } else { look.sub });
@@ -2281,7 +2287,7 @@ impl Panel {
                 (10.0, 4.0, 4usize, 1usize)
             }
         } else {
-            (12.0, 6.0, 2, 2)
+            (GROUP_PAD, GROUP_GAP, 2, 2)
         };
         let cw = (w - pad * 2.0 - gap * (cols - 1) as f32) / cols as f32;
         let ch = (h - pad * 2.0 - gap * (rows - 1) as f32) / rows as f32;
@@ -2312,7 +2318,7 @@ impl Panel {
             let (cx, cy) = if compact {
                 (cx0 + cw / 2.0, cy0 + ch / 2.0)
             } else {
-                (cx0 + cw / 2.0, cy0 + 23.0)
+                (cx0 + cw / 2.0, cy0 + 22.0)
             };
             let r = if compact {
                 (cw.min(ch) * 0.36).clamp(8.0, 15.0)
@@ -2344,7 +2350,7 @@ impl Panel {
             }
             if !compact {
                 let label_w = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
-                let base = fonts.baseline_centered((cy0 + 42.0) * s, 20.0 * s, 10.0 * s, Weight::Bold);
+                let base = fonts.baseline_centered((cy0 + 41.0) * s, 18.0 * s, 10.0 * s, Weight::Bold);
                 fonts.draw(
                     pm,
                     label,
@@ -2397,9 +2403,9 @@ impl Panel {
         let large = h > CC_CELL + 10.0;
         let media = self.control.media.clone();
         let has = media.is_some();
-        let art = if large { 62.0 } else { 40.0 };
-        let ax = x + 14.0;
-        let ay = y + 14.0;
+        let art = if large { 60.0 } else { 40.0 };
+        let ax = x + if large { MODULE_PAD } else { 14.0 };
+        let ay = y + if large { MODULE_PAD } else { 17.0 };
         let art_col = if has { scale_alpha(look.accent, 0.92) } else { look.off };
         fill_rounded(pm, ax * s, ay * s, art * s, art * s, 14.0 * s, art_col);
         let fade = look.text[3] as f32 / 255.0;
@@ -2434,16 +2440,16 @@ impl Panel {
         };
         let (text_x, title_base, artist_base, maxw) = if large {
             (
-                x + 14.0,
-                fonts.baseline_centered((y + 86.0) * s, 20.0 * s, 12.5 * s, Weight::Bold),
-                fonts.baseline_centered((y + 105.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
-                w - 28.0,
+                x + MODULE_PAD,
+                fonts.baseline_centered((y + 84.0) * s, 20.0 * s, 12.5 * s, Weight::Bold),
+                fonts.baseline_centered((y + 102.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
+                w - MODULE_PAD * 2.0,
             )
         } else {
             (
                 ax + art + 10.0,
-                fonts.baseline_centered((y + 18.0) * s, 18.0 * s, 12.5 * s, Weight::Bold),
-                fonts.baseline_centered((y + 37.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
+                fonts.baseline_centered((y + 16.0) * s, 18.0 * s, 12.5 * s, Weight::Bold),
+                fonts.baseline_centered((y + 35.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
                 w - art - 68.0,
             )
         };
@@ -2521,8 +2527,8 @@ impl Panel {
         let title = if brightness { t("Display", "Display") } else { t("Sound", "Ton") };
         // Leave room for the edit-mode remove/resize badges.
         let inset = if self.cc.edit { 18.0 } else { 0.0 };
-        let base = fonts.baseline_centered((y + 8.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
-        fonts.draw(pm, title, (x + 13.0 + inset) * s, base, 11.5 * s, Weight::Bold, look.text);
+        let base = fonts.baseline_centered((y + 12.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
+        fonts.draw(pm, title, (x + MODULE_PAD + inset) * s, base, 11.5 * s, Weight::Bold, look.text);
         let value_text = if !available {
             "—".to_string()
         } else if muted {
@@ -2532,14 +2538,19 @@ impl Panel {
         };
         let vw = fonts.measure(&value_text, 10.0 * s, Weight::Regular) / s;
         let chev = !self.cc.edit && if brightness { self.control.displays.len() > 1 } else { true };
-        let vx = x + w - 13.0 - inset - vw - if chev { 12.0 } else { 0.0 };
-        let vb = fonts.baseline_centered((y + 8.0) * s, 18.0 * s, 10.0 * s, Weight::Regular);
+        let vx = x + w - MODULE_PAD - inset - vw - if chev { 12.0 } else { 0.0 };
+        let vb = fonts.baseline_centered((y + 12.0) * s, 18.0 * s, 10.0 * s, Weight::Regular);
         fonts.draw(pm, &value_text, vx * s, vb, 10.0 * s, Weight::Regular, look.sub);
         if chev {
-            chevron_right(pm, (x + w - 15.0 - inset) * s, (y + 17.0) * s, 3.5 * s, look.faint);
+            chevron_right(pm, (x + w - MODULE_PAD - 2.0 - inset) * s, (y + 21.0) * s, 3.5 * s, look.faint);
         }
 
-        let (tx, ty, tw, th) = (x + 13.0 + inset, y + 37.0, w - 26.0 - inset * 2.0, 23.0);
+        let (tx, ty, tw, th) = (
+            x + MODULE_PAD + inset,
+            y + 38.0,
+            w - MODULE_PAD * 2.0 - inset * 2.0,
+            23.0,
+        );
         let track_hover = self.module_hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
         let dragging = matches!(self.dragging, Some(Target::Volume(..)) if !brightness)
             || matches!(self.dragging, Some(Target::Brightness(0, ..)) if brightness);
@@ -2578,7 +2589,7 @@ impl Panel {
                 } else {
                     Target::OpenSubmenu(Submenu::Sound)
                 };
-                targets.push(((x + w - 42.0, y + 2.0, 36.0, 28.0), detail));
+                targets.push(((x + w - MODULE_PAD - 26.0, y + 4.0, 34.0, 28.0), detail));
             }
         }
         let _ = h;
@@ -2645,8 +2656,11 @@ impl Panel {
         };
         let circle = lerp_rgba(look.off, on_col, on_t);
         let wide = w > CC_CELL + 10.0;
+        let tall = h > CC_CELL + 10.0;
         let (cx, cy) = if wide {
-            (x + 31.0, y + h / 2.0)
+            (x + MODULE_PAD + 16.0, y + h / 2.0)
+        } else if tall {
+            (x + w / 2.0, y + h / 2.0 - 12.0)
         } else {
             (x + w / 2.0, y + 26.0)
         };
@@ -2657,9 +2671,9 @@ impl Panel {
         module_glyph(pm, s, kind, cx, cy, 6.5 * ps, glyph);
         let label = module_name(kind, german);
         if wide {
-            let tx = x + 54.0;
-            let maxw = (w - 66.0).max(30.0);
-            let base = fonts.baseline_centered((y + 16.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
+            let tx = x + MODULE_PAD + 40.0;
+            let maxw = (w - (MODULE_PAD * 2.0 + 40.0)).max(30.0);
+            let base = fonts.baseline_centered((y + 19.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
             fonts.draw(pm, &fonts.elide(label, 11.5 * s, Weight::Bold, maxw * s), tx * s, base, 11.5 * s, Weight::Bold, look.text);
             let status = match kind {
                 ControlKind::Displays => {
@@ -2691,11 +2705,12 @@ impl Panel {
                     }
                 }
             };
-            let sb = fonts.baseline_centered((y + 36.0) * s, 16.0 * s, 10.0 * s, Weight::Regular);
+            let sb = fonts.baseline_centered((y + 39.0) * s, 16.0 * s, 10.0 * s, Weight::Regular);
             fonts.draw(pm, status, tx * s, sb, 10.0 * s, Weight::Regular, look.sub);
         } else {
             let lw = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
-            let base = fonts.baseline_centered((y + 46.0) * s, 22.0 * s, 10.0 * s, Weight::Bold);
+            let top = if tall { y + h / 2.0 + 10.0 } else { y + 46.0 };
+            let base = fonts.baseline_centered(top * s, 22.0 * s, 10.0 * s, Weight::Bold);
             fonts.draw(pm, label, (x + (w - lw) / 2.0) * s, base, 10.0 * s, Weight::Bold, look.text);
         }
         if interactive {
@@ -2882,20 +2897,20 @@ impl Panel {
         let hy = y0 + 4.0;
         let hb = fonts.baseline_centered(hy * s, header_h * s, 13.5 * s, Weight::Bold);
         if self.standalone {
-            fonts.draw(pm, title, (x0 + 14.0) * s, hb, 13.5 * s, Weight::Bold, text);
+            fonts.draw(pm, title, (x0 + 16.0) * s, hb, 14.5 * s, Weight::Bold, text);
         } else {
-            let back_rect = (x0 + 6.0, hy + 4.0, if toggle_t.is_some() { CC_WIDTH - 68.0 } else { CC_WIDTH - 12.0 }, 36.0);
+            let back_rect = (x0 + 8.0, hy + 4.0, if toggle_t.is_some() { CC_WIDTH - 72.0 } else { CC_WIDTH - 16.0 }, 36.0);
             let back_hovered = self.hovered(back_rect.0, back_rect.1, back_rect.2, back_rect.3);
             if back_hovered {
                 fill_rounded(pm, back_rect.0 * s, back_rect.1 * s, back_rect.2 * s, back_rect.3 * s, 8.0 * s, hover_bg);
             }
-            chevron_left(pm, (x0 + 18.0 + slide_x) * s, (hy + 22.0) * s, 4.5 * s, if back_hovered { text } else { sub_text });
-            fonts.draw(pm, title, (x0 + 30.0 + slide_x) * s, hb, 13.5 * s, Weight::Bold, text);
+            chevron_left(pm, (x0 + 20.0 + slide_x) * s, (hy + 22.0) * s, 4.5 * s, if back_hovered { text } else { sub_text });
+            fonts.draw(pm, title, (x0 + 34.0 + slide_x) * s, hb, 14.5 * s, Weight::Bold, text);
             self.targets.push((back_rect, Target::SubmenuBack));
         }
 
         if let (Some(sw_t), Some(t_target)) = (toggle_t, toggle_target) {
-            let sx = x0 + CC_WIDTH - 14.0 - 38.0;
+            let sx = x0 + CC_WIDTH - 16.0 - 38.0;
             let sy = hy + 11.0;
             switch_anim(pm, s, sx, sy, sw_t, accent, dark);
             self.targets.push(((sx - 4.0, sy - 4.0, 46.0, 30.0), t_target));
@@ -2905,7 +2920,7 @@ impl Panel {
         let mut cur_y = hy + header_h;
         if submenu == Submenu::Sound {
             let (_, muted) = self.control.volume.unwrap_or((0.0, true));
-            let (tx, ty, tw, th) = (x0 + 14.0, cur_y + 2.0, CC_WIDTH - 28.0, 22.0);
+            let (tx, ty, tw, th) = (x0 + 16.0, cur_y + 2.0, CC_WIDTH - 32.0, 22.0);
             let vol_hov = self.hovered(tx - 2.0, ty - 4.0, tw + 4.0, th + 8.0);
             let vol_drag = matches!(self.dragging, Some(Target::Volume(..)));
             draw_pill_slider(pm, s, tx, ty, tw, th, vol_val, 1, muted, off, vol_hov, vol_drag, 1.0);
@@ -2918,7 +2933,7 @@ impl Panel {
 
         // ---- Scrollable body ----
         if content_h > 0.0 && body_h > 1.0 {
-            draw_sep(pm, s, x0 + 14.0, cur_y, CC_WIDTH - 28.0, sep);
+            draw_sep(pm, s, x0 + 16.0, cur_y, CC_WIDTH - 32.0, sep);
             cur_y += 1.0;
 
             let list_y = cur_y;
@@ -2968,10 +2983,10 @@ impl Panel {
                                 } else {
                                     t("Known Networks", "Bekannte Netzwerke")
                                 };
-                                draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, lbl, fonts, sub_text);
+                                draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly, lbl, fonts, sub_text);
                                 ly += 24.0;
                                 for net in &known {
-                                    let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                    let row = (8.0, ly, CC_WIDTH - 16.0, 38.0);
                                     if is_hov(row.0, row.1, row.2, row.3) {
                                         fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                                     }
@@ -3001,7 +3016,7 @@ impl Panel {
                                 }
                                 ly += 4.0;
                                 if !others.is_empty() {
-                                    draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                                    draw_sep(&mut sub_pm, s, 16.0, ly + 4.0, CC_WIDTH - 32.0, sep);
                                     ly += 9.0;
                                 }
                             }
@@ -3011,7 +3026,7 @@ impl Panel {
                                 if is_hov(hdr_rect.0, hdr_rect.1, hdr_rect.2, hdr_rect.3) {
                                     fill_rounded(&mut sub_pm, hdr_rect.0 * s, hdr_rect.1 * s, hdr_rect.2 * s, hdr_rect.3 * s, 6.0 * s, hover_bg);
                                 }
-                                draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly + 1.0, t("Other Networks", "Andere Netzwerke"), fonts, sub_text);
+                                draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly + 1.0, t("Other Networks", "Andere Netzwerke"), fonts, sub_text);
                                 chevron_rotated(
                                     &mut sub_pm,
                                     (CC_WIDTH - 18.0) * s,
@@ -3030,7 +3045,7 @@ impl Panel {
                                         ly += 34.0 * others_t;
                                     } else {
                                         for net in &others {
-                                            let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                            let row = (8.0, ly, CC_WIDTH - 16.0, 38.0);
                                             if is_hov(row.0, row.1, row.2, row.3) {
                                                 fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                                             }
@@ -3068,13 +3083,13 @@ impl Panel {
                         if show_eth_link {
                             if wifi_on {
                                 ly += 4.0;
-                                draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                                draw_sep(&mut sub_pm, s, 16.0, ly + 4.0, CC_WIDTH - 32.0, sep);
                                 ly += 9.0;
                             }
-                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, "Ethernet", fonts, sub_text);
+                            draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly, "Ethernet", fonts, sub_text);
                             ly += 24.0;
                             if let Some(dev) = self.control.ethernet.first() {
-                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                let row = (8.0, ly, CC_WIDTH - 16.0, 38.0);
                                 if is_hov(row.0, row.1, row.2, row.3) {
                                     fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                                 }
@@ -3105,7 +3120,7 @@ impl Panel {
                     }
 
                     Submenu::Ethernet => {
-                        draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Connections", "Verbindungen"), fonts, sub_text);
+                        draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly, t("Connections", "Verbindungen"), fonts, sub_text);
                         ly += 24.0;
                         if self.control.ethernet.is_empty() {
                             let msg = if self.network_hint == Network::Wired {
@@ -3118,7 +3133,7 @@ impl Panel {
                             ly += 34.0;
                         } else {
                             for dev in &self.control.ethernet {
-                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                let row = (8.0, ly, CC_WIDTH - 16.0, 38.0);
                                 let clickable = dev.managed && dev.plugged;
                                 if clickable && is_hov(row.0, row.1, row.2, row.3) {
                                     fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
@@ -3140,13 +3155,13 @@ impl Panel {
 
                         if let Some((wifi_on, ref ssid)) = self.control.wifi {
                             ly += 4.0;
-                            draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                            draw_sep(&mut sub_pm, s, 16.0, ly + 4.0, CC_WIDTH - 32.0, sep);
                             ly += 9.0;
-                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, "Wi-Fi", fonts, sub_text);
+                            draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly, "Wi-Fi", fonts, sub_text);
                             ly += 24.0;
-                            let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
-                            let circle_rect = (12.0, ly + 5.0, 28.0, 28.0);
-                            let open_rect = (42.0, ly, CC_WIDTH - 48.0, 38.0);
+                            let row = (8.0, ly, CC_WIDTH - 16.0, 38.0);
+                            let circle_rect = (14.0, ly + 5.0, 28.0, 28.0);
+                            let open_rect = (44.0, ly, CC_WIDTH - 52.0, 38.0);
                             if is_hov(open_rect.0, open_rect.1, open_rect.2, open_rect.3) {
                                 fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                             }
@@ -3176,14 +3191,14 @@ impl Panel {
                     }
 
                     Submenu::Bluetooth => {
-                        draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Devices", "Geräte"), fonts, sub_text);
+                        draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly, t("Devices", "Geräte"), fonts, sub_text);
                         ly += 24.0;
                         if self.control.bt_devices.is_empty() {
                             let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
                             fonts.draw(&mut sub_pm, t("No Devices", "Keine Geräte"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
                         } else {
                             for dev in &self.control.bt_devices {
-                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                let row = (8.0, ly, CC_WIDTH - 16.0, 38.0);
                                 if is_hov(row.0, row.1, row.2, row.3) {
                                     fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                                 }
@@ -3202,14 +3217,14 @@ impl Panel {
                     }
 
                     Submenu::Sound => {
-                        draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Output", "Ausgabe"), fonts, sub_text);
+                        draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly, t("Output", "Ausgabe"), fonts, sub_text);
                         ly += 24.0;
                         if self.control.audio_sinks.is_empty() {
                             let b = fonts.baseline_centered(ly * s, 34.0 * s, 12.0 * s, Weight::Regular);
                             fonts.draw(&mut sub_pm, t("No Output Devices", "Keine Ausgabegeräte"), (16.0 + slide_x) * s, b, 12.0 * s, Weight::Regular, sub_text);
                         } else {
                             for sink in &self.control.audio_sinks {
-                                let row = (6.0, ly, CC_WIDTH - 12.0, 38.0);
+                                let row = (8.0, ly, CC_WIDTH - 16.0, 38.0);
                                 if is_hov(row.0, row.1, row.2, row.3) {
                                     fill_rounded(&mut sub_pm, row.0 * s, row.1 * s, row.2 * s, row.3 * s, 8.0 * s, hover_bg);
                                 }
@@ -3220,9 +3235,9 @@ impl Panel {
                         }
                         // per-app volume
                         if !self.control.streams.is_empty() {
-                            draw_sep(&mut sub_pm, s, 14.0, ly + 4.0, CC_WIDTH - 28.0, sep);
+                            draw_sep(&mut sub_pm, s, 16.0, ly + 4.0, CC_WIDTH - 32.0, sep);
                             ly += 9.0;
-                            draw_section_header(&mut sub_pm, s, 14.0 + slide_x, ly, t("Apps", "Apps"), fonts, sub_text);
+                            draw_section_header(&mut sub_pm, s, 16.0 + slide_x, ly, t("Apps", "Apps"), fonts, sub_text);
                             ly += 24.0;
                             let stream_count = self.control.streams.len();
                             for i in 0..stream_count {
@@ -3237,15 +3252,15 @@ impl Panel {
                                     .unwrap_or(if st_muted { 0.0 } else { self.control.streams[i].volume.min(1.0) });
                                 let icon_px = (16.0 * s).round().max(1.0) as u32;
                                 let name_x = if let Some(icon) = apps.icon(&st_icon, icon_px) {
-                                    pm_draw_icon(&mut sub_pm, &icon, (14.0 + slide_x) * s, (ly + 3.0) * s, 16.0 * s);
-                                    36.0
+                                    pm_draw_icon(&mut sub_pm, &icon, (16.0 + slide_x) * s, (ly + 3.0) * s, 16.0 * s);
+                                    38.0
                                 } else {
-                                    14.0
+                                    16.0
                                 };
                                 let b = fonts.baseline_centered((ly + 2.0) * s, 18.0 * s, 12.0 * s, Weight::Regular);
                                 let label = fonts.elide(&st_name, 12.0 * s, Weight::Regular, (CC_WIDTH - name_x - 18.0) * s);
                                 fonts.draw(&mut sub_pm, &label, (name_x + slide_x) * s, b, 12.0 * s, Weight::Regular, text);
-                                let (tx, ty, tw, th) = (14.0 + slide_x, ly + 22.0, CC_WIDTH - 28.0, 20.0);
+                                let (tx, ty, tw, th) = (16.0 + slide_x, ly + 22.0, CC_WIDTH - 32.0, 20.0);
                                 let app_hov = is_hov(tx - 2.0, ty - 3.0, tw + 4.0, th + 6.0);
                                 let app_drag = matches!(self.dragging, Some(Target::AppVolume(idx, ..)) if idx == i);
                                 draw_pill_slider(&mut sub_pm, s, tx, ty, tw, th, shown, 1, st_muted, off, app_hov, app_drag, 1.0);
@@ -3285,13 +3300,13 @@ impl Panel {
         }
 
         // ---- Footer ("… Settings…") ----
-        draw_sep(pm, s, x0 + 14.0, cur_y + 2.0, CC_WIDTH - 28.0, sep);
-        let foot_rect = (x0 + 6.0, cur_y + 6.0, CC_WIDTH - 12.0, 30.0);
+        draw_sep(pm, s, x0 + 16.0, cur_y + 2.0, CC_WIDTH - 32.0, sep);
+        let foot_rect = (x0 + 8.0, cur_y + 6.0, CC_WIDTH - 16.0, 30.0);
         if self.hovered(foot_rect.0, foot_rect.1, foot_rect.2, foot_rect.3) {
             fill_rounded(pm, foot_rect.0 * s, foot_rect.1 * s, foot_rect.2 * s, foot_rect.3 * s, 8.0 * s, hover_bg);
         }
         let fb = fonts.baseline_centered(foot_rect.1 * s, foot_rect.3 * s, 12.5 * s, Weight::Regular);
-        fonts.draw(pm, settings_label, (x0 + 16.0) * s, fb, 12.5 * s, Weight::Regular, text);
+        fonts.draw(pm, settings_label, (x0 + 18.0) * s, fb, 12.5 * s, Weight::Regular, text);
         self.targets.push((foot_rect, Target::OpenSettings(settings_page)));
     }
 }
@@ -5048,16 +5063,16 @@ wlan0:wifi:connected:OfficeWiFi
         let pages = ControlCenterSettings::default().pages;
         let placed = pack_page(&pages[0]);
         assert_eq!(placed.len(), 8);
-        assert_eq!((placed[0].x, placed[0].y, placed[0].w, placed[0].h), (14.0, 0.0, 162.0, 162.0));
+        assert_eq!((placed[0].x, placed[0].y, placed[0].w, placed[0].h), (16.0, 0.0, 160.0, 160.0));
         assert_eq!((placed[1].x, placed[1].y), (186.0, 0.0));
-        assert_eq!((placed[2].x, placed[2].y), (14.0, 172.0));
-        assert_eq!((placed[3].x, placed[3].y), (100.0, 172.0));
-        assert_eq!((placed[4].x, placed[4].y), (186.0, 172.0));
-        assert_eq!((placed[5].x, placed[5].y), (272.0, 172.0));
-        assert_eq!((placed[6].x, placed[6].y, placed[6].w), (14.0, 258.0, 162.0));
-        assert_eq!((placed[7].x, placed[7].y, placed[7].w), (186.0, 258.0, 162.0));
+        assert_eq!((placed[2].x, placed[2].y), (16.0, 170.0));
+        assert_eq!((placed[3].x, placed[3].y), (101.0, 170.0));
+        assert_eq!((placed[4].x, placed[4].y), (186.0, 170.0));
+        assert_eq!((placed[5].x, placed[5].y), (271.0, 170.0));
+        assert_eq!((placed[6].x, placed[6].y, placed[6].w), (16.0, 255.0, 160.0));
+        assert_eq!((placed[7].x, placed[7].y, placed[7].w), (186.0, 255.0, 160.0));
         assert_eq!(content_rows(&placed), 4);
-        assert_eq!(content_height(&placed), 334.0);
+        assert_eq!(content_height(&placed), 330.0);
     }
 
     #[test]
