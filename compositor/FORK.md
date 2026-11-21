@@ -53,8 +53,8 @@ sudo dnf install libdisplay-info-devel libinput-devel libseat-devel systemd-deve
 `libdisplay-info-devel` is the one Orchard does not already need. Without it the
 `libdisplay-info` build script fails with a pkg-config error.
 
-The upstream tree also contains Nix and Debian packaging. They are kept for reference; Orchard
-does not use them.
+The upstream Nix packaging is kept for reference; Orchard does not use it. The upstream
+`debian/` directory was excluded from the import because Orchard packages through `dist/`.
 
 ## Running it today
 
