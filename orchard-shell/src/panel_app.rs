@@ -15,7 +15,7 @@ use crate::{
     menubar::BarItem,
     notify::{self, Hit},
     panel::{self, ControlRequest, ControlUpdate, Kind, Panel, Submenu, Target},
-    App, Surf, Which, BTN_LEFT,
+    App, Surf, Which, BTN_LEFT, BTN_RIGHT,
 };
 
 impl App {
@@ -54,6 +54,7 @@ impl App {
             p.night_shift = settings.night_shift.active_now();
             p.game_mode_enabled = settings.game_mode.enabled;
             p.game_active = self.game.clone();
+            p.apply_settings(&settings);
             if let Some(sub) = submenu {
                 p.standalone = true;
                 p.auto_network_submenu = item == BarItem::Network;
@@ -121,6 +122,7 @@ impl App {
             return;
         }
         self.panel_surf = None;
+        self.last_panel_backdrop = None;
         self.set_backdrop("orchard-panel", None);
         if matches!(
             self.menubar.open,
@@ -307,7 +309,14 @@ impl App {
     pub(crate) fn send_panel_backdrop(&mut self) {
         let Some(p) = self.panel.as_ref() else { return };
         let (x, y, w, h) = p.rect();
-        self.set_backdrop_alpha("orchard-panel", Some((x, y, w, h, 18.0, p.backdrop_alpha())));
+        let alpha = p.backdrop_alpha();
+        let key = (x, y, w, h, alpha);
+        if self.last_panel_backdrop == Some(key) {
+            return;
+        }
+        self.last_panel_backdrop = Some(key);
+        let radius = if p.kind == Kind::Control { 28.0 } else { 18.0 };
+        self.set_backdrop_alpha("orchard-panel", Some((x, y, w, h, radius, alpha)));
     }
 
     fn set_slider(&mut self, target: &Target, x: f32) {
@@ -348,17 +357,23 @@ impl App {
         let (x, y) = (x as f32, y as f32);
         match kind {
             PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
-                let (dragging, prev_hit) = match self.panel.as_ref() {
+                let (dragging, module_drag, prev_hit) = match self.panel.as_ref() {
                     Some(p) => (
                         p.dragging.clone(),
+                        p.cc_dragging(),
                         p.hover.and_then(|(hx, hy)| p.hit(hx, hy)),
                     ),
-                    None => (None, None),
+                    None => (None, false, None),
                 };
                 if let Some(p) = self.panel.as_mut() {
                     p.hover = Some((x, y));
                 }
-                if let Some(t) = dragging {
+                if module_drag {
+                    if let Some(p) = self.panel.as_mut() {
+                        p.cc_drag_module_to(x, y);
+                    }
+                    self.redraw(Which::Panel);
+                } else if let Some(t) = dragging {
                     self.set_slider(&t, x);
                 } else {
                     let new_hit = self.panel.as_ref().and_then(|p| p.hit(x, y));
@@ -373,19 +388,54 @@ impl App {
                 }
                 self.redraw(Which::Panel);
             }
-            PointerEventKind::Axis { vertical, .. } => {
+            PointerEventKind::Axis { horizontal, vertical, .. } => {
                 let dy = if vertical.discrete != 0 { vertical.discrete as f32 * 40.0 } else { vertical.absolute as f32 };
+                let dx = if horizontal.discrete != 0 { horizontal.discrete as f32 * 40.0 } else { horizontal.absolute as f32 };
+                let mut page_step = 0;
+                if dx.abs() > dy.abs() + 2.0 {
+                    page_step = if dx < 0.0 { 1 } else { -1 };
+                }
                 if let Some(p) = self.panel.as_mut() {
-                    p.scroll_by(dy);
+                    if p.kind == Kind::Notifications || p.submenu.is_some() {
+                        p.scroll_by(dy);
+                    } else if page_step != 0 {
+                        p.cc_page_step(page_step);
+                    } else {
+                        p.cc_scroll_by(dy);
+                    }
                 }
                 self.redraw(Which::Panel);
             }
             PointerEventKind::Release { button: BTN_LEFT, .. } => {
+                let module_drag = self.panel.as_ref().map(|p| p.cc_dragging()).unwrap_or(false);
+                if module_drag {
+                    if let Some(p) = self.panel.as_mut() {
+                        p.cc_end_module_drag();
+                    }
+                    self.redraw(Which::Panel);
+                    return;
+                }
                 let dragging = self.panel.as_mut().and_then(|p| p.dragging.take());
                 if let Some(t) = dragging {
                     // final value, whatever the throttle skipped
                     let v = Panel::slider_value(&t, x);
                     self.refresh_control(Some(t), v);
+                }
+            }
+            PointerEventKind::Press { button: BTN_RIGHT, .. } => {
+                let Some(p) = self.panel.as_ref() else { return };
+                if p.closing.is_some() {
+                    return;
+                }
+                if p.hit(x, y).is_some() {
+                    if p.kind == Kind::Control && p.submenu.is_none() {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_toggle_edit();
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                } else {
+                    self.close_panel();
                 }
             }
             PointerEventKind::Press { button: BTN_LEFT, .. } => {
@@ -400,6 +450,66 @@ impl App {
                 };
                 match target {
                     Target::Panel => {}
+                    Target::Page(i) => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_set_page(i);
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::ToggleEdit => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_toggle_edit();
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::OpenGallery => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_open_gallery();
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::CloseGallery => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_close_gallery();
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::AddModule(kind) => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_add_module(kind);
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::RemoveModule(kind) => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_remove_module(kind);
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::ResizeModule(kind) => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_resize_module(kind);
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::GrabModule(kind) => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_begin_module_drag(kind, x, y);
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::PageAdd => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_add_page();
+                        }
+                        self.redraw(Which::Panel);
+                    }
+                    Target::PageRemove => {
+                        if let Some(p) = self.panel.as_mut() {
+                            p.cc_remove_page();
+                        }
+                        self.redraw(Which::Panel);
+                    }
                     Target::Dnd => self.toggle_dnd(),
                     Target::NightShift => self.toggle_night_shift(),
                     Target::GameMode => self.toggle_game_mode(),

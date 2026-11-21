@@ -59,10 +59,11 @@ dist/           login session files + installer
   - Scrollable, with "Clear All". Click a notification to open it, or hover and click × to remove it.
   - Do Not Disturb silences banners (critical ones still show), shows a moon in the menu bar and is remembered across restarts.
 - **Control Center** (the switches icon left of the clock):
-  - Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`), Do Not Disturb and Night Shift toggles.
-  - Display brightness (laptops) and volume sliders, and Now Playing with previous / play-pause / next (`playerctl`).
-  - Sound (click its header): output devices, and a volume slider per app that is playing sound. Several streams of one app (browser tabs) share a row; the speaker mutes the app.
-  - Click outside or press Esc to close.
+  - An iOS 18-style grid of rounded modules: a Connectivity group with Wi-Fi (`nmcli`), Bluetooth (`bluetoothctl`), Ethernet and a network detail sheet, Focus, Night Shift, Game Mode, display brightness (laptops and DDC monitors), volume, Now Playing (`playerctl`) and display details.
+  - Fully customizable: right-click or use the pencil to enter edit mode, drag cards to reorder, hover to resize, tap − to remove, add controls or whole pages from the gallery. The layout is kept in `settings.json` (`control_center`), and every edit saves immediately.
+  - Pages slide horizontally (trackpad swipe, wheel or the page dots), long pages scroll, and detail sheets slide back into the grid.
+  - Opens with a macOS-style spring from the menu bar icon; modules cascade in with a short stagger. Animation frames are rendered into a reused offscreen buffer and only the panel's rectangle is repainted and damaged, so the rest of the screen is never touched.
+  - Click outside or press Esc to close; Esc first leaves the gallery, edit mode or a detail sheet.
 - **Lock screen** (`orchard-lock`; ⌃⌘Q, Apple menu → Lock Screen, hot corners, idle lock):
   - macOS style: date and a large clock at the top, your account picture (`~/.face`, else a silhouette), name and the password field at the bottom, over the blurred wallpaper. Sleep, Restart and Shut Down buttons sit below.
   - A wrong password shakes the field. A caps-lock badge shows in the field. Return or the arrow button checks the password through PAM (`/etc/pam.d/orchard-lock`, else swaylock's PAM file).

@@ -4,10 +4,13 @@
 
 use std::time::{Duration, Instant};
 
+use orchard_config::{ControlCenterSettings, ControlItem, ControlKind, ControlSize, Settings};
 use tiny_skia::{FillRule, LineCap, LineJoin, PathBuilder, Pixmap, PixmapPaint, Stroke, Transform};
 
 use crate::{
-    anim::{self, ease_in_cubic, ease_out_cubic, lerp, lerp_rgba, tap_scale, SpringFloat, SpringParams},
+    anim::{
+        self, ease_in_cubic, ease_out_cubic, lerp, lerp_rgba, scale_alpha, tap_scale, SpringFloat, SpringParams,
+    },
     apps::Apps,
     draw::{composite, fill_circle, fill_rounded, paint, stroke_rounded},
     notify::{self, CardHit, Center, Hit},
@@ -17,13 +20,31 @@ use crate::{
 };
 
 pub const NC_WIDTH: f32 = 356.0;
-pub const CC_WIDTH: f32 = 320.0;
+/// Width of the iOS-style Control Center grid: four 76 px columns, 10 px
+/// gutters and 14 px side padding.
+pub const CC_WIDTH: f32 = 362.0;
 const MARGIN: f32 = 10.0;
 const SLIDE_NC_OPEN: Duration = Duration::from_millis(240);
 const SLIDE_NC_CLOSE: Duration = Duration::from_millis(175);
-const CC_OPEN: Duration = Duration::from_millis(200);
-const CC_CLOSE: Duration = Duration::from_millis(130);
-const SUBMENU_ANIM: Duration = Duration::from_millis(190);
+const CC_OPEN: Duration = Duration::from_millis(420);
+const CC_CLOSE: Duration = Duration::from_millis(180);
+const SUBMENU_ANIM: Duration = Duration::from_millis(210);
+const PAGE_ANIM: Duration = Duration::from_millis(260);
+
+const CC_COLS: usize = 4;
+const CC_PAD: f32 = 14.0;
+const CC_GAP: f32 = 10.0;
+const CC_CELL: f32 = 76.0;
+const CC_TOP: f32 = 14.0;
+const CC_BOTTOM: f32 = 10.0;
+const CC_FOOTER: f32 = 32.0;
+const CC_RADIUS: f32 = 28.0;
+const MODULE_RADIUS: f32 = 22.0;
+const PAGE_DOT: f32 = 3.5;
+
+/// iOS-style per-module entrance delay while the panel opens.
+const STAGGER_STEP: f32 = 0.018;
+const STAGGER_LEN: f32 = 0.26;
 
 pub const PULSE_WIFI: usize = 0;
 pub const PULSE_BT: usize = 1;
@@ -81,6 +102,291 @@ impl PanelAnim {
             || self.displays.iter().any(|d| d.is_animating(now))
             || self.streams.iter().any(|st| st.is_animating(now))
             || self.pulses.iter().any(|p| tap_scale(*p, now).1)
+    }
+}
+
+/// One control placed on the four-column grid (logical panel coordinates,
+/// relative to the top-left of the page content).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PlacedModule {
+    kind: ControlKind,
+    /// Index in the page's `Vec<ControlItem>`.
+    item_index: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+/// A control picked up in edit mode.
+#[derive(Debug, Clone)]
+struct ModuleDrag {
+    kind: ControlKind,
+    pos: (f32, f32),
+}
+
+/// iOS 18-style Control Center state: pages, edit mode, drag reordering and
+/// the cached packed grid. Everything here is cheap to carry between frames.
+struct ControlCenterUi {
+    pages: Vec<Vec<ControlItem>>,
+    page: usize,
+    prev_page: usize,
+    page_since: Instant,
+    page_dir: i8,
+    edit: bool,
+    edit_since: Instant,
+    gallery: bool,
+    drag: Option<ModuleDrag>,
+    placed: Vec<PlacedModule>,
+    layout_dirty: bool,
+    /// Surface position of the page content (top-left), from the last paint.
+    content_origin: (f32, f32),
+    /// Canvas → surface offset while painting a page into an offscreen buffer.
+    hover_offset: (f32, f32),
+    scroll: SpringFloat,
+    scroll_target: f32,
+    /// Panel height in logical px for the current view, from the last paint.
+    height: f32,
+    /// Last surface height seen by a paint, for snapping mode changes.
+    screen_h: f32,
+    /// Last painted panel rect (surface coords), for partial redraws.
+    last_rect: (f32, f32, f32, f32),
+}
+
+impl ControlCenterUi {
+    fn new(pages: Vec<Vec<ControlItem>>) -> Self {
+        let now = Instant::now();
+        Self {
+            pages,
+            page: 0,
+            prev_page: 0,
+            page_since: now - PAGE_ANIM,
+            page_dir: 0,
+            edit: false,
+            edit_since: now,
+            gallery: false,
+            drag: None,
+            placed: Vec::with_capacity(16),
+            layout_dirty: true,
+            content_origin: (0.0, 0.0),
+            hover_offset: (0.0, 0.0),
+            scroll: SpringFloat::new(0.0, SpringParams::SLIDER),
+            scroll_target: 0.0,
+            height: 0.0,
+            screen_h: 800.0,
+            last_rect: (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    fn page_items(&self) -> &[ControlItem] {
+        self.pages.get(self.page).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn page_transition(&self, now: Instant) -> f32 {
+        if anim::reduced() || self.page_dir == 0 {
+            return 1.0;
+        }
+        ease_out_cubic((now.saturating_duration_since(self.page_since).as_secs_f32() / PAGE_ANIM.as_secs_f32()).clamp(0.0, 1.0))
+    }
+
+    fn in_transition(&self, now: Instant) -> bool {
+        self.page_dir != 0 && !anim::reduced() && now.saturating_duration_since(self.page_since) < PAGE_ANIM
+    }
+
+}
+
+/// Pack controls into the four-column grid in list order: first free slot,
+/// row by row. `Large` controls therefore get a 2 × 2 block, wide ones a 2 × 1
+/// run, and so on, exactly like iOS Control Center.
+fn pack_page(items: &[ControlItem]) -> Vec<PlacedModule> {
+    let mut occupied: Vec<[bool; CC_COLS]> = Vec::new();
+    let mut out: Vec<PlacedModule> = Vec::with_capacity(items.len());
+    for (item_index, item) in items.iter().enumerate() {
+        let (sw, sh) = {
+            let (w, h) = item.size.span();
+            (w.min(CC_COLS), h.max(1))
+        };
+        let mut placed = None;
+        let mut row = 0usize;
+        'search: loop {
+            if row + sh > occupied.len() {
+                occupied.resize(row + sh, [false; CC_COLS]);
+            }
+            for col in 0..=(CC_COLS - sw) {
+                let free = (row..row + sh).all(|r| (col..col + sw).all(|c| !occupied[r][c]));
+                if free {
+                    for r in row..row + sh {
+                        for c in col..col + sw {
+                            occupied[r][c] = true;
+                        }
+                    }
+                    placed = Some((col, row));
+                    break 'search;
+                }
+            }
+            row += 1;
+            if row > 512 {
+                // Defensive: a malformed size can never loop forever.
+                break;
+            }
+        }
+        let Some((col, row)) = placed else { continue };
+        out.push(PlacedModule {
+            kind: item.kind,
+            item_index,
+            x: CC_PAD + col as f32 * (CC_CELL + CC_GAP),
+            y: row as f32 * (CC_CELL + CC_GAP),
+            w: sw as f32 * CC_CELL + (sw.saturating_sub(1)) as f32 * CC_GAP,
+            h: sh as f32 * CC_CELL + (sh.saturating_sub(1)) as f32 * CC_GAP,
+        });
+    }
+    out
+}
+
+fn content_rows(placed: &[PlacedModule]) -> usize {
+    placed
+        .iter()
+        .map(|p| ((p.y + p.h) / (CC_CELL + CC_GAP)).ceil() as usize)
+        .max()
+        .unwrap_or(0)
+}
+
+fn content_height(placed: &[PlacedModule]) -> f32 {
+    let rows = content_rows(placed);
+    if rows == 0 {
+        0.0
+    } else {
+        rows as f32 * CC_CELL + (rows - 1) as f32 * CC_GAP
+    }
+}
+
+/// Semantic colours for the Control Center modules, pre-faded for the
+/// staggered entrance so no per-shape alpha maths is needed later.
+#[derive(Clone, Copy)]
+struct CcLook {
+    text: Rgba,
+    sub: Rgba,
+    faint: Rgba,
+    card: Rgba,
+    card_hover: Rgba,
+    border: Rgba,
+    off: Rgba,
+    hover: Rgba,
+    accent: Rgba,
+}
+
+impl CcLook {
+    fn new(theme: &Theme, alpha: f32) -> Self {
+        let alpha = alpha.clamp(0.0, 1.0);
+        let dark = theme.bar_text[0] > 128;
+        let f = |c: Rgba| scale_alpha(c, alpha);
+        if dark {
+            Self {
+                text: f([245, 245, 247, 250]),
+                sub: f([235, 235, 240, 155]),
+                faint: f([235, 235, 240, 90]),
+                card: f([255, 255, 255, 30]),
+                card_hover: f([255, 255, 255, 46]),
+                border: f([255, 255, 255, 18]),
+                off: f([120, 120, 128, 125]),
+                hover: f([255, 255, 255, 20]),
+                accent: f(theme.menu_selection),
+            }
+        } else {
+            Self {
+                text: f([20, 20, 22, 255]),
+                sub: f([60, 60, 67, 145]),
+                faint: f([60, 60, 67, 85]),
+                card: f([255, 255, 255, 178]),
+                card_hover: f([255, 255, 255, 232]),
+                border: f([0, 0, 0, 20]),
+                off: f([106, 106, 113, 150]),
+                hover: f([0, 0, 0, 13]),
+                accent: f(theme.menu_selection),
+            }
+        }
+    }
+}
+
+fn next_module_size(kind: ControlKind, size: ControlSize) -> ControlSize {
+    match kind {
+        ControlKind::Connectivity | ControlKind::NowPlaying => match size {
+            ControlSize::Large => ControlSize::Wide,
+            _ => ControlSize::Large,
+        },
+        ControlKind::Brightness | ControlKind::Volume => match size {
+            ControlSize::Wide => ControlSize::Full,
+            _ => ControlSize::Wide,
+        },
+        _ => match size {
+            ControlSize::Small => ControlSize::Wide,
+            _ => ControlSize::Small,
+        },
+    }
+}
+
+fn module_name(kind: ControlKind, german: bool) -> &'static str {
+    match kind {
+        ControlKind::Connectivity => {
+            if german {
+                "Konnektivität"
+            } else {
+                "Connectivity"
+            }
+        }
+        ControlKind::Wifi => "Wi-Fi",
+        ControlKind::Bluetooth => "Bluetooth",
+        ControlKind::NowPlaying => {
+            if german {
+                "Wiedergabe"
+            } else {
+                "Now Playing"
+            }
+        }
+        ControlKind::Focus => {
+            if german {
+                "Fokus"
+            } else {
+                "Focus"
+            }
+        }
+        ControlKind::NightShift => "Night Shift",
+        ControlKind::GameMode => {
+            if german {
+                "Spielmodus"
+            } else {
+                "Game Mode"
+            }
+        }
+        ControlKind::Brightness => {
+            if german {
+                "Helligkeit"
+            } else {
+                "Brightness"
+            }
+        }
+        ControlKind::Volume => {
+            if german {
+                "Lautstärke"
+            } else {
+                "Volume"
+            }
+        }
+        ControlKind::Network => {
+            if german {
+                "Netzwerk"
+            } else {
+                "Network"
+            }
+        }
+        ControlKind::Sound => {
+            if german {
+                "Ton"
+            } else {
+                "Sound"
+            }
+        }
+        ControlKind::Displays => "Displays",
     }
 }
 
@@ -360,6 +666,18 @@ pub enum Target {
     MediaPrev,
     MediaPlay,
     MediaNext,
+    /// Control Center page switched from a dot.
+    Page(usize),
+    /// Edit-mode toolbar.
+    ToggleEdit,
+    OpenGallery,
+    CloseGallery,
+    AddModule(ControlKind),
+    RemoveModule(ControlKind),
+    ResizeModule(ControlKind),
+    GrabModule(ControlKind),
+    PageAdd,
+    PageRemove,
     /// inside the panel, nothing interactive
     Panel,
 }
@@ -396,6 +714,12 @@ pub struct Panel {
     /// the game Game Mode is on for
     pub game_active: Option<String>,
     anim: PanelAnim,
+    /// iOS-style grid, edit mode and page state.
+    cc: ControlCenterUi,
+    /// Reused offscreen buffer for the panel's scale/fade opening animation.
+    cc_buf: Option<Pixmap>,
+    /// Reused buffer for clipped/scrolled/paging page content.
+    body_buf: Option<Pixmap>,
     // filled by paint, used for hit tests
     targets: Vec<((f32, f32, f32, f32), Target)>,
     cards: Vec<CardHit>,
@@ -426,9 +750,29 @@ impl Panel {
             game_mode_enabled: true,
             game_active: None,
             anim: PanelAnim::new(),
+            cc: ControlCenterUi::new(ControlCenterSettings::default().pages),
+            cc_buf: None,
+            body_buf: None,
             targets: Vec::new(),
             cards: Vec::new(),
             panel_rect: (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    /// Load the user's Control Center layout. Kept separate from [`Panel::new`]
+    /// so unit tests and the default UI stay deterministic.
+    pub fn apply_settings(&mut self, settings: &Settings) {
+        let mut pages = settings.control_center.sanitized().pages;
+        if pages.is_empty() {
+            pages = ControlCenterSettings::default().pages;
+        }
+        if pages.is_empty() {
+            pages.push(Vec::new());
+        }
+        if pages != self.cc.pages {
+            self.cc.pages = pages;
+            self.cc.page = self.cc.page.min(self.cc.pages.len().saturating_sub(1));
+            self.cc.layout_dirty = true;
         }
     }
 
@@ -482,6 +826,264 @@ impl Panel {
         self.dragging = None;
     }
 
+    // ---- Control Center layout / edit mode ----------------------------------
+
+    fn ensure_layout(&mut self) {
+        if !self.cc.layout_dirty {
+            return;
+        }
+        self.cc.placed = if self.cc.gallery {
+            let items: Vec<ControlItem> = ControlKind::ALL
+                .into_iter()
+                .map(|k| ControlItem::new(k, ControlSize::Small))
+                .collect();
+            pack_page(&items)
+        } else {
+            pack_page(self.cc.page_items())
+        };
+        self.cc.layout_dirty = false;
+    }
+
+    /// Height of the current page / gallery, clamped to the space available
+    /// below the menu bar.
+    fn cc_height(&mut self, screen_h: f32) -> f32 {
+        self.ensure_layout();
+        let content = if self.cc.gallery {
+            let rows = content_rows(&self.cc.placed);
+            if rows == 0 {
+                96.0
+            } else {
+                rows as f32 * CC_CELL + (rows - 1) as f32 * CC_GAP + 54.0
+            }
+        } else if self.cc.placed.is_empty() {
+            132.0
+        } else {
+            content_height(&self.cc.placed)
+        };
+        let max_content =
+            (screen_h - 6.0 - MARGIN - CC_TOP - CC_FOOTER - CC_BOTTOM).max(CC_CELL + 12.0);
+        let body = content.min(max_content);
+        self.cc.height = CC_TOP + body + CC_FOOTER + CC_BOTTOM;
+        self.cc.height
+    }
+
+    fn body_height(&self) -> f32 {
+        (self.cc.height - CC_TOP - CC_FOOTER - CC_BOTTOM).max(0.0)
+    }
+
+    fn update_scroll_target(&mut self) {
+        let content = if self.cc.gallery {
+            let rows = content_rows(&self.cc.placed);
+            (rows as f32 * CC_CELL + (rows - 1).max(0) as f32 * CC_GAP + 54.0).max(0.0)
+        } else if self.cc.placed.is_empty() {
+            132.0
+        } else {
+            content_height(&self.cc.placed)
+        };
+        let max = (content - self.body_height()).max(0.0);
+        self.cc.scroll_target = self.cc.scroll_target.clamp(0.0, max);
+    }
+
+    pub fn cc_toggle_edit(&mut self) {
+        self.cc.edit = !self.cc.edit;
+        self.cc.edit_since = Instant::now();
+        self.cc.gallery = false;
+        self.cc.drag = None;
+        self.cc.layout_dirty = true;
+    }
+
+    pub fn cc_open_gallery(&mut self) {
+        self.cc.gallery = true;
+        self.cc.edit = true;
+        self.cc.drag = None;
+        self.cc.scroll_target = 0.0;
+        self.cc.scroll.snap(0.0);
+        self.cc.layout_dirty = true;
+        // A mode switch, not a content morph: make the sheet large enough on
+        // the very first frame instead of letting rows clip while it grows.
+        let target = self.cc_height(self.cc.screen_h);
+        self.anim.panel_h.snap(target);
+        self.anim.panel_h_init = true;
+    }
+
+    pub fn cc_close_gallery(&mut self) {
+        self.cc.gallery = false;
+        self.cc.layout_dirty = true;
+        self.cc.scroll_target = 0.0;
+        self.cc.scroll.snap(0.0);
+    }
+
+    pub fn cc_add_module(&mut self, kind: ControlKind) {
+        // A control lives on exactly one page. Adding it from the gallery of
+        // another page moves it here instead of silently doing nothing.
+        for page in &mut self.cc.pages {
+            page.retain(|c| c.kind != kind);
+        }
+        if self.cc.pages.is_empty() {
+            self.cc.pages.push(Vec::new());
+        }
+        let page = self.cc.page.min(self.cc.pages.len() - 1);
+        self.cc.page = page;
+        self.cc.pages[page].push(ControlItem::with_default_size(kind));
+        self.cc_close_gallery();
+        self.cc.layout_dirty = true;
+        self.save_layout();
+    }
+
+    pub fn cc_remove_module(&mut self, kind: ControlKind) {
+        // Controls are unique across pages, so a remove from the gallery or
+        // an edit badge removes it wherever it lives.
+        for page in &mut self.cc.pages {
+            page.retain(|c| c.kind != kind);
+        }
+        self.cc.layout_dirty = true;
+        self.save_layout();
+    }
+
+    pub fn cc_resize_module(&mut self, kind: ControlKind) {
+        if let Some(item) = self.cc.pages.get_mut(self.cc.page).and_then(|p| p.iter_mut().find(|c| c.kind == kind)) {
+            item.size = next_module_size(item.kind, item.size);
+        }
+        self.cc.layout_dirty = true;
+        self.save_layout();
+    }
+
+    pub fn cc_set_page(&mut self, page: usize) {
+        let page = page.min(self.cc.pages.len().saturating_sub(1));
+        if page == self.cc.page {
+            return;
+        }
+        self.cc.prev_page = self.cc.page;
+        self.cc.page_dir = if page > self.cc.page { 1 } else { -1 };
+        self.cc.page = page;
+        self.cc.page_since = Instant::now();
+        self.cc.scroll_target = 0.0;
+        self.cc.scroll.snap(0.0);
+        self.cc.layout_dirty = true;
+        self.cc.gallery = false;
+    }
+
+    pub fn cc_page_step(&mut self, step: i32) {
+        if step == 0 || self.cc.pages.is_empty() {
+            return;
+        }
+        let next = (self.cc.page as i32 + step).clamp(0, self.cc.pages.len() as i32 - 1) as usize;
+        self.cc_set_page(next);
+    }
+
+    pub fn cc_add_page(&mut self) {
+        self.cc.prev_page = self.cc.page;
+        self.cc.page_dir = 1;
+        self.cc.pages.push(Vec::new());
+        self.cc.page = self.cc.pages.len() - 1;
+        self.cc.page_since = Instant::now();
+        self.cc.scroll_target = 0.0;
+        self.cc.scroll.snap(0.0);
+        self.cc.layout_dirty = true;
+        self.cc.gallery = true;
+        self.cc.edit = true;
+        self.save_layout();
+    }
+
+    pub fn cc_remove_page(&mut self) {
+        if self.cc.pages.len() <= 1 {
+            return;
+        }
+        self.cc.pages.remove(self.cc.page);
+        self.cc.prev_page = self.cc.page;
+        self.cc.page = self.cc.page.min(self.cc.pages.len() - 1);
+        self.cc.page_dir = -1;
+        self.cc.page_since = Instant::now();
+        self.cc.scroll_target = 0.0;
+        self.cc.scroll.snap(0.0);
+        self.cc.layout_dirty = true;
+        self.save_layout();
+    }
+
+    pub fn cc_scroll_by(&mut self, dy: f32) {
+        self.cc.scroll_target = (self.cc.scroll_target + dy).max(0.0);
+        self.update_scroll_target();
+    }
+
+    pub fn cc_begin_module_drag(&mut self, kind: ControlKind, x: f32, y: f32) {
+        self.cc.drag = Some(ModuleDrag { kind, pos: (x, y) });
+    }
+
+    pub fn cc_drag_module_to(&mut self, x: f32, y: f32) {
+        let Some(drag) = self.cc.drag.as_ref() else { return };
+        let kind = drag.kind;
+        let (ox, oy) = self.cc.content_origin;
+        let px = x - ox;
+        let py = y - oy + self.cc.scroll.value(Instant::now());
+        // Nearest other module in the last packed grid. Live reflow is smoother
+        // than a drop indicator and needs no extra state.
+        let target = self
+            .cc
+            .placed
+            .iter()
+            .filter(|p| p.kind != kind)
+            .min_by(|a, b| {
+                let da = (a.x + a.w / 2.0 - px).powi(2) + (a.y + a.h / 2.0 - py).powi(2);
+                let db = (b.x + b.w / 2.0 - px).powi(2) + (b.y + b.h / 2.0 - py).powi(2);
+                da.total_cmp(&db)
+            })
+            .copied();
+        if let Some(drag) = self.cc.drag.as_mut() {
+            drag.pos = (x, y);
+        }
+        if let Some(target) = target {
+            let Some(page) = self.cc.pages.get_mut(self.cc.page) else { return };
+            let Some(from) = page.iter().position(|c| c.kind == kind) else { return };
+            if from != target.item_index {
+                let item = page.remove(from);
+                let insert = if from < target.item_index { target.item_index - 1 } else { target.item_index };
+                page.insert(insert.min(page.len()), item);
+                self.cc.layout_dirty = true;
+            }
+        }
+    }
+
+    pub fn cc_end_module_drag(&mut self) {
+        if self.cc.drag.take().is_some() {
+            self.cc.layout_dirty = true;
+            self.save_layout();
+        }
+    }
+
+    pub fn cc_dragging(&self) -> bool {
+        self.cc.drag.is_some()
+    }
+
+    /// Escape leaves the innermost Control Center mode. Returns `false` when
+    /// the panel itself should close instead.
+    pub fn cc_escape(&mut self) -> bool {
+        if self.cc.drag.is_some() {
+            self.cc_end_module_drag();
+            true
+        } else if self.cc.gallery {
+            self.cc_close_gallery();
+            true
+        } else if self.cc.edit {
+            self.cc_toggle_edit();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn save_layout(&self) {
+        let mut settings = Settings::load();
+        settings.control_center.pages = self.cc.pages.clone();
+        if let Err(e) = settings.save() {
+            tracing::warn!("saving Control Center layout: {e}");
+        }
+    }
+
+    /// Rect of the last painted panel, for partial surface repaints.
+    pub fn last_rect(&self) -> (f32, f32, f32, f32) {
+        self.cc.last_rect
+    }
+
     pub fn is_animating(&self) -> bool {
         let now = Instant::now();
         if self.closing.is_some() {
@@ -491,7 +1093,12 @@ impl Panel {
             Kind::Notifications => SLIDE_NC_OPEN,
             Kind::Control => CC_OPEN,
         };
-        (!anim::reduced() && (self.opened.elapsed() < open_dur || self.submenu_since.elapsed() < SUBMENU_ANIM))
+        (!anim::reduced()
+            && (self.opened.elapsed() < open_dur
+                || self.submenu_since.elapsed() < SUBMENU_ANIM
+                || self.cc.in_transition(now)))
+            || self.cc.scroll.is_animating(now)
+            || (self.kind == Kind::Control && self.cc.edit && self.submenu.is_none() && !self.cc.gallery)
             || self.anim.is_animating(now)
     }
 
@@ -533,7 +1140,8 @@ impl Panel {
         ease_out_cubic(t)
     }
 
-    fn sync_springs(&mut self, center: &Center, now: Instant) {
+    fn sync_springs(&mut self, center: &Center, now: Instant, screen_h: f32) {
+        self.cc.screen_h = screen_h;
         let dnd = if center.do_not_disturb { 1.0 } else { 0.0 };
         let night = if self.night_shift { 1.0 } else { 0.0 };
         let game = if self.game_mode_enabled || self.game_active.is_some() { 1.0 } else { 0.0 };
@@ -547,6 +1155,20 @@ impl Panel {
         let others = if self.wifi_others_open { 1.0 } else { 0.0 };
         let (vol_raw, muted) = self.control.volume.unwrap_or((0.0, true));
         let vol = if muted { 0.0 } else { vol_raw.clamp(0.0, 1.0) };
+
+        // Pack the page before the spring initialisation early-return below,
+        // so the very first frame already knows its modules and height.
+        if self.kind == Kind::Control && self.submenu.is_none() {
+            let target = self.cc_height(screen_h);
+            if !self.anim.panel_h_init {
+                self.anim.panel_h.snap(target);
+                self.anim.panel_h_init = true;
+            } else {
+                self.anim.panel_h.set_target(target, now);
+            }
+            self.update_scroll_target();
+            self.cc.scroll.set_target(self.cc.scroll_target, now);
+        }
 
         if !self.anim.initialized {
             self.anim.dnd.snap(dnd);
@@ -622,12 +1244,24 @@ impl Panel {
                 }
             }
         }
+
     }
 
     fn hovered(&self, rx: f32, ry: f32, rw: f32, rh: f32) -> bool {
         self.hover
             .map(|(hx, hy)| hx >= rx && hx < rx + rw && hy >= ry && hy < ry + rh)
             .unwrap_or(false)
+    }
+
+    /// Hover test for a rect in the current page canvas (which may be an
+    /// offscreen buffer while scrolling or paging).
+    fn module_hovered(&self, rx: f32, ry: f32, rw: f32, rh: f32) -> bool {
+        self.hovered(
+            rx + self.cc.hover_offset.0,
+            ry + self.cc.hover_offset.1,
+            rw,
+            rh,
+        )
     }
 
     /// The panel's rect (for the frosted backdrop), surface coordinates.
@@ -641,7 +1275,9 @@ impl Panel {
                 return Some(Target::Card(h));
             }
         }
-        for ((rx, ry, rw, rh), t) in &self.targets {
+        // Last painted wins, so edit badges and small controls layered over a
+        // module body can take the click.
+        for ((rx, ry, rw, rh), t) in self.targets.iter().rev() {
             if x >= *rx && x < rx + rw && y >= *ry && y < ry + rh {
                 return Some(t.clone());
             }
@@ -680,7 +1316,7 @@ impl Panel {
         let now = Instant::now();
         self.targets.clear();
         self.cards.clear();
-        self.sync_springs(center, now);
+        self.sync_springs(center, now, h);
         match self.kind {
             Kind::Notifications => self.paint_nc(pm, s, w, h, center, apps, fonts, theme, german, now),
             Kind::Control => self.paint_control_wrapped(pm, s, w, h, center, apps, fonts, theme, german, now),
@@ -708,18 +1344,34 @@ impl Panel {
             return;
         }
         let x0 = (self.anchor_right - CC_WIDTH).clamp(MARGIN, (w - CC_WIDTH - MARGIN).max(MARGIN));
-        let y0 = 6.0 - (1.0 - factor) * 8.0;
+        let y0 = 6.0 - (1.0 - factor) * 10.0;
 
         if factor < 0.999 {
-            let pop_scale = 0.955 + 0.045 * factor;
-            // Paint into a tight offscreen buffer at origin (0, 0) and composite anchored at top-right.
+            // macOS Control Center: a quick top-right anchored pop, with the
+            // modules themselves cascading in one after another.
+            let pop_scale = 0.84 + 0.16 * factor;
             let max_h = (h - MARGIN).max(1.0);
+            let content_h = match self.submenu {
+                Some(_) => max_h,
+                None => self.anim.panel_h.value(now).clamp(110.0, max_h),
+            };
             let bw = (CC_WIDTH * s).ceil().max(1.0) as u32;
-            let bh = (max_h * s).ceil().max(1.0) as u32;
-            if let Some(mut buf) = Pixmap::new(bw, bh) {
+            let bh = (content_h * s).ceil().max(1.0) as u32;
+            if self
+                .cc_buf
+                .as_ref()
+                .map(|b| b.width() != bw || b.height() != bh)
+                .unwrap_or(true)
+            {
+                self.cc_buf = Pixmap::new(bw, bh);
+            }
+            if let Some(mut buf) = self.cc_buf.take() {
+                buf.fill(tiny_skia::Color::TRANSPARENT);
                 match self.submenu {
                     None => self.paint_cc(&mut buf, s, 0.0, 0.0, center, fonts, theme, german, now),
-                    Some(sub) => self.paint_cc_submenu(&mut buf, s, 0.0, 0.0, max_h, sub, apps, fonts, theme, german, now),
+                    Some(sub) => {
+                        self.paint_cc_submenu(&mut buf, s, 0.0, 0.0, max_h, sub, apps, fonts, theme, german, now)
+                    }
                 }
                 let card_h = self.panel_rect.3;
                 let scaled_w = CC_WIDTH * pop_scale;
@@ -728,8 +1380,10 @@ impl Panel {
                 let draw_x = x0 + (CC_WIDTH - scaled_w);
                 let draw_y = y0;
                 self.panel_rect = (draw_x, draw_y, scaled_w, scaled_h);
+                self.cc.last_rect = self.panel_rect;
                 composite(pm, &buf, draw_x * s, draw_y * s, pop_scale, factor);
-                if self.closing.is_some() {
+                self.cc_buf = Some(buf);
+                if self.closing.is_some() || self.cc.in_transition(now) {
                     self.targets.clear();
                 } else {
                     for ((rx, ry, rw, rh), _) in &mut self.targets {
@@ -747,7 +1401,8 @@ impl Panel {
             None => self.paint_cc(pm, s, x0, y0, center, fonts, theme, german, now),
             Some(sub) => self.paint_cc_submenu(pm, s, x0, y0, h, sub, apps, fonts, theme, german, now),
         }
-        if self.closing.is_some() {
+        self.cc.last_rect = self.panel_rect;
+        if self.closing.is_some() || self.cc.in_transition(now) {
             self.targets.clear();
         }
     }
@@ -773,6 +1428,7 @@ impl Panel {
         let x0 = w - NC_WIDTH - MARGIN + slide;
         let (top, bottom) = (MARGIN, h - MARGIN);
         self.panel_rect = (x0, top, NC_WIDTH, bottom - top);
+        self.cc.last_rect = self.panel_rect;
         let dark = theme.bar_text[0] > 128;
         let tint: Rgba = if dark { [30, 30, 32, 150] } else { [240, 240, 242, 150] };
         let card: Rgba = if dark { [255, 255, 255, 22] } else { [255, 255, 255, 150] };
@@ -896,7 +1552,7 @@ impl Panel {
         PREV_CARDS.with(|c| *c.borrow_mut() = self.cards.iter().map(|h| (h.id, h.rect)).collect());
     }
 
-    // ---- Control Center (main view) ------------------------------------------
+    // ---- Control Center (iOS 18 module grid) ---------------------------------
 
     #[allow(clippy::too_many_arguments)]
     fn paint_cc(
@@ -911,334 +1567,1029 @@ impl Panel {
         german: bool,
         now: Instant,
     ) {
-        let t = |en: &'static str, de: &'static str| if german { de } else { en };
+        let _ = center;
         let dark = theme.bar_text[0] > 128;
-        let tint: Rgba = if dark { [30, 30, 32, 160] } else { [242, 242, 245, 170] };
-        let border: Rgba = if dark { [255, 255, 255, 34] } else { [0, 0, 0, 22] };
-        let card: Rgba = if dark { [255, 255, 255, 22] } else { [255, 255, 255, 155] };
-        let card_border: Rgba = if dark { [255, 255, 255, 18] } else { [0, 0, 0, 12] };
-        let off: Rgba = if dark { [255, 255, 255, 40] } else { [0, 0, 0, 26] };
-        let hover_bg: Rgba = if dark { [255, 255, 255, 18] } else { [0, 0, 0, 12] };
-        let accent = theme.menu_selection;
-        let text = theme.menu_text;
-        let sub: Rgba = if dark { [235, 235, 235, 130] } else { [20, 20, 20, 120] };
-
-        let pad = 10.0;
-        let slide_x = if self.submenu_returning { -(1.0 - self.sub_progress()) * 10.0 } else { 0.0 };
-        let inner_x = x0 + pad + slide_x;
-        let inner_w = CC_WIDTH - 2.0 * pad;
-        let half = (inner_w - pad) / 2.0;
-
-        // compute target height and morph container smoothly from previous view
-        let mut target_h = pad + 110.0 + pad;
-        target_h += GAME_CARD_H + pad;
-        let disp_count = self.control.displays.len();
-        if disp_count == 1 {
-            target_h += 64.0 + pad;
-        } else if disp_count > 1 {
-            target_h += 28.0 + disp_count as f32 * 44.0 + 6.0 + pad;
-        }
-        target_h += 64.0 + pad; // sound
-        if self.control.media.is_some() {
-            target_h += 64.0 + pad;
-        }
-        if !self.anim.panel_h_init {
-            self.anim.panel_h.snap(target_h);
-            self.anim.panel_h_init = true;
-        } else {
-            self.anim.panel_h.set_target(target_h, now);
-        }
-        let height = self.anim.panel_h.sample(now).max(120.0);
+        let solid = theme.menu_bg[3] > 200;
+        let height = self.anim.panel_h.sample(now).clamp(110.0, 4000.0);
+        self.cc.height = height;
         self.panel_rect = (x0, y0, CC_WIDTH, height);
-        fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, tint);
-        stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, 18.0 * s, 1.0 * s, border);
 
-        let wifi_t = self.anim.wifi.sample(now).clamp(0.0, 1.0);
-        let eth_t = self.anim.ethernet.sample(now).clamp(0.0, 1.0);
-        let bt_t = self.anim.bluetooth.sample(now).clamp(0.0, 1.0);
-        let dnd_t = self.anim.dnd.sample(now).clamp(0.0, 1.0);
-        let night_t = self.anim.night_shift.sample(now).clamp(0.0, 1.0);
-        let game_t = self.anim.game_mode.sample(now).clamp(0.0, 1.0);
-        let vol_val = self.anim.vol.sample(now).clamp(0.0, 1.0);
+        let tint: Rgba = if dark {
+            if solid { [28, 28, 30, 248] } else { [18, 18, 22, 122] }
+        } else if solid {
+            [244, 244, 247, 250]
+        } else {
+            [246, 246, 250, 150]
+        };
+        let edge: Rgba = if dark { [255, 255, 255, 30] } else { [0, 0, 0, 18] };
+        fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, CC_RADIUS * s, tint);
+        stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, height * s, CC_RADIUS * s, 1.0 * s, edge);
 
-        // connectivity card: Wi-Fi / Ethernet (dynamic by active connection) + Bluetooth
-        let y = y0 + pad;
-        fill_rounded(pm, inner_x * s, y * s, half * s, 110.0 * s, 14.0 * s, card);
-        stroke_rounded(pm, inner_x * s, y * s, half * s, 110.0 * s, 14.0 * s, 0.75 * s, card_border);
+        let body_h = (height - CC_TOP - CC_FOOTER - CC_BOTTOM).max(0.0);
+        let content_y = y0 + CC_TOP;
+        let scroll = self.cc.scroll.sample(now).clamp(0.0, 100000.0);
+        let trans = self.cc.in_transition(now);
+        let page_p = self.cc.page_transition(now);
+        let dir = self.cc.page_dir as f32;
+        // Sliding back from a detail sheet: the grid re-enters from the left.
+        let return_slide = if self.submenu_returning {
+            -(1.0 - self.sub_progress()) * 16.0
+        } else {
+            0.0
+        };
 
-        let (wifi_on, ssid) = self.control.wifi.clone().unwrap_or((false, None));
-        let bt_connected: Vec<&str> = self
-            .control
-            .bt_devices
-            .iter()
-            .filter(|d| d.connected)
-            .map(|d| d.name.as_str())
-            .collect();
-        let bt_status = match self.control.bluetooth {
-            Some(true) => match bt_connected.len() {
-                0 => t("On", "Ein").to_string(),
-                1 => bt_connected[0].to_string(),
-                n => {
-                    if german {
-                        format!("{n} Geräte")
+        if self.cc.gallery {
+            self.paint_gallery(pm, s, x0, content_y, body_h, theme, fonts, german, now);
+        } else if self.cc.placed.is_empty() {
+            self.paint_empty_page(pm, s, x0, content_y, body_h, theme, fonts, german);
+        } else {
+            let content = self.ensure_scroll_height();
+            let needs_body = trans || content > body_h + 0.5 || scroll > 0.5;
+            if needs_body {
+                let bw = (CC_WIDTH * s).ceil().max(1.0) as u32;
+                let bh = (body_h * s).ceil().max(1.0) as u32;
+                if self
+                    .body_buf
+                    .as_ref()
+                    .map(|b| b.width() != bw || b.height() != bh)
+                    .unwrap_or(true)
+                {
+                    self.body_buf = Pixmap::new(bw, bh);
+                }
+                if let Some(mut buf) = self.body_buf.take() {
+                    buf.fill(tiny_skia::Color::TRANSPARENT);
+                    let mut local: Vec<((f32, f32, f32, f32), Target)> = Vec::new();
+                    if trans {
+                        let prev = pack_page(self.cc.pages.get(self.cc.prev_page).map(Vec::as_slice).unwrap_or(&[]));
+                        let current = std::mem::take(&mut self.cc.placed);
+                        self.paint_page(
+                            &mut buf,
+                            s,
+                            &prev,
+                            (-dir * page_p * CC_WIDTH, 0.0),
+                            (x0, content_y),
+                            fonts,
+                            theme,
+                            german,
+                            now,
+                            false,
+                            &mut local,
+                        );
+                        self.paint_page(
+                            &mut buf,
+                            s,
+                            &current,
+                            (dir * (1.0 - page_p) * CC_WIDTH, -scroll),
+                            (x0, content_y),
+                            fonts,
+                            theme,
+                            german,
+                            now,
+                            false,
+                            &mut local,
+                        );
+                        self.cc.placed = current;
                     } else {
-                        format!("{n} Devices")
+                        // Current page, drawn into the clipped body buffer.
+                        self.paint_page_current(
+                            &mut buf,
+                            s,
+                            (return_slide, -scroll),
+                            (x0, content_y),
+                            fonts,
+                            theme,
+                            german,
+                            now,
+                            true,
+                            &mut local,
+                        );
+                    }
+                    composite(pm, &buf, x0 * s, content_y * s, 1.0, 1.0);
+                    self.body_buf = Some(buf);
+                    // A scrolled-out module must not leave a clickable strip
+                    // above or below the visible body.
+                    let (vx0, vy0) = (x0, content_y);
+                    let (vx1, vy1) = (x0 + CC_WIDTH, content_y + body_h);
+                    for ((rx, ry, rw, rh), t) in local {
+                        let x1 = (rx + rw).min(vx1);
+                        let y1 = (ry + rh).min(vy1);
+                        let x0 = rx.max(vx0);
+                        let y0 = ry.max(vy0);
+                        if x1 > x0 && y1 > y0 {
+                            self.targets.push(((x0, y0, x1 - x0, y1 - y0), t));
+                        }
                     }
                 }
-            },
-            Some(false) => t("Off", "Aus").to_string(),
-            None => t("Unavailable", "Nicht verfügbar").to_string(),
-        };
-
-        let show_eth = self.control.show_ethernet()
-            || (self.control.wifi.is_none()
-                && self.control.ethernet.is_empty()
-                && self.network_hint == Network::Wired);
-        let net_row = if show_eth {
-            let eth_connected = self.control.ethernet_connected()
-                || (self.control.ethernet.is_empty() && self.network_hint == Network::Wired);
-            let primary = self.control.ethernet.first();
-            let can_toggle = primary.is_some_and(|e| e.managed && e.plugged);
-            let status = if eth_connected {
-                t("Connected", "Verbunden").to_string()
-            } else if primary.is_some_and(|e| e.plugged) {
-                t("Disconnected", "Getrennt").to_string()
             } else {
-                t("Unplugged", "Kein Kabel").to_string()
-            };
-            (
-                can_toggle.then_some(Target::EthernetToggle),
-                Submenu::Ethernet,
-                PULSE_WIFI,
-                "Ethernet".to_string(),
-                status,
-                eth_t,
-                true,
-            )
+                let mut local: Vec<((f32, f32, f32, f32), Target)> = Vec::new();
+                self.paint_page_current(
+                    pm,
+                    s,
+                    (x0 + return_slide, content_y),
+                    (0.0, 0.0),
+                    fonts,
+                    theme,
+                    german,
+                    now,
+                    true,
+                    &mut local,
+                );
+                self.targets.extend(local);
+                self.cc.content_origin = (x0, content_y);
+            }
+        }
+
+        // Page dots / edit controls.
+        self.cc.hover_offset = (0.0, 0.0);
+        self.paint_cc_footer(pm, s, x0, y0 + height - CC_BOTTOM - CC_FOOTER, theme, fonts);
+
+        // The picked-up module floats under the pointer while reordering.
+        if let Some(drag) = self.cc.drag.clone() {
+            let (dw, dh) = self
+                .cc
+                .placed
+                .iter()
+                .find(|p| p.kind == drag.kind)
+                .map(|p| (p.w, p.h))
+                .unwrap_or((CC_CELL, CC_CELL));
+            let (mx, my) = (drag.pos.0 - dw / 2.0, drag.pos.1 - dh / 2.0);
+            let look = CcLook::new(theme, 0.92);
+            fill_rounded(pm, (mx + 1.0) * s, (my + 4.0) * s, dw * s, dh * s, MODULE_RADIUS * s, [0, 0, 0, 60]);
+            self.paint_module(
+                pm,
+                s,
+                drag.kind,
+                (mx, my, dw, dh),
+                look,
+                fonts,
+                theme,
+                german,
+                now,
+                false,
+                &mut Vec::new(),
+            );
+        }
+    }
+
+    /// Visible body height, used by the scroll spring.
+    fn ensure_scroll_height(&mut self) -> f32 {
+        self.ensure_layout();
+        content_height(&self.cc.placed)
+    }
+
+    fn paint_page_current(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        offset: (f32, f32),
+        target_origin: (f32, f32),
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+        now: Instant,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+    ) {
+        self.ensure_layout();
+        let placed = std::mem::take(&mut self.cc.placed);
+        self.paint_page(
+            pm,
+            s,
+            &placed,
+            offset,
+            target_origin,
+            fonts,
+            theme,
+            german,
+            now,
+            interactive,
+            targets,
+        );
+        self.cc.placed = placed;
+    }
+
+    /// Draw one page of modules. `offset` is the page origin inside the target
+    /// canvas; `target_origin` maps canvas coordinates back to the surface.
+    /// `interactive = false` is used for the outgoing page in a paging
+    /// transition (and for the floating drag preview).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_page(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        placed: &[PlacedModule],
+        offset: (f32, f32),
+        target_origin: (f32, f32),
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+        now: Instant,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+    ) {
+        let opening = self.opened.elapsed();
+        let opening = !anim::reduced() && opening < CC_OPEN && self.closing.is_none() && self.submenu.is_none();
+        let open_t = self.opened.elapsed().as_secs_f32();
+        let edit_sway = if self.cc.edit && !anim::reduced() {
+            let t = now.saturating_duration_since(self.cc.edit_since).as_secs_f32();
+            Some(t)
         } else {
-            (
-                self.control.wifi.is_some().then_some(Target::WifiToggle),
-                Submenu::Wifi,
-                PULSE_WIFI,
-                "Wi-Fi".to_string(),
-                if self.control.wifi.is_none() {
-                    t("Unavailable", "Nicht verfügbar").to_string()
-                } else if !wifi_on {
-                    t("Off", "Aus").to_string()
-                } else {
-                    ssid.unwrap_or_else(|| t("Not Connected", "Nicht verbunden").into())
-                },
-                wifi_t,
-                self.control.wifi.is_some(),
-            )
+            None
         };
+        let ox = offset.0 + target_origin.0;
+        let oy = offset.1 + target_origin.1;
+        self.cc.content_origin = (ox, oy);
+        self.cc.hover_offset = target_origin;
 
-        let rows = [
-            net_row,
-            (
-                self.control.bluetooth.is_some().then_some(Target::BluetoothToggle),
-                Submenu::Bluetooth,
-                PULSE_BT,
-                "Bluetooth".to_string(),
-                bt_status,
-                bt_t,
-                self.control.bluetooth.is_some(),
-            ),
-        ];
-
-        for (i, (toggle_target, submenu, pulse_slot, title, status, on_t, available)) in rows.into_iter().enumerate() {
-            let ry = y + 9.0 + i as f32 * 48.0;
-            let row_rect = (inner_x + 4.0, ry, half - 8.0, 44.0);
-            let circle_rect = (inner_x + 8.0, ry + 5.0, 32.0, 32.0);
-            let open_rect = (inner_x + 40.0, ry, half - 42.0, 44.0);
-            let hover_rect = if toggle_target.is_some() { open_rect } else { row_rect };
-            let row_hovered = available && self.hovered(hover_rect.0, hover_rect.1, hover_rect.2, hover_rect.3);
-            if row_hovered {
-                fill_rounded(pm, row_rect.0 * s, row_rect.1 * s, row_rect.2 * s, row_rect.3 * s, 10.0 * s, hover_bg);
+        let drag_kind = self.cc.drag.as_ref().map(|d| d.kind);
+        for (i, m) in placed.iter().enumerate() {
+            if interactive && drag_kind == Some(m.kind) {
+                // The picked-up control is drawn under the pointer instead.
+                continue;
             }
-            let (cx, cy) = (inner_x + 24.0, ry + 22.0);
-            let (ps, _) = tap_scale(self.anim.pulses[pulse_slot], now);
-            fill_circle(pm, cx * s, cy * s, 15.0 * ps * s, lerp_rgba(off, accent, on_t));
-            let glyph = lerp_rgba(text, [255, 255, 255, 255], on_t);
-            match submenu {
-                Submenu::Wifi => crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.8 * ps, Network::Wifi(3), glyph),
-                Submenu::Ethernet => crate::menubar::draw_network(pm, cx * s, cy * s, s * 1.0 * ps, Network::Wired, glyph),
-                _ => bluetooth(pm, cx * s, cy * s, 7.0 * ps * s, glyph),
-            }
-            let tx = inner_x + 46.0;
-            let maxw = half - 62.0;
-            let b1 = fonts.baseline_centered((ry + 5.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
-            fonts.draw(pm, &fonts.elide(&title, 12.0 * s, Weight::Bold, maxw * s), tx * s, b1, 12.0 * s, Weight::Bold, text);
-            let b2 = fonts.baseline_centered((ry + 21.0) * s, 16.0 * s, 11.0 * s, Weight::Regular);
-            fonts.draw(pm, &fonts.elide(&status, 11.0 * s, Weight::Regular, maxw * s), tx * s, b2, 11.0 * s, Weight::Regular, sub);
-            if available {
-                let chev_col = if row_hovered { text } else { sub };
-                chevron_right(pm, (inner_x + half - 11.0) * s, (ry + 22.0) * s, 4.0 * s, chev_col);
-                // Circle toggles directly when toggleable; rest of row opens submenu (1:1 macOS)
-                if let Some(toggle) = toggle_target {
-                    self.targets.push((circle_rect, toggle));
-                    self.targets.push((open_rect, Target::OpenSubmenu(submenu)));
-                } else {
-                    self.targets.push((row_rect, Target::OpenSubmenu(submenu)));
-                }
-            }
-        }
-
-        // Do Not Disturb + Night Shift: two stacked cards on the right
-        let fx = inner_x + half + pad;
-        let card_h = (110.0 - pad) / 2.0;
-        let dnd = center.do_not_disturb;
-        let night = self.night_shift;
-        let cards: [(Target, usize, &str, bool, f32, Rgba); 2] = [
-            (Target::Dnd, PULSE_DND, t("Do Not Disturb", "Nicht stören"), dnd, dnd_t, [94, 92, 230, 255]),
-            (Target::NightShift, PULSE_NIGHT, "Night Shift", night, night_t, [255, 149, 0, 255]),
-        ];
-        for (i, (target, pulse_slot, title, on, on_t, on_col)) in cards.into_iter().enumerate() {
-            let cy0 = y + i as f32 * (card_h + pad);
-            let hovered = self.hovered(fx, cy0, half, card_h);
-            fill_rounded(pm, fx * s, cy0 * s, half * s, card_h * s, 14.0 * s, if hovered && !on { hover_bg } else { card });
-            stroke_rounded(pm, fx * s, cy0 * s, half * s, card_h * s, 14.0 * s, 0.75 * s, card_border);
-            let (cx, cy) = (fx + 22.0, cy0 + card_h / 2.0);
-            let (ps, _) = tap_scale(self.anim.pulses[pulse_slot], now);
-            fill_circle(pm, cx * s, cy * s, 14.0 * ps * s, lerp_rgba(off, on_col, on_t));
-            let glyph = lerp_rgba(text, [255, 255, 255, 255], on_t);
-            match target {
-                Target::Dnd => moon(pm, cx * s, cy * s, 6.5 * ps * s, glyph),
-                _ => sun(pm, cx * s, cy * s, 6.5 * ps * s, glyph),
-            }
-            let tx = fx + 42.0;
-            let maxw = half - 48.0;
-            let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
-            fonts.draw(pm, &fonts.elide(title, 12.0 * s, Weight::Bold, maxw * s), tx * s, b1, 12.0 * s, Weight::Bold, text);
-            let b2 = fonts.baseline_centered((cy + 1.0) * s, 14.0 * s, 11.0 * s, Weight::Regular);
-            fonts.draw(pm, if on { t("On", "Ein") } else { t("Off", "Aus") }, tx * s, b2, 11.0 * s, Weight::Regular, sub);
-            self.targets.push(((fx, cy0, half, card_h), target));
-        }
-
-        // Game Mode: full width under the toggles
-        let gy = y + 110.0 + pad;
-        {
-            let on = self.game_mode_enabled;
-            let hovered = self.hovered(inner_x, gy, inner_w, GAME_CARD_H);
-            fill_rounded(pm, inner_x * s, gy * s, inner_w * s, GAME_CARD_H * s, 14.0 * s, if hovered && !on { hover_bg } else { card });
-            stroke_rounded(pm, inner_x * s, gy * s, inner_w * s, GAME_CARD_H * s, 14.0 * s, 0.75 * s, card_border);
-            let (cx, cy) = (inner_x + 22.0, gy + GAME_CARD_H / 2.0);
-            let active = self.game_active.is_some();
-            let (ps, _) = tap_scale(self.anim.pulses[PULSE_GAME], now);
-            let on_col = if active { [52, 199, 89, 255] } else { accent };
-            fill_circle(pm, cx * s, cy * s, 14.0 * ps * s, lerp_rgba(off, on_col, game_t));
-            controller(pm, cx * s, cy * s, 7.0 * ps * s, lerp_rgba(text, [255, 255, 255, 255], game_t));
-            let tx = inner_x + 42.0;
-            let maxw = inner_w - 50.0;
-            let b1 = fonts.baseline_centered((cy - 15.0) * s, 16.0 * s, 12.0 * s, Weight::Bold);
-            fonts.draw(pm, t("Game Mode", "Spielmodus"), tx * s, b1, 12.0 * s, Weight::Bold, text);
-            let status = match (&self.game_active, on) {
-                (Some(game), _) => if german { format!("Ein · {game}") } else { format!("On · {game}") },
-                (None, true) => t("Automatic: on while a game is full screen", "Automatisch: an, wenn ein Spiel im Vollbild läuft").to_string(),
-                (None, false) => t("Off", "Aus").to_string(),
+            // Staggered entrance from the menu bar (macOS Control Center).
+            let (e, alpha) = if opening {
+                let local = ((open_t - i as f32 * STAGGER_STEP) / STAGGER_LEN).clamp(0.0, 1.0);
+                (ease_out_cubic(local), ease_out_cubic(local))
+            } else {
+                (1.0, 1.0)
             };
-            let b2 = fonts.baseline_centered((cy + 1.0) * s, 14.0 * s, 11.0 * s, Weight::Regular);
-            fonts.draw(pm, &fonts.elide(&status, 11.0 * s, Weight::Regular, maxw * s), tx * s, b2, 11.0 * s, Weight::Regular, sub);
-            self.targets.push(((inner_x, gy, inner_w, GAME_CARD_H), Target::GameMode));
-        }
-
-        // sliders
-        let mut y = gy + GAME_CARD_H + pad;
-        if self.control.displays.len() == 1 {
-            let d_bus = self.control.displays[0].bus;
-            let d_name = self.control.displays[0].name.clone();
-            let d_val = self.anim.displays.get_mut(0).map(|sp| sp.sample(now)).unwrap_or(self.control.displays[0].value);
-            fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
-            stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
-            let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
-            fonts.draw(pm, t("Display", "Display"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
-            if d_bus.is_some() {
-                let name = fonts.elide(&d_name, 11.0 * s, Weight::Regular, (inner_w - 86.0) * s);
-                let nw = fonts.measure(&name, 11.0 * s, Weight::Regular);
-                let nb = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 11.0 * s, Weight::Regular);
-                fonts.draw(pm, &name, (inner_x + inner_w - 12.0) * s - nw, nb, 11.0 * s, Weight::Regular, sub);
+            if e <= 0.001 {
+                continue;
             }
-            let (tx, ty, tw, th) = (inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0);
-            let hov = self.hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
-            let drag = matches!(self.dragging, Some(Target::Brightness(0, ..)));
-            draw_pill_slider(pm, s, tx, ty, tw, th, d_val, 0, false, off, hov, drag);
-            self.targets.push((
-                (tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0),
-                Target::Brightness(0, tx + th / 2.0, tx + tw - th / 2.0),
-            ));
-            y += 64.0 + pad;
-        } else if self.control.displays.len() > 1 {
-            let count = self.control.displays.len();
-            let card_h = 28.0 + count as f32 * 44.0 + 6.0;
-            fill_rounded(pm, inner_x * s, y * s, inner_w * s, card_h * s, 14.0 * s, card);
-            stroke_rounded(pm, inner_x * s, y * s, inner_w * s, card_h * s, 14.0 * s, 0.75 * s, card_border);
-            let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
-            fonts.draw(pm, t("Displays", "Displays"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
-            for idx in 0..count {
-                let d_name = self.control.displays[idx].name.clone();
-                let d_val = self.anim.displays.get_mut(idx).map(|sp| sp.sample(now)).unwrap_or(self.control.displays[idx].value);
-                let ry = y + 28.0 + idx as f32 * 44.0;
-                let lb = fonts.baseline_centered(ry * s, 14.0 * s, 11.0 * s, Weight::Regular);
-                let label = fonts.elide(&d_name, 11.0 * s, Weight::Regular, (inner_w - 24.0) * s);
-                fonts.draw(pm, &label, (inner_x + 12.0) * s, lb, 11.0 * s, Weight::Regular, sub);
-                let (tx, ty, tw, th) = (inner_x + 12.0, ry + 16.0, inner_w - 24.0, 22.0);
-                let hov = self.hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
-                let drag = matches!(self.dragging, Some(Target::Brightness(i, ..)) if i == idx);
-                draw_pill_slider(pm, s, tx, ty, tw, th, d_val, 0, false, off, hov, drag);
-                self.targets.push((
-                    (tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0),
-                    Target::Brightness(idx, tx + th / 2.0, tx + tw - th / 2.0),
-                ));
-            }
-            y += card_h + pad;
-        }
+            let sway = edit_sway
+                .map(|t| ((t * 5.0 + i as f32 * 0.85).sin() * 1.3) as f32)
+                .unwrap_or(0.0);
+            let rect = (
+                offset.0 + m.x + sway,
+                offset.1 + m.y + (1.0 - e) * 16.0,
+                m.w,
+                m.h,
+            );
+            let look = CcLook::new(theme, alpha);
+            let module_interactive = interactive && alpha > 0.999 && !self.cc.edit;
+            self.paint_module(
+                pm,
+                s,
+                m.kind,
+                rect,
+                look,
+                fonts,
+                theme,
+                german,
+                now,
+                module_interactive,
+                targets,
+            );
+            // Targets are always surface coordinates, even when the pixels
+            // were drawn into a scrolled/paging offscreen buffer.
+            let gx = target_origin.0 + rect.0;
+            let gy = target_origin.1 + rect.1;
 
-        // Sound card (header opens Sound submenu, slider adjusts volume)
-        let (_, muted) = self.control.volume.unwrap_or((0.0, true));
-        fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
-        stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
-        let sound_head_rect = (inner_x + 4.0, y + 2.0, inner_w - 8.0, 26.0);
-        let sound_hovered = self.hovered(sound_head_rect.0, sound_head_rect.1, sound_head_rect.2, sound_head_rect.3);
-        if sound_hovered {
-            fill_rounded(pm, sound_head_rect.0 * s, sound_head_rect.1 * s, sound_head_rect.2 * s, sound_head_rect.3 * s, 8.0 * s, hover_bg);
-        }
-        let b_base = fonts.baseline_centered((y + 6.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
-        fonts.draw(pm, t("Sound", "Ton"), (inner_x + 12.0) * s, b_base, 12.0 * s, Weight::Bold, text);
-        chevron_right(pm, (inner_x + inner_w - 14.0) * s, (y + 15.0) * s, 4.0 * s, if sound_hovered { text } else { sub });
-        self.targets.push((sound_head_rect, Target::OpenSubmenu(Submenu::Sound)));
-
-        let (tx, ty, tw, th) = (inner_x + 12.0, y + 32.0, inner_w - 24.0, 22.0);
-        let vol_hov = self.hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
-        let vol_drag = matches!(self.dragging, Some(Target::Volume(..)));
-        draw_pill_slider(pm, s, tx, ty, tw, th, vol_val, 1, muted, off, vol_hov, vol_drag);
-        self.targets
-            .push(((tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0), Target::Volume(tx + th / 2.0, tx + tw - th / 2.0)));
-        y += 64.0 + pad;
-
-        // now playing
-        if let Some(m) = self.control.media.clone() {
-            fill_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, card);
-            stroke_rounded(pm, inner_x * s, y * s, inner_w * s, 64.0 * s, 14.0 * s, 0.75 * s, card_border);
-            let maxw = inner_w - 130.0;
-            let b1 = fonts.baseline_centered((y + 12.0) * s, 18.0 * s, 12.0 * s, Weight::Bold);
-            let title = if m.title.is_empty() { t("Not Playing", "Keine Wiedergabe") } else { &m.title };
-            fonts.draw(pm, &fonts.elide(title, 12.0 * s, Weight::Bold, maxw * s), (inner_x + 12.0) * s, b1, 12.0 * s, Weight::Bold, text);
-            let b2 = fonts.baseline_centered((y + 32.0) * s, 16.0 * s, 11.0 * s, Weight::Regular);
-            fonts.draw(pm, &fonts.elide(&m.artist, 11.0 * s, Weight::Regular, maxw * s), (inner_x + 12.0) * s, b2, 11.0 * s, Weight::Regular, sub);
-            let cy = y + 32.0;
-            let bx = inner_x + inner_w - 112.0;
-            for (i, target) in [Target::MediaPrev, Target::MediaPlay, Target::MediaNext].into_iter().enumerate() {
-                let cx = bx + 18.0 + i as f32 * 36.0;
-                match target {
-                    Target::MediaPrev => transport(pm, cx * s, cy * s, 6.0 * s, -1, text),
-                    Target::MediaNext => transport(pm, cx * s, cy * s, 6.0 * s, 1, text),
-                    _ if m.playing => pause(pm, cx * s, cy * s, 7.0 * s, text),
-                    _ => play(pm, cx * s, cy * s, 8.0 * s, text),
-                }
-                self.targets.push(((cx - 16.0, cy - 16.0, 32.0, 32.0), target));
+            if self.cc.edit && interactive && alpha > 0.999 {
+                // The whole card grabs; the badges below win the hit test.
+                targets.push(((gx, gy, rect.2, rect.3), Target::GrabModule(m.kind)));
+                self.paint_edit_badges(pm, s, (gx, gy, rect.2, rect.3), m.kind, theme, targets);
             }
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_edit_badges(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        kind: ControlKind,
+        theme: &Theme,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+    ) {
+        let (x, y, w, h) = rect;
+        // Remove (inset so it stays inside the panel corner).
+        let (cx, cy) = (x + 14.0, y + 14.0);
+        fill_circle(pm, cx * s, (cy + 0.7) * s, 11.0 * s, [0, 0, 0, 40]);
+        fill_circle(pm, cx * s, cy * s, 10.5 * s, [255, 69, 58, 255]);
+        minus(pm, cx * s, cy * s, 4.2 * s, [255, 255, 255, 255]);
+        targets.push(((cx - 13.0, cy - 13.0, 26.0, 26.0), Target::RemoveModule(kind)));
+        // Resize handle appears on hover, so the labels stay readable while
+        // the remove badges are always visible.
+        if self.hovered(x, y, w, h) {
+            let (rx, ry) = (x + w - 14.0, y + h - 14.0);
+            fill_circle(pm, rx * s, (ry + 0.7) * s, 11.0 * s, [0, 0, 0, 40]);
+            fill_circle(pm, rx * s, ry * s, 10.5 * s, [242, 242, 247, 255]);
+            resize_glyph(pm, rx * s, ry * s, 4.6 * s, [40, 40, 43, 255]);
+            targets.push(((rx - 13.0, ry - 13.0, 26.0, 26.0), Target::ResizeModule(kind)));
+        }
+        let _ = theme;
+    }
+
+    fn paint_empty_page(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        x0: f32,
+        y: f32,
+        body_h: f32,
+        theme: &Theme,
+        fonts: &Fonts,
+        german: bool,
+    ) {
+        let look = CcLook::new(theme, 1.0);
+        let t = |en: &'static str, de: &'static str| if german { de } else { en };
+        let rect = (x0 + CC_PAD, y, CC_WIDTH - 2.0 * CC_PAD, (body_h - 6.0).max(60.0));
+        let hovered = self.hovered(rect.0, rect.1, rect.2, rect.3);
+        fill_rounded(pm, rect.0 * s, rect.1 * s, rect.2 * s, rect.3 * s, MODULE_RADIUS * s, if hovered { look.card_hover } else { look.card });
+        stroke_rounded(pm, rect.0 * s, rect.1 * s, rect.2 * s, rect.3 * s, MODULE_RADIUS * s, 1.0 * s, look.border);
+        let (cx, cy) = (rect.0 + rect.2 / 2.0, rect.1 + rect.3 / 2.0 - 12.0);
+        fill_circle(pm, cx * s, cy * s, 18.0 * s, look.off);
+        plus(pm, cx * s, cy * s, 7.5 * s, look.sub);
+        let msg = t("No Controls", "Keine Bedienelemente");
+        let mw = fonts.measure(msg, 13.0 * s, Weight::Bold) / s;
+        let base = fonts.baseline_centered((cy + 24.0) * s, 18.0 * s, 13.0 * s, Weight::Bold);
+        fonts.draw(pm, msg, (rect.0 + (rect.2 - mw) / 2.0) * s, base, 13.0 * s, Weight::Bold, look.text);
+        let hint = t("Click to add controls", "Klicken, um Bedienelemente hinzuzufügen");
+        let hw = fonts.measure(hint, 11.0 * s, Weight::Regular) / s;
+        let base = fonts.baseline_centered((cy + 42.0) * s, 16.0 * s, 11.0 * s, Weight::Regular);
+        fonts.draw(pm, hint, (rect.0 + (rect.2 - hw) / 2.0) * s, base, 11.0 * s, Weight::Regular, look.sub);
+        self.targets.push((rect, Target::OpenGallery));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_gallery(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        x0: f32,
+        y: f32,
+        body_h: f32,
+        theme: &Theme,
+        fonts: &Fonts,
+        german: bool,
+        now: Instant,
+    ) {
+        let t = |en: &'static str, de: &'static str| if german { de } else { en };
+        let look = CcLook::new(theme, 1.0);
+        self.ensure_layout();
+        let title = t("Add Control", "Bedienelement hinzufügen");
+        let base = fonts.baseline_centered(y * s, 26.0 * s, 15.0 * s, Weight::Bold);
+        fonts.draw(pm, title, (x0 + CC_PAD) * s, base, 15.0 * s, Weight::Bold, look.text);
+        // "New Page" pill
+        let np_w = fonts.measure(t("New Page", "Neue Seite"), 11.0 * s, Weight::Bold) / s + 24.0;
+        let np = (x0 + CC_WIDTH - CC_PAD - np_w, y + 3.0, np_w, 24.0);
+        let np_hover = self.hovered(np.0, np.1, np.2, np.3);
+        fill_rounded(pm, np.0 * s, np.1 * s, np.2 * s, np.3 * s, 12.0 * s, if np_hover { look.card_hover } else { look.card });
+        let nb = fonts.baseline_centered(np.1 * s, np.3 * s, 11.0 * s, Weight::Bold);
+        let label = t("New Page", "Neue Seite");
+        fonts.draw(pm, label, (np.0 + 12.0) * s, nb, 11.0 * s, Weight::Bold, look.text);
+        self.targets.push((np, Target::PageAdd));
+
+        let grid_y = y + 34.0;
+        let scroll = self.cc.scroll.sample(now);
+        let placed = std::mem::take(&mut self.cc.placed);
+        if placed.is_empty() {
+            self.cc.placed = placed;
+            let msg = t("All controls added", "Alle Bedienelemente hinzugefügt");
+            let mw = fonts.measure(msg, 12.0 * s, Weight::Regular) / s;
+            let base = fonts.baseline_centered((grid_y + 16.0) * s, 20.0 * s, 12.0 * s, Weight::Regular);
+            fonts.draw(pm, msg, (x0 + (CC_WIDTH - mw) / 2.0) * s, base, 12.0 * s, Weight::Regular, look.sub);
+            return;
+        }
+        // The panel height springs between views; don't let gallery tiles
+        // escape the current (still growing) panel body in the meantime.
+        let body_bottom = y + body_h;
+        for m in placed.iter() {
+            let rect = (
+                x0 + m.x,
+                grid_y + m.y - scroll,
+                m.w,
+                m.h,
+            );
+            if rect.1 < grid_y - 0.5 || rect.1 + rect.3 > body_bottom + 0.5 {
+                continue;
+            }
+            let hovered = self.hovered(rect.0, rect.1, rect.2, rect.3);
+            let added = self.cc.pages.iter().flatten().any(|c| c.kind == m.kind);
+            let on_this_page = self.cc.pages.get(self.cc.page).is_some_and(|p| p.iter().any(|c| c.kind == m.kind));
+            let l = CcLook::new(theme, if added && on_this_page { 0.62 } else { 1.0 });
+            self.paint_gallery_tile(pm, s, rect, m.kind, l, hovered, added, fonts, german);
+            let target = if on_this_page {
+                Target::RemoveModule(m.kind)
+            } else {
+                Target::AddModule(m.kind)
+            };
+            self.targets.push((rect, target));
+        }
+        self.cc.placed = placed;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_gallery_tile(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        kind: ControlKind,
+        look: CcLook,
+        hovered: bool,
+        added: bool,
+        fonts: &Fonts,
+        german: bool,
+    ) {
+        let (x, y, w, h) = rect;
+        fill_rounded(
+            pm,
+            x * s,
+            y * s,
+            w * s,
+            h * s,
+            MODULE_RADIUS * s,
+            if hovered { look.card_hover } else { look.card },
+        );
+        stroke_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, 1.0 * s, look.border);
+        let (cx, cy) = (x + w / 2.0, y + 25.0);
+        fill_circle(pm, cx * s, cy * s, 15.0 * s, look.off);
+        module_glyph(pm, s, kind, cx, cy, 6.5, look.text);
+        let label = module_name(kind, german);
+        let lw = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
+        let base = fonts.baseline_centered((y + 46.0) * s, 24.0 * s, 10.0 * s, Weight::Bold);
+        fonts.draw(pm, label, (x + (w - lw) / 2.0) * s, base, 10.0 * s, Weight::Bold, look.text);
+        // Add / already-added badge.
+        let (bx, by) = (x + w - 10.0, y + 10.0);
+        if added {
+            fill_circle(pm, bx * s, by * s, 7.0 * s, [52, 199, 89, 255]);
+            check(pm, bx * s, by * s, 3.3 * s, [255, 255, 255, 255]);
+        } else {
+            fill_circle(pm, bx * s, by * s, 7.0 * s, look.accent);
+            plus(pm, bx * s, by * s, 3.4 * s, [255, 255, 255, 255]);
+        }
+    }
+
+    fn paint_cc_footer(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        x0: f32,
+        y: f32,
+        theme: &Theme,
+        fonts: &Fonts,
+    ) {
+        let look = CcLook::new(theme, 1.0);
+        let h = CC_FOOTER;
+        if self.cc.gallery {
+            let label = "Done";
+            let w = fonts.measure(label, 11.5 * s, Weight::Bold) / s + 26.0;
+            let r = (x0 + CC_WIDTH - CC_PAD - w, y + 3.0, w, 26.0);
+            let hov = self.hovered(r.0, r.1, r.2, r.3);
+            fill_rounded(pm, r.0 * s, r.1 * s, r.2 * s, r.3 * s, 13.0 * s, if hov { look.accent } else { look.card_hover });
+            let b = fonts.baseline_centered(r.1 * s, r.3 * s, 11.5 * s, Weight::Bold);
+            fonts.draw(pm, label, (r.0 + 13.0) * s, b, 11.5 * s, Weight::Bold, if hov { [255, 255, 255, 255] } else { look.text });
+            self.targets.push((r, Target::CloseGallery));
+            return;
+        }
+
+        // Page dots, centred.
+        let n = self.cc.pages.len();
+        let dot_gap = 15.0;
+        let total = if n == 0 { 0.0 } else { (n - 1) as f32 * dot_gap + 6.0 };
+        let mut dx = x0 + (CC_WIDTH - total) / 2.0;
+        for i in 0..n {
+            let active = i == self.cc.page;
+            let rect = if active {
+                let r = (dx - 6.0, y + h / 2.0 - 3.0, 12.0, 6.0);
+                fill_rounded(pm, r.0 * s, r.1 * s, r.2 * s, r.3 * s, 3.0 * s, look.text);
+                r
+            } else {
+                let r = (dx - 4.5, y + h / 2.0 - PAGE_DOT - 4.0, 12.0, 14.0);
+                fill_circle(pm, dx * s, (y + h / 2.0) * s, PAGE_DOT * s, look.faint);
+                r
+            };
+            self.targets.push((rect, Target::Page(i)));
+            dx += dot_gap;
+        }
+
+        if self.cc.edit {
+            if self.cc.pages.len() > 1 {
+                let r = (x0 + CC_PAD, y + 4.0, 24.0, 24.0);
+                let hov = self.hovered(r.0, r.1, r.2, r.3);
+                fill_circle(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 12.0 * s, if hov { [255, 69, 58, 45] } else { [0, 0, 0, 0] });
+                trash(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 5.6 * s, if hov { [255, 69, 58, 255] } else { look.sub });
+                self.targets.push((r, Target::PageRemove));
+            }
+            let plus_r = (x0 + CC_WIDTH - CC_PAD - 24.0, y + 4.0, 24.0, 24.0);
+            let hov = self.hovered(plus_r.0, plus_r.1, plus_r.2, plus_r.3);
+            fill_circle(pm, (plus_r.0 + 12.0) * s, (plus_r.1 + 12.0) * s, 12.0 * s, if hov { look.accent } else { look.card_hover });
+            plus(pm, (plus_r.0 + 12.0) * s, (plus_r.1 + 12.0) * s, 5.0 * s, if hov { [255, 255, 255, 255] } else { look.text });
+            self.targets.push((plus_r, Target::OpenGallery));
+            let done = (x0 + CC_WIDTH - CC_PAD - 24.0 - 30.0, y + 4.0, 24.0, 24.0);
+            let hov = self.hovered(done.0, done.1, done.2, done.3);
+            fill_circle(pm, (done.0 + 12.0) * s, (done.1 + 12.0) * s, 12.0 * s, if hov { look.accent } else { look.card_hover });
+            check(pm, (done.0 + 12.0) * s, (done.1 + 12.0) * s, 5.0 * s, if hov { [255, 255, 255, 255] } else { look.text });
+            self.targets.push((done, Target::ToggleEdit));
+        } else {
+            let r = (x0 + CC_WIDTH - CC_PAD - 24.0, y + 4.0, 24.0, 24.0);
+            let hov = self.hovered(r.0, r.1, r.2, r.3);
+            fill_circle(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 12.0 * s, if hov { look.card_hover } else { [0, 0, 0, 0] });
+            pencil(pm, (r.0 + 12.0) * s, (r.1 + 12.0) * s, 5.4 * s, if hov { look.text } else { look.sub });
+            self.targets.push((r, Target::ToggleEdit));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_module(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        kind: ControlKind,
+        rect: (f32, f32, f32, f32),
+        look: CcLook,
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+        now: Instant,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+    ) {
+        let (x, y, w, h) = rect;
+        let hovered = self.module_hovered(x, y, w, h);
+        let card = if hovered { look.card_hover } else { look.card };
+        fill_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, card);
+        stroke_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, 1.0 * s, look.border);
+        match kind {
+            ControlKind::Connectivity => {
+                self.paint_connectivity(pm, s, rect, look, fonts, interactive, targets, now);
+            }
+            ControlKind::NowPlaying => {
+                self.paint_now_playing(pm, s, rect, look, fonts, theme, german, interactive, targets);
+            }
+            ControlKind::Brightness => {
+                self.paint_slider_module(pm, s, rect, kind, look, fonts, german, now, interactive, targets);
+            }
+            ControlKind::Volume => {
+                self.paint_slider_module(pm, s, rect, kind, look, fonts, german, now, interactive, targets);
+            }
+            ControlKind::Wifi
+            | ControlKind::Bluetooth
+            | ControlKind::Focus
+            | ControlKind::NightShift
+            | ControlKind::GameMode
+            | ControlKind::Displays
+            | ControlKind::Network
+            | ControlKind::Sound => {
+                self.paint_small_module(pm, s, rect, kind, look, fonts, german, interactive, targets, now);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_connectivity(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        look: CcLook,
+        fonts: &Fonts,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+        now: Instant,
+    ) {
+        let (x, y, w, h) = rect;
+        let wifi_on = self.anim.wifi.sample(now).clamp(0.0, 1.0);
+        let bt_on = self.anim.bluetooth.sample(now).clamp(0.0, 1.0);
+        let eth = self.anim.ethernet.sample(now).clamp(0.0, 1.0);
+        let nw = self.control.wifi.is_some();
+        let nb = self.control.bluetooth.is_some();
+        let ne = !self.control.ethernet.is_empty() || self.network_hint == Network::Wired;
+        let compact = h < CC_CELL + 10.0;
+        let (pad, gap, cols, rows) = if compact {
+            if w < CC_CELL + 44.0 {
+                (8.0, 5.0, 2usize, 2usize)
+            } else {
+                (10.0, 4.0, 4usize, 1usize)
+            }
+        } else {
+            (12.0, 6.0, 2, 2)
+        };
+        let cw = (w - pad * 2.0 - gap * (cols - 1) as f32) / cols as f32;
+        let ch = (h - pad * 2.0 - gap * (rows - 1) as f32) / rows as f32;
+        // Clicking the gaps in the group opens the network detail sheet.
+        if interactive && !compact {
+            targets.push(((x + pad, y + pad, w - pad * 2.0, h - pad * 2.0), Target::OpenSubmenu(Submenu::Wifi)));
+        }
+        let cells = [
+            (0usize, 0usize, "Wi-Fi", wifi_on, nw, PULSE_WIFI),
+            (1, 0, "Bluetooth", bt_on, nb, PULSE_BT),
+            (0, 1, "Ethernet", eth, ne, PULSE_WIFI),
+            (1, 1, "Network", 0.0, true, PULSE_WIFI),
+        ];
+        for (col, row, label, on, available, pulse) in cells {
+            let (col, row) = if compact && cols == 4 {
+                // A wide connectivity module becomes a single row of four
+                // compact icons.
+                (col + row * 2, 0)
+            } else {
+                (col, row)
+            };
+            let cx0 = x + pad + col as f32 * (cw + gap);
+            let cy0 = y + pad + row as f32 * (ch + gap);
+            let hov = interactive && self.module_hovered(cx0, cy0, cw, ch);
+            if hov {
+                fill_rounded(pm, cx0 * s, cy0 * s, cw * s, ch * s, 16.0 * s, look.hover);
+            }
+            let (cx, cy) = if compact {
+                (cx0 + cw / 2.0, cy0 + ch / 2.0)
+            } else {
+                (cx0 + cw / 2.0, cy0 + 23.0)
+            };
+            let r = if compact {
+                (cw.min(ch) * 0.36).clamp(8.0, 15.0)
+            } else {
+                17.0
+            };
+            let (ps, _) = tap_scale(self.anim.pulses[pulse], now);
+            let gs = ps * (r / 15.0);
+            let is_network = label == "Network";
+            let circle = if is_network {
+                look.off
+            } else {
+                lerp_rgba(look.off, look.accent, if available { on } else { 0.0 })
+            };
+            fill_circle(pm, cx * s, cy * s, r * ps * s, circle);
+            let glyph_col = if available && (is_network || on > 0.5) {
+                [255, 255, 255, look.text[3]]
+            } else {
+                [255, 255, 255, look.faint[3].max(80)]
+            };
+            match label {
+                "Wi-Fi" | "Network" => {
+                    crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.76 * gs, Network::Wifi(3), glyph_col)
+                }
+                "Ethernet" => {
+                    crate::menubar::draw_network(pm, cx * s, cy * s, s * 0.90 * gs, Network::Wired, glyph_col)
+                }
+                _ => bluetooth(pm, cx * s, cy * s, 7.0 * gs * s, glyph_col),
+            }
+            if !compact {
+                let label_w = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
+                let base = fonts.baseline_centered((cy0 + 42.0) * s, 20.0 * s, 10.0 * s, Weight::Bold);
+                fonts.draw(
+                    pm,
+                    label,
+                    (cx - label_w / 2.0) * s,
+                    base,
+                    10.0 * s,
+                    Weight::Bold,
+                    if available { look.text } else { look.faint },
+                );
+            }
+            if interactive {
+                // The whole cell opens its detail sheet; tapping the circle
+                // itself flips the radio (like quick settings on iOS).
+                let detail = match label {
+                    "Bluetooth" => Submenu::Bluetooth,
+                    "Ethernet" => Submenu::Ethernet,
+                    _ => Submenu::Wifi,
+                };
+                targets.push(((cx0, cy0, cw, ch), Target::OpenSubmenu(detail)));
+                let toggle = match label {
+                    "Wi-Fi" if available => Some(Target::WifiToggle),
+                    "Bluetooth" if available => Some(Target::BluetoothToggle),
+                    "Ethernet" if available && self.control.ethernet.iter().any(|e| e.managed && e.plugged) => {
+                        Some(Target::EthernetToggle)
+                    }
+                    _ => None,
+                };
+                if let Some(toggle) = toggle {
+                    targets.push(((cx - r, cy - r, r * 2.0, r * 2.0), toggle));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_now_playing(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        look: CcLook,
+        fonts: &Fonts,
+        theme: &Theme,
+        german: bool,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+    ) {
+        let t = |en: &'static str, de: &'static str| if german { de } else { en };
+        let (x, y, w, h) = rect;
+        let large = h > CC_CELL + 10.0;
+        let media = self.control.media.clone();
+        let has = media.is_some();
+        let art = if large { 62.0 } else { 40.0 };
+        let ax = x + 14.0;
+        let ay = y + 14.0;
+        let art_col = if has { scale_alpha(look.accent, 0.92) } else { look.off };
+        fill_rounded(pm, ax * s, ay * s, art * s, art * s, 14.0 * s, art_col);
+        let fade = look.text[3] as f32 / 255.0;
+        fill_rounded(
+            pm,
+            (ax + 4.0) * s,
+            (ay + 4.0) * s,
+            (art - 8.0) * s,
+            (art - 8.0) * s,
+            10.0 * s,
+            scale_alpha([255, 255, 255, 255], (if has { 0.16 } else { 0.06 }) * fade),
+        );
+        music_note(
+            pm,
+            (ax + art / 2.0) * s,
+            (ay + art / 2.0) * s,
+            (art * 0.19) * s,
+            if has { [255, 255, 255, look.text[3]] } else { look.faint },
+        );
+
+        let (title, artist, playing) = match &media {
+            Some(m) => (
+                if m.title.is_empty() {
+                    t("Not Playing", "Keine Wiedergabe").to_string()
+                } else {
+                    m.title.clone()
+                },
+                m.artist.clone(),
+                m.playing,
+            ),
+            None => (t("Not Playing", "Keine Wiedergabe").to_string(), String::new(), false),
+        };
+        let (text_x, title_base, artist_base, maxw) = if large {
+            (
+                x + 14.0,
+                fonts.baseline_centered((y + 86.0) * s, 20.0 * s, 12.5 * s, Weight::Bold),
+                fonts.baseline_centered((y + 105.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
+                w - 28.0,
+            )
+        } else {
+            (
+                ax + art + 10.0,
+                fonts.baseline_centered((y + 18.0) * s, 18.0 * s, 12.5 * s, Weight::Bold),
+                fonts.baseline_centered((y + 37.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
+                w - art - 68.0,
+            )
+        };
+        let title = fonts.elide(&title, 12.5 * s, Weight::Bold, maxw.max(30.0) * s);
+        fonts.draw(pm, &title, text_x * s, title_base, 12.5 * s, Weight::Bold, look.text);
+        let artist = fonts.elide(if artist.is_empty() { t("Nothing playing", "Nichts läuft") } else { &artist }, 10.5 * s, Weight::Regular, maxw.max(30.0) * s);
+        fonts.draw(pm, &artist, text_x * s, artist_base, 10.5 * s, Weight::Regular, look.sub);
+
+        // Transport controls. The wide variant only has room for play/pause.
+        if large {
+            let (bx, cy, step, play_r) = (x + w / 2.0 - 36.0, y + h - 28.0, 36.0, 14.0);
+            for (i, target) in [Target::MediaPrev, Target::MediaPlay, Target::MediaNext].into_iter().enumerate() {
+                let cx = bx + i as f32 * step;
+                let glyph = if has { look.text } else { look.faint };
+                match target {
+                    Target::MediaPrev => transport(pm, cx * s, cy * s, 5.6 * s, -1, glyph),
+                    Target::MediaNext => transport(pm, cx * s, cy * s, 5.6 * s, 1, glyph),
+                    _ => {
+                        fill_circle(pm, cx * s, cy * s, play_r * s, if has { look.accent } else { look.off });
+                        let c = if has { [255, 255, 255, look.text[3]] } else { look.faint };
+                        if playing {
+                            pause(pm, cx * s, cy * s, 5.2 * s, c);
+                        } else {
+                            play(pm, cx * s, cy * s, 5.8 * s, c);
+                        }
+                    }
+                }
+                if interactive && has {
+                    targets.push(((cx - 17.0, cy - 17.0, 34.0, 34.0), target));
+                }
+            }
+        } else {
+            let (cx, cy) = (x + w - 27.0, y + h / 2.0);
+            fill_circle(pm, cx * s, cy * s, 15.0 * s, if has { look.accent } else { look.off });
+            let c = if has { [255, 255, 255, look.text[3]] } else { look.faint };
+            if playing {
+                pause(pm, cx * s, cy * s, 5.4 * s, c);
+            } else {
+                play(pm, cx * s, cy * s, 6.0 * s, c);
+            }
+            if interactive && has {
+                targets.push(((cx - 18.0, cy - 18.0, 36.0, 36.0), Target::MediaPlay));
+            }
+        }
+        let _ = theme;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_slider_module(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        kind: ControlKind,
+        look: CcLook,
+        fonts: &Fonts,
+        german: bool,
+        now: Instant,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+    ) {
+        let t = |en: &'static str, de: &'static str| if german { de } else { en };
+        let (x, y, w, h) = rect;
+        let brightness = kind == ControlKind::Brightness;
+        let (value, muted, available) = if brightness {
+            let animated = self.anim.displays.first_mut().map(|sp| sp.sample(now));
+            let value = animated
+                .or_else(|| self.control.displays.first().map(|d| d.value))
+                .unwrap_or(0.0);
+            (value.clamp(0.0, 1.0), false, !self.control.displays.is_empty())
+        } else {
+            let (_, muted) = self.control.volume.unwrap_or((0.0, true));
+            (self.anim.vol.sample(now).clamp(0.0, 1.0), muted, self.control.volume.is_some())
+        };
+        let title = if brightness { t("Display", "Display") } else { t("Sound", "Ton") };
+        // Leave room for the edit-mode remove/resize badges.
+        let inset = if self.cc.edit { 18.0 } else { 0.0 };
+        let base = fonts.baseline_centered((y + 8.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
+        fonts.draw(pm, title, (x + 13.0 + inset) * s, base, 11.5 * s, Weight::Bold, look.text);
+        let value_text = if !available {
+            "—".to_string()
+        } else if muted {
+            t("Muted", "Stumm").to_string()
+        } else {
+            format!("{}%", (value * 100.0).round() as u32)
+        };
+        let vw = fonts.measure(&value_text, 10.0 * s, Weight::Regular) / s;
+        let chev = !self.cc.edit && if brightness { self.control.displays.len() > 1 } else { true };
+        let vx = x + w - 13.0 - inset - vw - if chev { 12.0 } else { 0.0 };
+        let vb = fonts.baseline_centered((y + 8.0) * s, 18.0 * s, 10.0 * s, Weight::Regular);
+        fonts.draw(pm, &value_text, vx * s, vb, 10.0 * s, Weight::Regular, look.sub);
+        if chev {
+            chevron_right(pm, (x + w - 15.0 - inset) * s, (y + 17.0) * s, 3.5 * s, look.faint);
+        }
+
+        let (tx, ty, tw, th) = (x + 13.0 + inset, y + 37.0, w - 26.0 - inset * 2.0, 23.0);
+        let track_hover = self.module_hovered(tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0);
+        let dragging = matches!(self.dragging, Some(Target::Volume(..)) if !brightness)
+            || matches!(self.dragging, Some(Target::Brightness(0, ..)) if brightness);
+        draw_pill_slider(
+            pm,
+            s,
+            tx,
+            ty,
+            tw,
+            th,
+            value,
+            if brightness { 0 } else { 1 },
+            muted,
+            look.off,
+            track_hover,
+            dragging,
+            look.text[3] as f32 / 255.0,
+        );
+        if interactive {
+            if available {
+                let target = if brightness {
+                    Target::Brightness(0, tx + th / 2.0, tx + tw - th / 2.0)
+                } else {
+                    Target::Volume(tx + th / 2.0, tx + tw - th / 2.0)
+                };
+                targets.push(((tx - 4.0, ty - 4.0, tw + 8.0, th + 8.0), target));
+                if !brightness {
+                    // The little speaker inside the track toggles mute.
+                    targets.push(((tx - 3.0, ty - 4.0, 28.0, th + 8.0), Target::VolumeMute));
+                }
+            }
+            // Header chevron opens the detail sheet.
+            if chev {
+                let detail = if brightness {
+                    Target::OpenSettings("displays")
+                } else {
+                    Target::OpenSubmenu(Submenu::Sound)
+                };
+                targets.push(((x + w - 42.0, y + 2.0, 36.0, 28.0), detail));
+            }
+        }
+        let _ = h;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_small_module(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        kind: ControlKind,
+        look: CcLook,
+        fonts: &Fonts,
+        german: bool,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+        now: Instant,
+    ) {
+        let (x, y, w, h) = rect;
+        let (on_t, on_col, pulse, target) = match kind {
+            ControlKind::Wifi => (
+                self.anim.wifi.sample(now).clamp(0.0, 1.0),
+                look.accent,
+                PULSE_WIFI,
+                if self.control.wifi.is_some() {
+                    Target::WifiToggle
+                } else {
+                    Target::OpenSubmenu(Submenu::Wifi)
+                },
+            ),
+            ControlKind::Bluetooth => (
+                self.anim.bluetooth.sample(now).clamp(0.0, 1.0),
+                look.accent,
+                PULSE_BT,
+                if self.control.bluetooth.is_some() {
+                    Target::BluetoothToggle
+                } else {
+                    Target::OpenSubmenu(Submenu::Bluetooth)
+                },
+            ),
+            ControlKind::Focus => (
+                self.anim.dnd.sample(now).clamp(0.0, 1.0),
+                [94, 92, 230, 255],
+                PULSE_DND,
+                Target::Dnd,
+            ),
+            ControlKind::NightShift => (
+                self.anim.night_shift.sample(now).clamp(0.0, 1.0),
+                [255, 149, 0, 255],
+                PULSE_NIGHT,
+                Target::NightShift,
+            ),
+            ControlKind::GameMode => (
+                self.anim.game_mode.sample(now).clamp(0.0, 1.0),
+                [52, 199, 89, 255],
+                PULSE_GAME,
+                Target::GameMode,
+            ),
+            ControlKind::Displays => (0.0, look.accent, PULSE_GAME, Target::OpenSettings("displays")),
+            ControlKind::Network => (0.0, look.accent, PULSE_WIFI, Target::OpenSubmenu(Submenu::Wifi)),
+            ControlKind::Sound => (0.0, look.accent, PULSE_WIFI, Target::OpenSubmenu(Submenu::Sound)),
+            _ => (0.0, look.accent, PULSE_WIFI, Target::Panel),
+        };
+        let circle = lerp_rgba(look.off, on_col, on_t);
+        let wide = w > CC_CELL + 10.0;
+        let (cx, cy) = if wide {
+            (x + 31.0, y + h / 2.0)
+        } else {
+            (x + w / 2.0, y + 26.0)
+        };
+        let (ps, _) = tap_scale(self.anim.pulses[pulse], now);
+        fill_circle(pm, cx * s, cy * s, 16.0 * ps * s, circle);
+        // White symbols read correctly on both the accent and grey circles.
+        let glyph = [255, 255, 255, look.text[3]];
+        module_glyph(pm, s, kind, cx, cy, 6.5 * ps, glyph);
+        let label = module_name(kind, german);
+        if wide {
+            let tx = x + 54.0;
+            let maxw = (w - 66.0).max(30.0);
+            let base = fonts.baseline_centered((y + 16.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
+            fonts.draw(pm, &fonts.elide(label, 11.5 * s, Weight::Bold, maxw * s), tx * s, base, 11.5 * s, Weight::Bold, look.text);
+            let status = match kind {
+                ControlKind::Displays => {
+                    if german {
+                        "Anpassen"
+                    } else {
+                        "Adjust"
+                    }
+                }
+                ControlKind::Network => "Details",
+                ControlKind::Sound => {
+                    if german {
+                        "Ausgabe"
+                    } else {
+                        "Output"
+                    }
+                }
+                _ => {
+                    if on_t > 0.5 {
+                        if german {
+                            "Ein"
+                        } else {
+                            "On"
+                        }
+                    } else if german {
+                        "Aus"
+                    } else {
+                        "Off"
+                    }
+                }
+            };
+            let sb = fonts.baseline_centered((y + 36.0) * s, 16.0 * s, 10.0 * s, Weight::Regular);
+            fonts.draw(pm, status, tx * s, sb, 10.0 * s, Weight::Regular, look.sub);
+        } else {
+            let lw = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
+            let base = fonts.baseline_centered((y + 46.0) * s, 22.0 * s, 10.0 * s, Weight::Bold);
+            fonts.draw(pm, label, (x + (w - lw) / 2.0) * s, base, 10.0 * s, Weight::Bold, look.text);
+        }
+        if interactive {
+            targets.push(((x, y, w, h), target));
+        }
+        let _ = (h, pulse);
+    }
+
 
     // ---- Control Center submenus (1:1 macOS) ---------------------------------
 
@@ -1259,8 +2610,15 @@ impl Panel {
     ) {
         let t = |en: &'static str, de: &'static str| if german { de } else { en };
         let dark = theme.bar_text[0] > 128;
-        let tint: Rgba = if dark { [30, 30, 32, 165] } else { [242, 242, 245, 178] };
-        let border: Rgba = if dark { [255, 255, 255, 34] } else { [0, 0, 0, 22] };
+        let solid = theme.menu_bg[3] > 200;
+        let tint: Rgba = if dark {
+            if solid { [28, 28, 30, 248] } else { [18, 18, 22, 128] }
+        } else if solid {
+            [244, 244, 247, 250]
+        } else {
+            [246, 246, 250, 155]
+        };
+        let border: Rgba = if dark { [255, 255, 255, 30] } else { [0, 0, 0, 18] };
         let off: Rgba = if dark { [255, 255, 255, 36] } else { [0, 0, 0, 22] };
         let hover_bg: Rgba = if dark { [255, 255, 255, 22] } else { [0, 0, 0, 13] };
         let sep: Rgba = if dark { [255, 255, 255, 26] } else { [0, 0, 0, 22] };
@@ -1403,8 +2761,8 @@ impl Panel {
         let body_h = (total_h - top_chrome - footer_h).max(0.0);
 
         self.panel_rect = (x0, y0, CC_WIDTH, total_h);
-        fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, total_h * s, 18.0 * s, tint);
-        stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, total_h * s, 18.0 * s, 1.0 * s, border);
+        fill_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, total_h * s, CC_RADIUS * s, tint);
+        stroke_rounded(pm, x0 * s, y0 * s, CC_WIDTH * s, total_h * s, CC_RADIUS * s, 1.0 * s, border);
 
         // ---- Header ----
         let hy = y0 + 4.0;
@@ -1436,7 +2794,7 @@ impl Panel {
             let (tx, ty, tw, th) = (x0 + 14.0, cur_y + 2.0, CC_WIDTH - 28.0, 22.0);
             let vol_hov = self.hovered(tx - 2.0, ty - 4.0, tw + 4.0, th + 8.0);
             let vol_drag = matches!(self.dragging, Some(Target::Volume(..)));
-            draw_pill_slider(pm, s, tx, ty, tw, th, vol_val, 1, muted, off, vol_hov, vol_drag);
+            draw_pill_slider(pm, s, tx, ty, tw, th, vol_val, 1, muted, off, vol_hov, vol_drag, 1.0);
             // Clicking the speaker icon toggles mute; dragging anywhere else sets volume
             self.targets.push(((tx - 2.0, ty - 4.0, 24.0, th + 8.0), Target::VolumeMute));
             self.targets
@@ -1776,7 +3134,7 @@ impl Panel {
                                 let (tx, ty, tw, th) = (14.0 + slide_x, ly + 22.0, CC_WIDTH - 28.0, 20.0);
                                 let app_hov = is_hov(tx - 2.0, ty - 3.0, tw + 4.0, th + 6.0);
                                 let app_drag = matches!(self.dragging, Some(Target::AppVolume(idx, ..)) if idx == i);
-                                draw_pill_slider(&mut sub_pm, s, tx, ty, tw, th, shown, 1, st_muted, off, app_hov, app_drag);
+                                draw_pill_slider(&mut sub_pm, s, tx, ty, tw, th, shown, 1, st_muted, off, app_hov, app_drag, 1.0);
                                 // the speaker mutes; the rest of the track sets the level.
                                 // local targets get x0 added, slider ranges are absolute.
                                 local_targets.push(((tx - 2.0, ty - 3.0, 24.0, th + 6.0), Target::AppMute(i)));
@@ -1854,17 +3212,26 @@ fn draw_pill_slider(
     off: Rgba,
     hovered: bool,
     dragging: bool,
+    opacity: f32,
 ) {
+    let op = opacity.clamp(0.0, 1.0);
+    let a = |v: u8| (v as f32 * op).round().clamp(0.0, 255.0) as u8;
     fill_rounded(pm, tx * s, ty * s, tw * s, th * s, (th / 2.0) * s, off);
     let fill_w = (th + (tw - th) * value.clamp(0.0, 1.0)).max(th);
     let fill_alpha = if dragging { 252 } else if hovered { 246 } else { 236 };
-    fill_rounded(pm, tx * s, ty * s, fill_w * s, th * s, (th / 2.0) * s, [255, 255, 255, fill_alpha]);
+    fill_rounded(pm, tx * s, ty * s, fill_w * s, th * s, (th / 2.0) * s, [255, 255, 255, a(fill_alpha)]);
     let knob_x = tx + fill_w - th / 2.0;
     let knob_r = th / 2.0 - if dragging { 0.6 } else { 1.0 };
     if hovered || dragging {
-        fill_circle(pm, knob_x * s, (ty + th / 2.0 + 0.6) * s, knob_r * s, [0, 0, 0, if dragging { 38 } else { 22 }]);
+        fill_circle(
+            pm,
+            knob_x * s,
+            (ty + th / 2.0 + 0.6) * s,
+            knob_r * s,
+            [0, 0, 0, a(if dragging { 38 } else { 22 })],
+        );
     }
-    fill_circle(pm, knob_x * s, (ty + th / 2.0) * s, knob_r * s, [255, 255, 255, 255]);
+    fill_circle(pm, knob_x * s, (ty + th / 2.0) * s, knob_r * s, [255, 255, 255, a(255)]);
     stroke_rounded(
         pm,
         (knob_x - knob_r) * s,
@@ -1873,9 +3240,9 @@ fn draw_pill_slider(
         (knob_r * 2.0) * s,
         knob_r * s,
         1.0 * s,
-        [0, 0, 0, if dragging { 42 } else { 28 }],
+        [0, 0, 0, a(if dragging { 42 } else { 28 })],
     );
-    let glyph: Rgba = [90, 90, 92, 255];
+    let glyph: Rgba = [90, 90, 92, a(255)];
     match icon {
         0 => crate::osd::sun(pm, (tx + th / 2.0) * s, (ty + th / 2.0) * s, 8.0 * s, value, glyph),
         _ => crate::osd::speaker(pm, (tx + th / 2.0 + 1.0) * s, (ty + th / 2.0) * s, 7.0 * s, value, muted || value <= 0.001, glyph),
@@ -2175,9 +3542,6 @@ pub fn moon(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     }
 }
 
-/// Height of the Control Center's Game Mode card.
-const GAME_CARD_H: f32 = 50.0;
-
 /// A game controller outline with a d-pad and two buttons (Game Mode).
 pub fn controller(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     let (w, h) = (r * 2.3, r * 1.45);
@@ -2404,6 +3768,123 @@ fn transport(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, dir: i32, c: Rgba) {
         if let Some(p) = pb.finish() {
             pm.fill_path(&p, &paint(c), FillRule::Winding, Transform::identity(), None);
         }
+    }
+}
+
+/// Draw the glyph for a Control Center module at logical (cx, cy).
+fn module_glyph(pm: &mut Pixmap, s: f32, kind: ControlKind, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let ps = (r / 6.5).clamp(0.1, 1.5);
+    match kind {
+        ControlKind::Connectivity | ControlKind::Network | ControlKind::Wifi => {
+            crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.8 * ps, Network::Wifi(3), c)
+        }
+        ControlKind::Bluetooth => bluetooth(pm, cx * s, cy * s, r * 1.08 * s, c),
+        ControlKind::NowPlaying => music_note(pm, cx * s, cy * s, r * 1.15 * s, c),
+        ControlKind::Focus => moon(pm, cx * s, cy * s, r * s, c),
+        ControlKind::NightShift | ControlKind::Brightness => sun(pm, cx * s, cy * s, r * s, c),
+        ControlKind::GameMode => controller(pm, cx * s, cy * s, r * s, c),
+        ControlKind::Displays => display_glyph(pm, cx * s, cy * s, r * s, c),
+        ControlKind::Sound | ControlKind::Volume => {
+            crate::osd::speaker(pm, (cx + 1.0) * s, cy * s, r * s, 0.8, false, c)
+        }
+    }
+}
+
+fn music_note(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    fill_circle(pm, cx - r * 0.35, cy + r * 0.55, r * 0.38, c);
+    fill_rounded(pm, cx + r * 0.22, cy - r * 0.85, r * 0.17, r * 1.42, r * 0.08, c);
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + r * 0.39, cy - r * 0.82);
+    pb.line_to(cx + r * 0.72, cy - r * 0.45);
+    pb.line_to(cx + r * 0.39, cy - r * 0.30);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        pm.fill_path(&p, &paint(c), FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+fn plus(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - r, cy);
+    pb.line_to(cx + r, cy);
+    pb.move_to(cx, cy - r);
+    pb.line_to(cx, cy + r);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.42).max(1.4),
+            line_cap: LineCap::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+}
+
+fn minus(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - r, cy);
+    pb.line_to(cx + r, cy);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.42).max(1.5),
+            line_cap: LineCap::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+}
+
+fn check(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - r, cy);
+    pb.line_to(cx - r * 0.2, cy + r * 0.8);
+    pb.line_to(cx + r, cy - r * 0.8);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.38).max(1.4),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
+    }
+}
+
+fn pencil(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx + r * 0.55, cy - r * 0.95);
+    pb.line_to(cx + r * 0.95, cy - r * 0.55);
+    pb.line_to(cx - r * 0.35, cy + r);
+    pb.line_to(cx - r, cy + r * 0.55);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        pm.fill_path(&p, &paint(c), FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+fn trash(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    fill_rounded(pm, cx - r * 0.75, cy - r * 0.55, r * 1.5, r * 0.26, r * 0.08, c);
+    fill_rounded(pm, cx - r * 0.38, cy - r * 0.92, r * 0.76, r * 0.25, r * 0.08, c);
+    stroke_rounded(pm, cx - r * 0.58, cy - r * 0.25, r * 1.16, r * 1.2, r * 0.22, (r * 0.18).max(1.2), c);
+}
+
+fn resize_glyph(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - r, cy + r);
+    pb.line_to(cx + r, cy - r);
+    pb.move_to(cx - r * 0.15, cy - r);
+    pb.line_to(cx + r, cy - r);
+    pb.line_to(cx + r, cy + r * 0.15);
+    pb.move_to(cx - r, cy + r * 0.15);
+    pb.line_to(cx - r, cy + r);
+    pb.line_to(cx - r * 0.15, cy + r);
+    if let Some(p) = pb.finish() {
+        let st = Stroke {
+            width: (r * 0.28).max(1.1),
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&p, &paint(c), &st, Transform::identity(), None);
     }
 }
 
@@ -3356,19 +4837,190 @@ wlan0:wifi:connected:OfficeWiFi
         assert!(!ControlState::default().show_ethernet());
     }
 
+    /// Renders the Control Center to `/tmp/orchard-cc-preview.png` for visual
+    /// inspection: `cargo test -p orchard-shell render_cc_preview -- --ignored`.
     #[test]
-    fn quicksettings_switches_targets_between_wifi_and_ethernet() {
+    #[ignore]
+    fn render_cc_preview() {
+        let fonts = Fonts::load();
+        let center = Center::default();
+        let apps = Apps::load(None);
+        let render = |appearance,
+                      edit: bool,
+                      gallery: bool,
+                      open_ms: u64,
+                      submenu: Option<Submenu>,
+                      layout: Option<ControlCenterSettings>,
+                      path: &str| {
+            let theme = Theme::new(appearance);
+            let mut pm = Pixmap::new(1500, 1100).unwrap();
+            let mut panel = Panel::new(Kind::Control, 1480.0);
+            panel.opened = Instant::now() - Duration::from_millis(open_ms);
+            if let Some(layout) = layout {
+                let mut settings = Settings::default();
+                settings.control_center = layout;
+                panel.apply_settings(&settings);
+            }
+            panel.control = ControlState {
+                wifi: Some((true, Some("Home 5G".into()))),
+                bluetooth: Some(true),
+                ethernet: Vec::new(),
+                volume: Some((0.62, false)),
+                displays: vec![crate::ddc::DisplayBrightness {
+                    bus: None,
+                    name: "Built-in Display".into(),
+                    value: 0.82,
+                }],
+                media: Some(Media {
+                    title: "Midnight City".into(),
+                    artist: "M83".into(),
+                    playing: true,
+                }),
+                ..Default::default()
+            };
+            panel.game_mode_enabled = true;
+            if edit {
+                panel.cc_toggle_edit();
+            }
+            if gallery {
+                panel.cc_open_gallery();
+            }
+            if let Some(sub) = submenu {
+                panel.open_submenu(sub);
+            }
+            panel.paint(&mut pm, 2.0, 750.0, 550.0, &center, &apps, &fonts, &theme, false);
+            pm.save_png(path).unwrap();
+        };
+        render(crate::theme::Appearance::Dark, false, false, 2000, None, None, "/tmp/orchard-cc-dark.png");
+        render(crate::theme::Appearance::Light, false, false, 2000, None, None, "/tmp/orchard-cc-light.png");
+        render(crate::theme::Appearance::Dark, true, false, 2000, None, None, "/tmp/orchard-cc-edit.png");
+        render(crate::theme::Appearance::Dark, true, true, 2000, None, None, "/tmp/orchard-cc-gallery.png");
+        render(crate::theme::Appearance::Dark, false, false, 170, None, None, "/tmp/orchard-cc-open.png");
+        render(
+            crate::theme::Appearance::Dark,
+            false,
+            false,
+            2000,
+            Some(Submenu::Wifi),
+            None,
+            "/tmp/orchard-cc-wifi.png",
+        );
+        render(
+            crate::theme::Appearance::Dark,
+            false,
+            false,
+            2000,
+            None,
+            Some(ControlCenterSettings {
+                pages: vec![vec![
+                    ControlItem::new(ControlKind::NowPlaying, ControlSize::Wide),
+                    ControlItem::new(ControlKind::Wifi, ControlSize::Small),
+                    ControlItem::new(ControlKind::Bluetooth, ControlSize::Small),
+                    ControlItem::new(ControlKind::Focus, ControlSize::Wide),
+                    ControlItem::new(ControlKind::GameMode, ControlSize::Wide),
+                    ControlItem::new(ControlKind::Network, ControlSize::Wide),
+                    ControlItem::new(ControlKind::Sound, ControlSize::Small),
+                    ControlItem::new(ControlKind::Displays, ControlSize::Small),
+                    ControlItem::new(ControlKind::Brightness, ControlSize::Full),
+                    ControlItem::new(ControlKind::Volume, ControlSize::Full),
+                ]],
+            }),
+            "/tmp/orchard-cc-custom.png",
+        );
+    }
+
+    #[test]
+    fn pack_page_uses_a_four_column_ios_grid() {
+        let pages = ControlCenterSettings::default().pages;
+        let placed = pack_page(&pages[0]);
+        assert_eq!(placed.len(), 8);
+        assert_eq!((placed[0].x, placed[0].y, placed[0].w, placed[0].h), (14.0, 0.0, 162.0, 162.0));
+        assert_eq!((placed[1].x, placed[1].y), (186.0, 0.0));
+        assert_eq!((placed[2].x, placed[2].y), (14.0, 172.0));
+        assert_eq!((placed[3].x, placed[3].y), (100.0, 172.0));
+        assert_eq!((placed[4].x, placed[4].y), (186.0, 172.0));
+        assert_eq!((placed[5].x, placed[5].y), (272.0, 172.0));
+        assert_eq!((placed[6].x, placed[6].y, placed[6].w), (14.0, 258.0, 162.0));
+        assert_eq!((placed[7].x, placed[7].y, placed[7].w), (186.0, 258.0, 162.0));
+        assert_eq!(content_rows(&placed), 4);
+        assert_eq!(content_height(&placed), 334.0);
+    }
+
+    #[test]
+    fn paints_every_control_at_every_size_without_panicking() {
+        let fonts = Fonts::load();
+        let center = Center::default();
+        let apps = Apps::load(None);
+        let mut pm = Pixmap::new(500, 600).unwrap();
+        let mut panel = Panel::new(Kind::Control, 490.0);
+        panel.control = ControlState {
+            wifi: Some((true, Some("Home".into()))),
+            bluetooth: Some(true),
+            volume: Some((0.4, false)),
+            displays: vec![crate::ddc::DisplayBrightness {
+                bus: None,
+                name: "Built-in".into(),
+                value: 0.5,
+            }],
+            media: Some(Media {
+                title: "A very long media title that will be elided".into(),
+                artist: "Artist".into(),
+                playing: false,
+            }),
+            ..Default::default()
+        };
+        for appearance in [crate::theme::Appearance::Dark, crate::theme::Appearance::Light] {
+            let theme = Theme::new(appearance);
+            for kind in ControlKind::ALL {
+                for size in [
+                    ControlSize::Small,
+                    ControlSize::Wide,
+                    ControlSize::Tall,
+                    ControlSize::Large,
+                    ControlSize::Full,
+                ] {
+                    panel.cc.pages = vec![vec![ControlItem::new(kind, size)]];
+                    panel.cc.page = 0;
+                    panel.cc.layout_dirty = true;
+                    panel.cc.edit = false;
+                    panel.cc.gallery = false;
+                    panel.opened = Instant::now() - Duration::from_secs(1);
+                    panel.paint(&mut pm, 1.0, 500.0, 600.0, &center, &apps, &fonts, &theme, false);
+                }
+            }
+        }
+        // Gallery and edit rendering for the default layout.
+        let theme = Theme::new(crate::theme::Appearance::Dark);
+        panel.cc.pages = ControlCenterSettings::default().pages;
+        panel.cc.layout_dirty = true;
+        panel.cc_toggle_edit();
+        panel.paint(&mut pm, 1.0, 500.0, 600.0, &center, &apps, &fonts, &theme, false);
+        panel.cc_open_gallery();
+        panel.paint(&mut pm, 1.0, 500.0, 600.0, &center, &apps, &fonts, &theme, false);
+    }
+
+    #[test]
+    fn resize_cycles_to_sensible_sizes() {
+        assert_eq!(next_module_size(ControlKind::Connectivity, ControlSize::Large), ControlSize::Wide);
+        assert_eq!(next_module_size(ControlKind::Connectivity, ControlSize::Wide), ControlSize::Large);
+        assert_eq!(next_module_size(ControlKind::Brightness, ControlSize::Wide), ControlSize::Full);
+        assert_eq!(next_module_size(ControlKind::Brightness, ControlSize::Full), ControlSize::Wide);
+        assert_eq!(next_module_size(ControlKind::Focus, ControlSize::Small), ControlSize::Wide);
+        assert_eq!(next_module_size(ControlKind::Focus, ControlSize::Wide), ControlSize::Small);
+    }
+
+    #[test]
+    fn control_center_exposes_quick_settings_and_media_targets() {
         let fonts = Fonts::load();
         let theme = Theme::new(crate::theme::Appearance::Dark);
         let center = Center::default();
         let apps = Apps::load(None);
-        let mut pm = Pixmap::new(640, 800).unwrap();
-
-        let mut panel = Panel::new(Kind::Control, 620.0);
+        let mut pm = Pixmap::new(750, 800).unwrap();
+        let mut panel = Panel::new(Kind::Control, 740.0);
         panel.opened = Instant::now() - Duration::from_secs(1);
-        // Connected only via Ethernet -> main view exposes Ethernet toggle & submenu
         panel.control = ControlState {
-            wifi: Some((false, None)),
+            wifi: Some((true, Some("HomeNet".into()))),
+            bluetooth: Some(true),
             ethernet: vec![EthernetDevice {
                 device: "enp5s0".into(),
                 connection: Some("Wired connection 1".into()),
@@ -3377,28 +5029,57 @@ wlan0:wifi:connected:OfficeWiFi
                 plugged: true,
                 managed: true,
             }],
+            volume: Some((0.5, false)),
+            displays: vec![crate::ddc::DisplayBrightness {
+                bus: None,
+                name: "Built-in".into(),
+                value: 0.7,
+            }],
+            media: Some(Media {
+                title: "Song".into(),
+                artist: "Artist".into(),
+                playing: true,
+            }),
             ..Default::default()
         };
-        panel.paint(&mut pm, 1.0, 640.0, 800.0, &center, &apps, &fonts, &theme, false);
-        assert!(panel.targets.iter().any(|(_, t)| *t == Target::EthernetToggle));
-        assert!(panel.targets.iter().any(|(_, t)| *t == Target::OpenSubmenu(Submenu::Ethernet)));
-        assert!(!panel.targets.iter().any(|(_, t)| *t == Target::WifiToggle));
+        panel.paint(&mut pm, 1.0, 750.0, 800.0, &center, &apps, &fonts, &theme, false);
+        macro_rules! has {
+            ($t:expr) => {
+                panel.targets.iter().any(|(_, x)| x == &$t)
+            };
+        }
+        assert!(has!(Target::WifiToggle));
+        assert!(has!(Target::BluetoothToggle));
+        assert!(has!(Target::EthernetToggle));
+        assert!(has!(Target::OpenSubmenu(Submenu::Wifi)));
+        assert!(has!(Target::OpenSubmenu(Submenu::Bluetooth)));
+        assert!(has!(Target::OpenSubmenu(Submenu::Ethernet)));
+        assert!(has!(Target::Dnd));
+        assert!(has!(Target::NightShift));
+        assert!(has!(Target::GameMode));
+        assert!(has!(Target::OpenSettings("displays")));
+        assert!(panel.targets.iter().any(|(_, t)| matches!(t, Target::Volume(..))));
+        assert!(panel.targets.iter().any(|(_, t)| matches!(t, Target::Brightness(0, ..))));
+        assert!(has!(Target::MediaPlay));
+        assert!(has!(Target::ToggleEdit));
+        let (_, _, w, h) = panel.rect();
+        assert_eq!(w, CC_WIDTH);
+        assert!(h > 300.0);
 
-        // Open Ethernet submenu -> exposes EthToggleDevice + quick-access Wi-Fi link
-        panel.open_submenu(Submenu::Ethernet);
-        panel.paint(&mut pm, 1.0, 640.0, 800.0, &center, &apps, &fonts, &theme, false);
-        assert!(panel.targets.iter().any(|(_, t)| {
-            matches!(t, Target::EthToggleDevice { device, connected: true } if device == "enp5s0")
-        }));
-        assert!(panel.targets.iter().any(|(_, t)| *t == Target::OpenSubmenu(Submenu::Wifi)));
+        // Edit mode turns every module into a draggable, removable card.
+        panel.cc_toggle_edit();
+        panel.paint(&mut pm, 1.0, 750.0, 800.0, &center, &apps, &fonts, &theme, false);
+        assert!(has!(Target::GrabModule(ControlKind::Connectivity)));
+        assert!(has!(Target::GrabModule(ControlKind::NowPlaying)));
+        assert!(has!(Target::RemoveModule(ControlKind::Focus)));
+        assert!(!has!(Target::WifiToggle), "module sub-targets are disabled while editing");
 
-        // Switch to Wi-Fi connected -> main view switches back to Wi-Fi
-        panel.close_submenu();
-        panel.control.wifi = Some((true, Some("HomeNet".into())));
-        panel.control.ethernet[0].connected = false;
-        panel.paint(&mut pm, 1.0, 640.0, 800.0, &center, &apps, &fonts, &theme, false);
-        assert!(panel.targets.iter().any(|(_, t)| *t == Target::WifiToggle));
-        assert!(panel.targets.iter().any(|(_, t)| *t == Target::OpenSubmenu(Submenu::Wifi)));
-        assert!(!panel.targets.iter().any(|(_, t)| *t == Target::EthernetToggle));
+        // The gallery lists added and addable controls.
+        panel.cc_open_gallery();
+        panel.paint(&mut pm, 1.0, 750.0, 800.0, &center, &apps, &fonts, &theme, false);
+        assert!(has!(Target::AddModule(ControlKind::Wifi)));
+        assert!(has!(Target::RemoveModule(ControlKind::Connectivity)));
+        assert!(has!(Target::PageAdd));
+        assert!(has!(Target::CloseGallery));
     }
 }

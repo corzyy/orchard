@@ -900,6 +900,169 @@ pub fn kelvin_to_rgb(kelvin: f32) -> [f32; 3] {
     [0, 1, 2].map(|i| (c[i] / white[i]).clamp(0.0, 1.0))
 }
 
+/// One control in the Control Center grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlKind {
+    /// Wi-Fi / Bluetooth / Ethernet group.
+    Connectivity,
+    /// Standalone Wi-Fi quick toggle.
+    Wifi,
+    /// Standalone Bluetooth quick toggle.
+    Bluetooth,
+    /// Now-playing media transport.
+    NowPlaying,
+    /// Do Not Disturb / Focus.
+    Focus,
+    /// Display colour temperature.
+    NightShift,
+    /// Automatic game mode.
+    GameMode,
+    /// Brightness slider.
+    Brightness,
+    /// Volume slider.
+    Volume,
+    /// Network details (Wi-Fi / Ethernet).
+    Network,
+    /// Sound output details.
+    Sound,
+    /// Per-display brightness details.
+    Displays,
+}
+
+impl ControlKind {
+    pub const ALL: [ControlKind; 12] = [
+        ControlKind::Connectivity,
+        ControlKind::Wifi,
+        ControlKind::Bluetooth,
+        ControlKind::NowPlaying,
+        ControlKind::Focus,
+        ControlKind::NightShift,
+        ControlKind::GameMode,
+        ControlKind::Brightness,
+        ControlKind::Volume,
+        ControlKind::Network,
+        ControlKind::Sound,
+        ControlKind::Displays,
+    ];
+
+    /// The size a control gets when it is added from the gallery.
+    pub fn default_size(self) -> ControlSize {
+        match self {
+            ControlKind::Connectivity | ControlKind::NowPlaying => ControlSize::Large,
+            ControlKind::Brightness | ControlKind::Volume => ControlSize::Wide,
+            _ => ControlSize::Small,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlSize {
+    /// 1 × 1 grid cells.
+    #[default]
+    Small,
+    /// 2 × 1 grid cells.
+    Wide,
+    /// 1 × 2 grid cells.
+    Tall,
+    /// 2 × 2 grid cells.
+    Large,
+    /// 4 × 1 grid cells.
+    Full,
+}
+
+impl ControlSize {
+    /// `(columns, rows)` occupied in the four-column Control Center grid.
+    pub fn span(self) -> (usize, usize) {
+        match self {
+            ControlSize::Small => (1, 1),
+            ControlSize::Wide => (2, 1),
+            ControlSize::Tall => (1, 2),
+            ControlSize::Large => (2, 2),
+            ControlSize::Full => (4, 1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlItem {
+    pub kind: ControlKind,
+    pub size: ControlSize,
+}
+
+impl ControlItem {
+    pub const fn new(kind: ControlKind, size: ControlSize) -> Self {
+        Self { kind, size }
+    }
+
+    pub fn with_default_size(kind: ControlKind) -> Self {
+        Self {
+            kind,
+            size: kind.default_size(),
+        }
+    }
+}
+
+impl Default for ControlItem {
+    fn default() -> Self {
+        Self {
+            kind: ControlKind::Connectivity,
+            size: ControlSize::Large,
+        }
+    }
+}
+
+/// Control Center layout: an ordered list of pages, each a list of controls.
+/// The UI packs them into a four-column grid, preserving this order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlCenterSettings {
+    pub pages: Vec<Vec<ControlItem>>,
+}
+
+impl Default for ControlCenterSettings {
+    fn default() -> Self {
+        Self {
+            pages: vec![vec![
+                ControlItem::new(ControlKind::Connectivity, ControlSize::Large),
+                ControlItem::new(ControlKind::NowPlaying, ControlSize::Large),
+                ControlItem::new(ControlKind::Focus, ControlSize::Small),
+                ControlItem::new(ControlKind::NightShift, ControlSize::Small),
+                ControlItem::new(ControlKind::GameMode, ControlSize::Small),
+                ControlItem::new(ControlKind::Displays, ControlSize::Small),
+                ControlItem::new(ControlKind::Brightness, ControlSize::Wide),
+                ControlItem::new(ControlKind::Volume, ControlSize::Wide),
+            ]],
+        }
+    }
+}
+
+impl ControlCenterSettings {
+    /// Every control currently placed on any page.
+    pub fn contains(&self, kind: ControlKind) -> bool {
+        self.pages.iter().flatten().any(|c| c.kind == kind)
+    }
+
+    /// Drop repeated controls, keeping pages (even empty ones) and the user's
+    /// order, so a layout never has two identical controls after a bad edit.
+    pub fn sanitized(&self) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let pages = self
+            .pages
+            .iter()
+            .map(|page| {
+                page.iter()
+                    .copied()
+                    .filter(|c| seen.insert(c.kind))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self { pages }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Settings {
@@ -918,6 +1081,7 @@ pub struct Settings {
     pub performance: PerformanceSettings,
     pub night_shift: NightShiftSettings,
     pub game_mode: GameModeSettings,
+    pub control_center: ControlCenterSettings,
 }
 
 pub fn config_dir() -> PathBuf {
@@ -1353,6 +1517,40 @@ mod tests {
         n.set_manual(false, t0, 20 * 60);
         assert_eq!(n.manual, None);
         assert!(!n.active(t0, 20 * 60));
+    }
+
+    #[test]
+    fn control_center_layout_round_trips_and_sanitizes() {
+        let mut s = Settings::default();
+        s.control_center.pages = vec![
+            vec![
+                ControlItem::new(ControlKind::Connectivity, ControlSize::Large),
+                ControlItem::new(ControlKind::Focus, ControlSize::Small),
+                // duplicates are dropped
+                ControlItem::new(ControlKind::Focus, ControlSize::Wide),
+            ],
+            Vec::new(),
+        ];
+        let round = serde_json::from_str::<Settings>(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(round.control_center, s.control_center);
+        let clean = s.control_center.sanitized();
+        assert_eq!(clean.pages.len(), 2, "an empty page is still a page");
+        assert_eq!(clean.pages[0].len(), 2);
+        assert!(clean.pages[0].iter().all(|c| c.kind != ControlKind::Focus || c.size == ControlSize::Small));
+        // Older files without the field get the iOS-style default.
+        let parsed: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.control_center.pages.len(), 1);
+        assert!(parsed.control_center.contains(ControlKind::Connectivity));
+        assert!(parsed.control_center.contains(ControlKind::Volume));
+    }
+
+    #[test]
+    fn control_sizes_span_the_grid() {
+        assert_eq!(ControlSize::Small.span(), (1, 1));
+        assert_eq!(ControlSize::Wide.span(), (2, 1));
+        assert_eq!(ControlSize::Tall.span(), (1, 2));
+        assert_eq!(ControlSize::Large.span(), (2, 2));
+        assert_eq!(ControlSize::Full.span(), (4, 1));
     }
 
     #[test]

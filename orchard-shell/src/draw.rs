@@ -95,14 +95,48 @@ pub fn fill_circle(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, c: Rgba) {
     }
 }
 
-/// Copy a premultiplied RGBA pixmap into a wl_shm ARGB8888 canvas (BGRA bytes).
-pub fn blit_to_shm(pm: &Pixmap, canvas: &mut [u8]) {
-    // RGBA -> BGRA as one u32 swap of the R and B bytes (vectorizes well;
-    // full-screen surfaces are tens of MB per frame on HiDPI)
-    for (dst, src) in canvas.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
-        let v = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
-        let v = (v & 0xFF00_FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
-        dst.copy_from_slice(&v.to_le_bytes());
+/// Copy one physical-pixel rectangle of `pm` into the canvas. Transient
+/// overlays (the Control Center) only change a small part of their surface, so
+/// an animation frame needs neither a full clear nor a full-screen blit.
+pub fn blit_region_to_shm(pm: &Pixmap, canvas: &mut [u8], x: u32, y: u32, w: u32, h: u32) {
+    let pw = pm.width();
+    let x1 = (x + w).min(pw);
+    let y1 = (y + h).min(pm.height());
+    if x >= x1 || y >= y1 {
+        return;
+    }
+    let row = x1 - x;
+    let src = pm.data();
+    for sy in y..y1 {
+        let start = ((sy * pw + x) * 4) as usize;
+        let end = start + row as usize * 4;
+        for (dst, px) in canvas[start..end].chunks_exact_mut(4).zip(src[start..end].chunks_exact(4)) {
+            // RGBA -> BGRA as one u32 swap of the R and B bytes.
+            let v = u32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+            let v = (v & 0xFF00_FF00) | ((v & 0xFF) << 16) | ((v >> 16) & 0xFF);
+            dst.copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// Clear a physical-pixel rectangle (plus a margin for antialiasing and
+/// shadows) back to transparent.
+pub fn clear_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, margin: f32) {
+    let pw = pm.width() as f32;
+    let ph = pm.height() as f32;
+    let x0 = (x - margin).floor().clamp(0.0, pw) as u32;
+    let y0 = (y - margin).floor().clamp(0.0, ph) as u32;
+    let x1 = (x + w + margin).ceil().clamp(0.0, pw) as u32;
+    let y1 = (y + h + margin).ceil().clamp(0.0, ph) as u32;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let row_bytes = (x1 - x0) as usize * 4;
+    let stride = pm.width() as usize * 4;
+    let data = pm.data_mut();
+    for sy in y0..y1 {
+        let start = sy as usize * stride + x0 as usize * 4;
+        data[start..start + row_bytes].fill(0);
     }
 }
 
@@ -113,8 +147,26 @@ mod blit_tests {
         let mut pm = tiny_skia::Pixmap::new(2, 1).unwrap();
         pm.data_mut().copy_from_slice(&[1, 2, 3, 4, 10, 20, 30, 40]);
         let mut out = [0u8; 8];
-        super::blit_to_shm(&pm, &mut out);
+        super::blit_region_to_shm(&pm, &mut out, 0, 0, 2, 1);
         assert_eq!(out, [3, 2, 1, 4, 30, 20, 10, 40]);
+    }
+
+    #[test]
+    fn clear_rect_clears_only_the_requested_area() {
+        let mut pm = tiny_skia::Pixmap::new(4, 4).unwrap();
+        pm.data_mut().fill(9);
+        super::clear_rect(&mut pm, 1.0, 1.0, 2.0, 2.0, 0.0);
+        let at = |x: usize, y: usize| (y * 4 + x) * 4;
+        assert_eq!(pm.data()[at(0, 0)], 9);
+        assert_eq!(pm.data()[at(1, 1)], 0);
+        assert_eq!(pm.data()[at(2, 2)], 0);
+        assert_eq!(pm.data()[at(3, 3)], 9);
+        // Out-of-bounds rects never panic and leave the pixmap alone.
+        super::clear_rect(&mut pm, -20.0, -20.0, 4.0, 4.0, 8.0);
+        assert_eq!(pm.data()[at(0, 0)], 9);
+        // A rect starting off-screen still clips into the visible part.
+        super::clear_rect(&mut pm, -2.0, -2.0, 4.0, 4.0, 0.0);
+        assert_eq!(pm.data()[at(0, 0)], 0);
     }
 }
 

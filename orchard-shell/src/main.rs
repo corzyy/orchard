@@ -197,6 +197,8 @@ struct App {
     ipc: Option<Ipc>,
     last_step: Instant,
     last_backdrop: Option<(f32, f32, f32, f32)>,
+    /// Last Control Center backdrop sent to the compositor (rect + alpha).
+    last_panel_backdrop: Option<(f32, f32, f32, f32, f32)>,
     last_tiles: String,
     german: bool,
     exit: bool,
@@ -414,6 +416,7 @@ fn main() {
         ipc,
         last_step: Instant::now(),
         last_backdrop: None,
+        last_panel_backdrop: None,
         last_tiles: String::new(),
         german: std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false),
         exit: false,
@@ -1679,6 +1682,17 @@ impl App {
     }
 
     fn draw(&mut self, which: Which) {
+        // The panel is a transparent full-screen overlay whose only content is
+        // the panel rect. Keep the previous rect so an animation frame can
+        // clear/blit just that part instead of the whole surface.
+        let panel_prev = if which == Which::Panel {
+            self.panel
+                .as_ref()
+                .map(|p| p.last_rect())
+                .filter(|r| r.2 > 0.0 && r.3 > 0.0)
+        } else {
+            None
+        };
         let (w, h, scale, existing_pm) = match self.surf(which) {
             Some(s) if s.configured => {
                 s.dirty = false;
@@ -1688,9 +1702,19 @@ impl App {
         };
         let pw = w as i32 * scale;
         let ph = h as i32 * scale;
+        let first_frame = existing_pm
+            .as_ref()
+            .map(|pm| pm.width() != pw as u32 || pm.height() != ph as u32)
+            .unwrap_or(true);
         let mut pm = match existing_pm {
             Some(mut pm) if pm.width() == pw as u32 && pm.height() == ph as u32 => {
-                pm.fill(tiny_skia::Color::TRANSPARENT);
+                if which == Which::Panel {
+                    if let Some((x, y, rw, rh)) = panel_prev {
+                        draw::clear_rect(&mut pm, x * scale as f32, y * scale as f32, rw * scale as f32, rh * scale as f32, 24.0 * scale as f32);
+                    }
+                } else {
+                    pm.fill(tiny_skia::Color::TRANSPARENT);
+                }
                 pm
             }
             _ => match Pixmap::new(pw as u32, ph as u32) {
@@ -1824,6 +1848,38 @@ impl App {
             }
         }
 
+        // Panel repaints only touch the union of the previous and current panel
+        // rect (plus a margin). Everything else on that overlay is transparent.
+        let partial = if which == Which::Panel && !first_frame {
+            let cur = self
+                .panel
+                .as_ref()
+                .map(|p| p.rect())
+                .filter(|r| r.2 > 0.0 && r.3 > 0.0);
+            let union = match (panel_prev, cur) {
+                (Some(a), Some(b)) => {
+                    let x0 = a.0.min(b.0);
+                    let y0 = a.1.min(b.1);
+                    let x1 = (a.0 + a.2).max(b.0 + b.2);
+                    let y1 = (a.1 + a.3).max(b.1 + b.3);
+                    Some((x0, y0, x1 - x0, y1 - y0))
+                }
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            union.map(|(x, y, rw, rh)| {
+                let m = 28.0;
+                let x0 = ((x - m) * fscale).floor().clamp(0.0, pw as f32) as u32;
+                let y0 = ((y - m) * fscale).floor().clamp(0.0, ph as f32) as u32;
+                let x1 = ((x + rw + m) * fscale).ceil().clamp(0.0, pw as f32) as u32;
+                let y1 = ((y + rh + m) * fscale).ceil().clamp(0.0, ph as f32) as u32;
+                (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+            })
+            .filter(|r| r.2 > 0 && r.3 > 0)
+        } else {
+            None
+        };
         let qh = self.qh.clone();
         let shm = &self.shm;
         let s = match which {
@@ -1862,10 +1918,11 @@ impl App {
                 return;
             }
         };
-        draw::blit_to_shm(&pm, canvas);
+        let (dx, dy, dw, dh) = partial.unwrap_or((0, 0, pw as u32, ph as u32));
+        draw::blit_region_to_shm(&pm, canvas, dx, dy, dw, dh);
         s.pixmap = Some(pm);
         let surface = s.layer.wl_surface().clone();
-        surface.damage_buffer(0, 0, pw, ph);
+        surface.damage_buffer(dx as i32, dy as i32, dw as i32, dh as i32);
         // Every commit asks for a frame callback: further repaints wait for it
         // (vsync-paced), and an animation continues from it (dirty stays set).
         if animating {
@@ -3226,6 +3283,8 @@ impl KeyboardHandler for App {
                 if let Some(p) = self.panel.as_mut() {
                     p.close_submenu();
                 }
+                self.redraw(Which::Panel);
+            } else if self.panel.as_mut().is_some_and(|p| p.cc_escape()) {
                 self.redraw(Which::Panel);
             } else {
                 self.close_panel();
