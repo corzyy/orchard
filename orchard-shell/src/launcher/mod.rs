@@ -500,6 +500,9 @@ pub struct Launcher {
     german: bool,
     /// recoloured symbolic icons
     tiles: RefCell<HashMap<(String, u32), Option<Rc<Pixmap>>>>,
+    /// reused canvases (the list needs clipping; the field clips its text)
+    list_canvas: RefCell<Option<Pixmap>>,
+    field_canvas: RefCell<Option<Pixmap>>,
 }
 
 impl Launcher {
@@ -521,6 +524,8 @@ impl Launcher {
             last_click: None,
             german,
             tiles: RefCell::new(HashMap::new()),
+            list_canvas: RefCell::new(None),
+            field_canvas: RefCell::new(None),
         }
     }
 
@@ -1218,9 +1223,15 @@ impl Launcher {
         let body_h = (h - body_top - FOOTER_H).max(0.0);
         if body_h > 0.5 && !self.items.is_empty() {
             // the list is the only off-screen canvas: it clips rows while the
-            // panel grows or shrinks
-            if let Some(mut list) = Pixmap::new((WIDTH * s).ceil() as u32, (body_h * s).ceil() as u32) {
-                self.paint_list(&mut list, s, apps, fonts, &pal);
+            // panel grows or shrinks. The buffer is reused between frames.
+            let (cw, ch) = (((WIDTH * s).ceil()) as u32, ((body_h * s).ceil()) as u32);
+            let mut canvas = self.list_canvas.borrow_mut();
+            if canvas.as_ref().map(|p| p.width() != cw || p.height() != ch).unwrap_or(true) {
+                *canvas = Pixmap::new(cw, ch);
+            }
+            if let Some(list) = canvas.as_mut() {
+                list.fill(tiny_skia::Color::TRANSPARENT);
+                self.paint_list(list, s, apps, fonts, &pal);
                 pm.draw_pixmap(px as i32, ((y + body_top) * s) as i32, list.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
             }
         }
@@ -1318,10 +1329,16 @@ impl Launcher {
         let tx0 = 40.0;
         let avail = WIDTH - tx0 - 16.0;
         let fpx = 17.0 * s;
-        let Some(mut fld) = Pixmap::new((avail * s).ceil() as u32, (FIELD_H * s).ceil() as u32) else { return };
+        let (cw, ch) = (((avail * s).ceil()) as u32, ((FIELD_H * s).ceil()) as u32);
+        let mut canvas = self.field_canvas.borrow_mut();
+        if canvas.as_ref().map(|p| p.width() != cw || p.height() != ch).unwrap_or(true) {
+            *canvas = Pixmap::new(cw, ch);
+        }
+        let Some(fld) = canvas.as_mut() else { return };
+        fld.fill(tiny_skia::Color::TRANSPARENT);
         let base = fonts.baseline_centered(0.0, FIELD_H * s, fpx, Weight::Regular);
         if self.query.is_empty() {
-            fonts.draw(&mut fld, self.t("Search apps, files and actions…", "Apps, Dateien und Aktionen suchen …"), 0.0, base, fpx, Weight::Regular, pal.tertiary);
+            fonts.draw(fld, self.t("Search apps, files and actions…", "Apps, Dateien und Aktionen suchen …"), 0.0, base, fpx, Weight::Regular, pal.tertiary);
         } else {
             let full_w = fonts.measure(&self.query, fpx, Weight::Regular);
             let caret_x = fonts.measure(&self.query[..self.cursor], fpx, Weight::Regular);
@@ -1330,20 +1347,20 @@ impl Launcher {
             let tx = -shift;
             if self.sel_all {
                 let sel = [pal.accent[0], pal.accent[1], pal.accent[2], 80];
-                fill_rounded(&mut fld, tx - 1.0 * s, base - 15.0 * s, full_w + 2.0 * s, 21.0 * s, 3.0 * s, sel);
+                fill_rounded(fld, tx - 1.0 * s, base - 15.0 * s, full_w + 2.0 * s, 21.0 * s, 3.0 * s, sel);
             }
-            fonts.draw(&mut fld, &self.query, tx, base, fpx, Weight::Regular, pal.text);
+            fonts.draw(fld, &self.query, tx, base, fpx, Weight::Regular, pal.text);
             // inline completion: the rest of the top hit's name, dimmed
             if let Some(rest) = self.completion() {
                 let after = tx + full_w;
-                fonts.draw(&mut fld, &rest, after, base, fpx, Weight::Regular, pal.secondary);
+                fonts.draw(fld, &rest, after, base, fpx, Weight::Regular, pal.secondary);
             }
             if self.caret_on && !self.sel_all {
-                fill_rounded(&mut fld, (tx + caret_x).round(), base - 14.5 * s, (2.0 * s).max(2.0), 20.0 * s, 1.0 * s, pal.accent);
+                fill_rounded(fld, (tx + caret_x).round(), base - 14.5 * s, (2.0 * s).max(2.0), 20.0 * s, 1.0 * s, pal.accent);
             }
         }
         if self.caret_on && self.query.is_empty() {
-            fill_rounded(&mut fld, 0.0, base - 14.5 * s, (2.0 * s).max(2.0), 20.0 * s, 1.0 * s, pal.accent);
+            fill_rounded(fld, 0.0, base - 14.5 * s, (2.0 * s).max(2.0), 20.0 * s, 1.0 * s, pal.accent);
         }
         pm.draw_pixmap((px + tx0 * s) as i32, py as i32, fld.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
     }
