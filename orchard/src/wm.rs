@@ -172,6 +172,24 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             y += CASCADE_STEP;
             guard += 1;
         }
+        // Full screen before the first frame (a game starting full screen):
+        // keep the full-screen frame, only remember where the window would
+        // have been restored to. Re-placing and re-focusing it here would move
+        // it behind the full-screen renderer and make clients that iconify
+        // themselves on focus loss (GLFW's auto-iconify) drop out of full screen.
+        if window.is_fullscreen() {
+            if let Some(cell) = window
+                .user_data()
+                .get::<std::cell::Cell<Option<crate::spaces::FullscreenOrigin>>>()
+            {
+                let mut origin = cell.take();
+                if let Some(origin) = origin.as_mut() {
+                    origin.loc = (x, y).into();
+                }
+                cell.set(origin);
+            }
+            return;
+        }
         self.space.map_element(window.clone(), (x, y), false);
         window.start_open_animation(self.clock.now().into());
         // new windows come to the front with keyboard focus, like on macOS
@@ -502,6 +520,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         if !window.alive() {
             return;
         }
+        tracing::debug!(app_id = %window.app_id(), fullscreen = window.is_fullscreen(), "minimize window");
         if window.is_fullscreen() {
             self.exit_fullscreen_space(window);
         }
@@ -542,6 +561,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
 
     /// Restore a minimized window (most recently minimized if `None`).
     pub fn unminimize(&mut self, window: Option<&WindowElement>) {
+        tracing::debug!(app_id = window.map(|w| w.app_id()).unwrap_or_default(), "unminimize");
         self.minimized.retain(|w| w.alive());
         let idx = match window {
             Some(w) => self.minimized.iter().position(|m| m == w),
@@ -606,6 +626,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
     }
 
     pub fn focus_window(&mut self, window: &WindowElement) {
+        tracing::debug!(app_id = %window.app_id(), title = %window.title(), "focus window");
         // another window comes forward on a display showing a full-screen app:
         // that app has to leave full screen, or it stays glued over the newcomer
         self.leave_fullscreen_behind(window);
@@ -668,6 +689,7 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             return;
         }
         let top = self.space.elements().next_back().cloned();
+        tracing::debug!(app_id = top.as_ref().map(|w| w.app_id()).unwrap_or_default(), "focus topmost");
         match top {
             Some(w) => self.focus_window(&w),
             None => {

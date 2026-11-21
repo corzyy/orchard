@@ -69,6 +69,16 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
         };
         let _ = xsurface.configure(Some(bbox));
         window.set_ssd(!xsurface.is_decorated());
+        // Focus new X11 windows when they map, while they are still windowed:
+        // doing it later (e.g. when a game asks for full screen right after
+        // mapping) makes X deliver a spurious FocusOut, and GLFW/SDL full-screen
+        // windows iconify themselves on focus loss.
+        self.focus_window(&window);
+        // full screen was requested before the window was mapped (games that
+        // start in full screen): apply it now that it is in the Space
+        if xsurface.is_fullscreen() {
+            self.enter_fullscreen_space(&window);
+        }
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -182,6 +192,7 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
             .elements()
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
             .cloned();
+        tracing::debug!(window = ?window.window_id(), found = elem.is_some(), "X11 fullscreen request");
         match elem {
             // same path as Wayland: remembers where to restore to, hides the
             // title bar and lets the Space slide animate the window
@@ -226,6 +237,18 @@ impl<BackendData: Backend> XwmHandler for OrchardState<BackendData> {
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
             .cloned();
         if let Some(elem) = elem {
+            // GLFW and SDL full-screen windows iconify themselves on focus loss
+            // (`GLFW_AUTO_ICONIFY`). Xwayland can deliver a spurious X focus
+            // blip (focus -> None -> focus) while the window is entering full
+            // screen. The compositor still has the window focused, so this is
+            // not the user minimizing it: stay in full screen instead.
+            let still_focused = self.seat.get_keyboard().and_then(|k| k.current_focus()).is_some_and(|f| {
+                matches!(f, crate::focus::KeyboardFocusTarget::Window(w) if w.x11_surface() == Some(&window))
+            });
+            if elem.is_fullscreen() && still_focused {
+                tracing::debug!(app_id = %elem.app_id(), "ignoring self-iconify of the focused full-screen window");
+                return;
+            }
             self.minimize_window(&elem);
         }
     }

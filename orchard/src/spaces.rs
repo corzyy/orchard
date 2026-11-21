@@ -503,6 +503,13 @@ impl<BackendData: Backend> OrchardState<BackendData> {
             return;
         };
         let Some(out_geo) = self.space.output_geometry(&output) else { return };
+        tracing::debug!(
+            window = %window.app_id(),
+            output = %output.name(),
+            ?out_geo,
+            loc = ?self.space.element_location(window),
+            "enter full screen"
+        );
         let name = output.name();
         let (active, _) = self.spaces.info(&name);
         let loc = self.space.element_location(window).unwrap_or(out_geo.loc);
@@ -558,7 +565,9 @@ impl<BackendData: Backend> OrchardState<BackendData> {
                 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
                 t.with_pending_state(|s| {
                     s.states.unset(xdg_toplevel::State::Fullscreen);
-                    s.size = origin.map(|o| o.size);
+                    // a window that went full screen before its first commit has
+                    // no known windowed size: leave the size to the client
+                    s.size = origin.filter(|o| o.size.w > 0 && o.size.h > 0).map(|o| o.size);
                     s.fullscreen_output = None;
                 });
                 t.send_pending_configure();
