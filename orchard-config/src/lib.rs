@@ -1041,6 +1041,21 @@ pub fn ipc_request(request: &serde_json::Value) -> std::io::Result<serde_json::V
     serde_json::from_str(&reply).map_err(std::io::Error::other)
 }
 
+/// Scale factor of the primary display, as reported by the compositor.
+///
+/// Used to decide how large a pixel-density boost a toolkit app needs on a
+/// low-DPI output. Returns `None` when the compositor isn't reachable.
+pub fn primary_output_scale() -> Option<f64> {
+    let reply = ipc_request(&serde_json::json!({ "request": "outputs" })).ok()?;
+    let outputs = reply.get("outputs")?.as_array()?;
+    outputs
+        .iter()
+        .find(|o| o.get("primary").and_then(serde_json::Value::as_bool).unwrap_or(false))
+        .or_else(|| outputs.first())
+        .and_then(|o| o.get("scale"))
+        .and_then(serde_json::Value::as_f64)
+}
+
 pub mod desktop;
 
 #[cfg(test)]

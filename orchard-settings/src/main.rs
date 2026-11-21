@@ -75,6 +75,22 @@ fn theme_mode(m: ThemeMode) -> Mode {
     }
 }
 
+/// Pixel-density boost for low-DPI outputs. The toolkit is designed in point
+/// sizes (13 pt text, 22 pt switches); on a 1080p panel at scale 1 those land
+/// on too few physical pixels and look coarse. Asking iced to draw at ~1.25×
+/// gives every control the extra samples it needs, while the window grows by
+/// the same factor so the layout keeps its intended logical size.
+///
+/// HiDPI outputs already have the density and keep a boost of 1.0. Set
+/// `ORCHARD_UI_SCALE` to override (for example `ORCHARD_UI_SCALE=1.5`).
+pub(crate) fn ui_scale() -> f32 {
+    if let Some(v) = std::env::var("ORCHARD_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()) {
+        return v.clamp(1.0, 3.0);
+    }
+    let current = orchard_config::primary_output_scale().unwrap_or(1.0) as f32;
+    (1.25 / current.max(0.1)).clamp(1.0, 1.5)
+}
+
 impl App {
     fn new(page: Page) -> (Self, Task<Message>) {
         let settings = Settings::load();
@@ -400,13 +416,20 @@ fn main() -> iced::Result {
         return about::run();
     }
     let start_page = arg1.as_deref().and_then(Page::from_arg).unwrap_or(Page::Appearance);
+    let ui_scale = ui_scale();
 
     iced::application("System Settings", App::update, App::view)
         .theme(|_| orchard_ui::theme())
         .default_font(fonts::text())
         .antialiasing(true)
+        .scale_factor(move |_| ui_scale as f64)
         .subscription(App::subscription)
         .exit_on_close_request(false)
-        .window(orchard_ui::window_settings("org.orchard.settings", (940.0, 720.0), Some((760.0, 520.0))))
+        .window(orchard_ui::window_settings_scaled(
+            "org.orchard.settings",
+            (920.0, 700.0),
+            Some((740.0, 500.0)),
+            ui_scale,
+        ))
         .run_with(move || App::new(start_page))
 }

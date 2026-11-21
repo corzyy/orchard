@@ -145,15 +145,17 @@ pub fn run() -> iced::Result {
     let s = Settings::load();
     let dark = resolve_dark(crate::theme_mode(s.appearance.mode));
     orchard_ui::set_appearance(Appearance::new(dark, s.appearance.accent_rgb()));
+    let ui_scale = crate::ui_scale();
 
-    let mut window = orchard_ui::window_settings("org.orchard.about", (W, H), Some((W, H)));
-    window.max_size = Some(Size::new(W, H));
+    let mut window = orchard_ui::window_settings_scaled("org.orchard.about", (W, H), Some((W, H)), ui_scale);
+    window.max_size = Some(Size::new(W * ui_scale, H * ui_scale));
     window.resizable = false;
 
     iced::application("About Device", About::update, About::view)
         .theme(|_| orchard_ui::theme())
         .default_font(fonts::text())
         .antialiasing(true)
+        .scale_factor(move |_| ui_scale as f64)
         .subscription(About::subscription)
         .window(window)
         .run_with(|| (About::default(), Task::perform(sys::blocking(load_about), Message::Loaded)))
