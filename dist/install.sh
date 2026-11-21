@@ -26,11 +26,16 @@ fi
 cargo build --release
 
 for b in orchard orchard-shell orchard-settings orchard-lock; do
-    sudo rm -f "/usr/local/bin/$b"
+    dst="/usr/local/bin/$b"
     if [ "${1:-}" = "--dev" ]; then
-        sudo ln -s "$PWD/target/release/$b" "/usr/local/bin/$b"
+        # -f replaces an existing file/symlink in one step, so a failed link
+        # never leaves the binary missing.
+        sudo ln -sfn "$PWD/target/release/$b" "$dst"
     else
-        sudo install -Dm755 "target/release/$b" "/usr/local/bin/$b"
+        # install a complete copy next to the destination, then rename it over
+        # the old binary: an interrupted install keeps the previous one.
+        sudo install -Dm755 "target/release/$b" "$dst.new"
+        sudo mv -f "$dst.new" "$dst"
     fi
 done
 sudo install -Dm644 dist/org.orchard.settings.desktop /usr/share/applications/org.orchard.settings.desktop

@@ -127,6 +127,10 @@ pub struct UdevData {
     primary_gpu: DrmNode,
     gpus: GpuManager<GbmGlesBackend<GlesRenderer, DrmDeviceFd>>,
     backends: HashMap<DrmNode, BackendData>,
+    /// Leasing state of GPUs that were unplugged while a client still held a
+    /// lease. Kept (with its global disabled) until the client releases the
+    /// lease, so late protocol requests don't look up a missing node.
+    orphaned_leases: HashMap<DrmNode, DrmLeaseState>,
     pointer_images: HashMap<u64, MemoryRenderBuffer>,
     pointer_element: PointerElement,
     /// last named cursor image + hotspot, for screencopy
@@ -376,6 +380,7 @@ pub fn run_udev() {
         primary_gpu,
         gpus,
         backends: HashMap::new(),
+        orphaned_leases: HashMap::new(),
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: HashMap::new(),
         pointer_element: PointerElement::default(),
@@ -676,13 +681,22 @@ pub fn run_udev() {
 
 impl DrmLeaseHandler for OrchardState<UdevData> {
     fn drm_lease_state(&mut self, node: DrmNode) -> &mut DrmLeaseState {
-        self.backend_data
+        if let Some(state) = self
+            .backend_data
             .backends
             .get_mut(&node)
-            .unwrap()
-            .leasing_global
-            .as_mut()
-            .unwrap()
+            .and_then(|backend| backend.leasing_global.as_mut())
+        {
+            return state;
+        }
+        // The GPU was unplugged while a client still owns a lease; its state
+        // lives on in `orphaned_leases` so release/destroy requests work.
+        if let Some(state) = self.backend_data.orphaned_leases.get_mut(&node) {
+            return state;
+        }
+        // A node without a successful DrmLeaseState::new never registers the
+        // wp_drm_lease_device global, so no client can hold one for it.
+        unreachable!("drm lease state requested for unknown node {node:?}")
     }
 
     fn lease_request(
@@ -734,13 +748,19 @@ impl DrmLeaseHandler for OrchardState<UdevData> {
     }
 
     fn new_active_lease(&mut self, node: DrmNode, lease: DrmLease) {
-        let backend = self.backend_data.backends.get_mut(&node).unwrap();
-        backend.active_leases.push(lease);
+        // The device may have been unplugged between the lease request and its
+        // completion; dropping the lease object is the right answer then.
+        if let Some(backend) = self.backend_data.backends.get_mut(&node) {
+            backend.active_leases.push(lease);
+        } else {
+            tracing::warn!(?node, "lease completed for a device that is gone");
+        }
     }
 
     fn lease_destroyed(&mut self, node: DrmNode, lease: u32) {
-        let backend = self.backend_data.backends.get_mut(&node).unwrap();
-        backend.active_leases.retain(|l| l.id() != lease);
+        if let Some(backend) = self.backend_data.backends.get_mut(&node) {
+            backend.active_leases.retain(|l| l.id() != lease);
+        }
     }
 }
 
@@ -1122,13 +1142,18 @@ impl OrchardState<UdevData> {
                 );
             }
         } else {
-            let mode_id = connector
+            // A connected connector can briefly report no modes (flaky DP/HDMI
+            // link, some adapters); indexing [0] would panic the compositor.
+            let Some(preferred) = connector
                 .modes()
                 .iter()
-                .position(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-                .unwrap_or(0);
-
-            let preferred = connector.modes()[mode_id];
+                .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
+                .or_else(|| connector.modes().first())
+                .copied()
+            else {
+                warn!("connector {} is connected but has no modes; skipping", output_name);
+                return;
+            };
             // a saved refresh rate picks among the modes with the preferred size
             let drm_mode = crate::settings::get()
                 .displays
@@ -1155,12 +1180,10 @@ impl OrchardState<UdevData> {
                     model,
                 },
             );
-            let global = output.create_global::<OrchardState<UdevData>>(&self.display_handle);
-
             let x = self
                 .space
                 .outputs()
-                .fold(0, |acc, o| acc + self.space.output_geometry(o).unwrap().size.w);
+                .fold(0, |acc, o| acc + self.space.output_geometry(o).map(|g| g.size.w).unwrap_or(0));
             let position = (x, 0).into();
 
             output.set_preferred(WlMode::from(preferred));
@@ -1172,12 +1195,6 @@ impl OrchardState<UdevData> {
                 .filter(|s| (0.5..=4.0).contains(s))
                 .map(smithay::output::Scale::Fractional);
             output.change_current_state(Some(wl_mode), None, scale, Some(position));
-            self.space.map_output(&output, position);
-
-            output.user_data().insert_if_missing(|| UdevOutputId {
-                crtc,
-                device_id: node,
-            });
 
             #[cfg(feature = "debug")]
             let fps_element = self.backend_data.fps_texture.clone().map(FpsElement::new);
@@ -1237,6 +1254,16 @@ impl OrchardState<UdevData> {
                     return;
                 }
             };
+
+            // Only now that initialization succeeded advertise the output and
+            // map it: the early returns above must not leave a phantom global
+            // or an output in the Space that never renders.
+            let global = output.create_global::<OrchardState<UdevData>>(&self.display_handle);
+            self.space.map_output(&output, position);
+            output.user_data().insert_if_missing(|| UdevOutputId {
+                crtc,
+                device_id: node,
+            });
 
             // On NVIDIA, direct primary-plane scanout bypasses Swapchain::sync.wait()
             // and can flash corrupted/white-dot frames on scanout transitions.
@@ -1405,6 +1432,9 @@ impl OrchardState<UdevData> {
         if let Some(mut backend_data) = self.backend_data.backends.remove(&node) {
             if let Some(mut leasing_global) = backend_data.leasing_global.take() {
                 leasing_global.disable_global::<OrchardState<UdevData>>();
+                // Clients may still hold leases and send release/destroy
+                // requests after the GPU is gone.
+                self.backend_data.orphaned_leases.insert(node, leasing_global);
             }
 
             if let Some(render_node) = backend_data.render_node {
@@ -1455,10 +1485,10 @@ impl OrchardState<UdevData> {
             return;
         };
 
-        let Some(frame_duration) = output
-            .current_mode()
-            .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
-        else {
+        let Some(frame_duration) = output.current_mode().map(|mode| {
+            // clock == 0 on some virtual/broken connectors gives refresh == 0
+            Duration::from_secs_f64(1_000f64 / mode.refresh.max(1) as f64)
+        }) else {
             return;
         };
 
@@ -1844,7 +1874,7 @@ impl OrchardState<UdevData> {
                 None => return,
             };
 
-            let next_frame_target = frame_target + Duration::from_millis(1_000_000 / output_refresh as u64);
+            let next_frame_target = frame_target + Duration::from_millis(1_000_000 / output_refresh.max(1) as u64);
             let reschedule_timeout =
                 Duration::from(next_frame_target).saturating_sub(self.clock.now().into());
             trace!(
@@ -2052,7 +2082,14 @@ fn render_surface(
             smithay::backend::drm::compositor::RenderFrameError::RenderFrame(
                 OutputDamageTrackerError::Rendering(err),
             ) => SwapBuffersError::from(err),
-            _ => unreachable!(),
+            // The output lost its mode (VT switch, connector change): skip this
+            // frame instead of killing the whole session with unreachable!().
+            smithay::backend::drm::compositor::RenderFrameError::RenderFrame(
+                OutputDamageTrackerError::OutputNoMode(err),
+            ) => {
+                warn!("output {} has no active mode: {err}", output.name());
+                SwapBuffersError::TemporaryFailure(Box::new(err))
+            }
         })?;
 
     update_primary_scanout_output(space, output, dnd_icon, cursor_status, &states);

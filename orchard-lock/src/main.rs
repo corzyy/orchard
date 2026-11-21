@@ -126,7 +126,7 @@ struct App {
     pressed: Option<Hit>,
     pointer_surface: Option<wl_surface::WlSurface>,
     text: Option<TextCache>,
-    fonts: Option<std::thread::JoinHandle<Fonts>>,
+    fonts: Option<std::thread::JoinHandle<Option<Fonts>>>,
     user: user::User,
     picture: Option<image::RgbaImage>,
     picture_loader: Option<std::thread::JoinHandle<Option<image::RgbaImage>>>,
@@ -276,11 +276,15 @@ impl App {
     fn text(&mut self) -> &mut TextCache {
         if self.text.is_none() {
             trace("waiting for fonts");
-            let fonts = self.fonts.take().expect("fonts").join().expect("font thread");
+            let fonts = self.fonts.take().and_then(|h| h.join().ok()).flatten();
+            let Some(fonts) = fonts else {
+                eprintln!("orchard-lock: no usable system font; cannot draw the lock screen");
+                std::process::exit(1);
+            };
             trace("fonts ready");
             self.text = Some(TextCache::new(fonts));
         }
-        self.text.as_mut().unwrap()
+        self.text.as_mut().expect("text cache initialized above")
     }
 
     fn picture(&mut self) -> Option<&image::RgbaImage> {
@@ -568,6 +572,19 @@ impl App {
             Ok(()) => {
                 self.phase = Phase::Unlocking(Instant::now());
                 self.mark(BAND_ALL);
+                // The fade normally ends in frame_done, but there may be no
+                // outputs (lid closed), no frame callbacks, or no buffer
+                // allocation. Never leave an authenticated user locked out
+                // just because nothing repainted.
+                let _ = self.loop_handle.insert_source(
+                    Timer::from_duration(FADE_OUT + Duration::from_millis(250)),
+                    |_, _, app| {
+                        if matches!(app.phase, Phase::Unlocking(_)) {
+                            app.unlock();
+                        }
+                        TimeoutAction::Drop
+                    },
+                );
             }
             Err(e) => {
                 eprintln!("orchard-lock: {e}");

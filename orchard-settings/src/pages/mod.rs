@@ -222,7 +222,7 @@ impl Page {
             Accessibility => "accessibility reduce motion transparency pointer cursor size theme shake locate find mouse",
             Appearance => "appearance dark light mode accent color colour theme corner radius icon",
             MenuBar => "menu bar control center clock battery percentage date seconds",
-            DesktopDock => "desktop dock magnification minimize hot corners mission control windows title bar focus",
+            DesktopDock => "desktop dock magnification minimize trash bin hot corners mission control windows title bar focus",
             Tiling => "windows tiling tile floating snap snapping layout gaps margin edge corner preview",
             Displays => "displays screen monitor resolution scale refresh hidpi vrr freesync gsync adaptive sync night shift blue light warm colour color temperature redshift",
             Wallpaper => "wallpaper background desktop picture",

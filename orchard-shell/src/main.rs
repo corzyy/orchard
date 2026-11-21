@@ -1334,6 +1334,10 @@ impl App {
         let old_dock_cfg = self.dock.cfg.clone();
         self.dock.cfg = s.dock.clone();
         let dock_changed = self.dock.cfg != old_dock_cfg;
+        if self.dock.cfg.show_trash != old_dock_cfg.show_trash {
+            let apps = &self.apps;
+            self.dock.rebuild(apps, &self.windows);
+        }
         if self.dock.cfg.autohide == DockAutohide::Never {
             self.dock.hidden = 0.0;
         }
@@ -1416,7 +1420,14 @@ impl App {
         }
         let apps = &self.apps;
         self.dock.rebuild(apps, &self.windows);
+        let old_menu = self.menu_addr.clone();
         self.refresh_app_menu();
+        // An open global menu belongs to the app that was focused when it was
+        // opened; clicking it after focus moved would send the action to the
+        // wrong app. Close it, as macOS does.
+        if self.menu_addr != old_menu && matches!(self.menu_owner, Some(MenuOwner::Bar(BarItem::AppMenu(_)))) {
+            self.close_menu();
+        }
         self.redraw(Which::Bar);
         self.redraw(Which::Dock);
         self.send_dock_tiles();
@@ -2825,7 +2836,7 @@ impl App {
                     return;
                 }
                 self.dock.hovered = self.dock.hit(x as f32, y as f32, sw, sh);
-                if self.dock.cfg.magnification
+                if self.dock.magnifies()
                     || self.dock.hovered != prev_hovered
                     || matches!(kind, PointerEventKind::Enter { .. })
                 {
@@ -3017,8 +3028,9 @@ impl OutputHandler for App {
                 self.output_name = info.name.clone().unwrap_or_default();
             }
             self.send_dock_tiles();
-        } else if self.output.is_some() {
-            // the primary display may just have been plugged in
+        } else {
+            // The primary display may just have been plugged in, or we may have
+            // lost our output earlier and are still waiting for a usable one.
             self.retarget_output();
         }
     }

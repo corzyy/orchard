@@ -232,6 +232,19 @@ pub fn save_pinned(pinned: &[String]) {
     }
 }
 
+/// Winit's default title means the app never set one; showing "winit window"
+/// in the Dock helps nobody.
+fn placeholder_title(title: &str) -> bool {
+    let title = title.trim();
+    title.is_empty() || title.eq_ignore_ascii_case("winit window")
+}
+
+/// A toolkit's housekeeping window (no app id and no real title) must not get
+/// a Dock tile of its own.
+fn phantom_window(w: &WindowInfo) -> bool {
+    w.app_id.trim().is_empty() && placeholder_title(&w.title)
+}
+
 impl Dock {
     pub fn new(pinned: Vec<String>) -> Dock {
         Dock {
@@ -257,9 +270,15 @@ impl Dock {
         self.cfg.icon_size.clamp(24.0, 128.0)
     }
 
+    /// Icons grow under the pointer only when the magnification size is
+    /// larger than the base size (the slider is not fully left).
+    pub fn magnifies(&self) -> bool {
+        self.cfg.magnified_size > self.icon() + 0.5
+    }
+
     /// Tile size under the pointer.
     pub fn icon_max(&self) -> f32 {
-        if self.cfg.magnification {
+        if self.magnifies() {
             self.cfg.magnified_size.clamp(self.icon(), 160.0)
         } else {
             self.icon()
@@ -407,9 +426,10 @@ impl Dock {
         // Launchpad right after the first app (Finder's place on macOS)
         items.insert(items.len().min(1), Item::new(ItemKind::Launchpad, "Launchpad".into(), None, false));
         // running apps that are not pinned, in first-seen order
+        let mut running_items = Vec::new();
         let mut seen: Vec<String> = Vec::new();
         for w in windows {
-            if seen.contains(&w.app_id) {
+            if phantom_window(w) || seen.contains(&w.app_id) {
                 continue;
             }
             seen.push(w.app_id.clone());
@@ -418,14 +438,14 @@ impl Dock {
                 continue;
             }
             let entry = apps.for_app_id(&w.app_id);
-            items.push(Item::new(
+            running_items.push(Item::new(
                 ItemKind::App {
                     desktop_id: entry.map(|e| e.id.clone()),
                     app_id: w.app_id.clone(),
                     pinned: false,
                 },
                 entry.map(|e| e.name.clone()).unwrap_or_else(|| {
-                    if w.title.is_empty() {
+                    if placeholder_title(&w.title) {
                         w.app_id.clone()
                     } else {
                         w.title.clone()
@@ -435,8 +455,17 @@ impl Dock {
                 true,
             ));
         }
-        items.push(Item::new(ItemKind::Separator, String::new(), None, false));
-        for w in windows.iter().filter(|w| w.minimized) {
+        if !running_items.is_empty() {
+            // kept apps | open apps
+            items.push(Item::new(ItemKind::Separator, String::new(), None, false));
+            items.extend(running_items);
+        }
+        let minimized: Vec<&WindowInfo> = windows.iter().filter(|w| w.minimized && !phantom_window(w)).collect();
+        if !minimized.is_empty() || self.cfg.show_trash {
+            // open apps | minimized windows (and the Trash)
+            items.push(Item::new(ItemKind::Separator, String::new(), None, false));
+        }
+        for w in minimized {
             let entry = apps.for_app_id(&w.app_id);
             items.push(Item::new(
                 ItemKind::Minimized {
@@ -444,35 +473,37 @@ impl Dock {
                     app_id: w.app_id.clone(),
                     thumb: w.thumb.clone(),
                 },
-                if w.title.is_empty() { w.app_id.clone() } else { w.title.clone() },
+                if placeholder_title(&w.title) { w.app_id.clone() } else { w.title.clone() },
                 entry.and_then(|e| e.icon.clone()).or_else(|| Some(w.app_id.clone())),
                 false,
             ));
         }
-        static GERMAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let trash_name = if *GERMAN.get_or_init(|| std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false)) {
-            "Papierkorb"
-        } else {
-            "Trash"
-        };
-        static TRASH_CACHE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
-        let full = {
-            let mut guard = TRASH_CACHE.lock().unwrap();
-            match *guard {
-                Some((at, v)) if at.elapsed() < std::time::Duration::from_secs(5) => v,
-                _ => {
-                    let v = trash_full();
-                    *guard = Some((Instant::now(), v));
-                    v
+        if self.cfg.show_trash {
+            static GERMAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let trash_name = if *GERMAN.get_or_init(|| std::env::var("LANG").map(|l| l.starts_with("de")).unwrap_or(false)) {
+                "Papierkorb"
+            } else {
+                "Trash"
+            };
+            static TRASH_CACHE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+            let full = {
+                let mut guard = TRASH_CACHE.lock().unwrap();
+                match *guard {
+                    Some((at, v)) if at.elapsed() < std::time::Duration::from_secs(5) => v,
+                    _ => {
+                        let v = trash_full();
+                        *guard = Some((Instant::now(), v));
+                        v
+                    }
                 }
-            }
-        };
-        items.push(Item::new(
-            ItemKind::Trash,
-            trash_name.into(),
-            Some(if full { "user-trash-full" } else { "user-trash" }.into()),
-            false,
-        ));
+            };
+            items.push(Item::new(
+                ItemKind::Trash,
+                trash_name.into(),
+                Some(if full { "user-trash-full" } else { "user-trash" }.into()),
+                false,
+            ));
+        }
 
         // carry animation state over; new apps and minimized windows grow in
         for it in items.iter_mut() {
@@ -519,6 +550,9 @@ impl Dock {
         self.thumbs.retain(|k, _| live.contains(k));
         self.items = items;
         self.hovered = None;
+        // `pressed` is an index into the old item list; keeping it across a
+        // rebuild can activate the app that moved into that slot.
+        self.pressed = None;
         self.built = true;
         self.load_thumbs();
     }
@@ -660,21 +694,30 @@ impl Dock {
         true
     }
 
-    /// Move the dragged app between the other apps, by where the pointer is.
+    /// Move the dragged app between the other kept apps, or from the open-apps
+    /// row into the kept apps once it crosses the first divider.
     fn reorder_for_drag(&mut self, sw: f32, sh: f32) {
         let Some(d) = self.drag.clone() else { return };
-        let Some(sep) = self.items.iter().position(|i| i.is_separator()) else { return };
+        let sep = self.items.iter().position(|i| i.is_separator()).unwrap_or(self.items.len());
         let (placed, _) = self.layout(sw, sh);
         let is_app = |it: &Item| matches!(it.kind, ItemKind::App { .. }) && !it.leaving;
-        let Some(di) = self.items[..sep].iter().position(|it| it.kind.key() == d.key) else { return };
-        // rank among the other apps = how many of them lie before the pointer
+        let Some(di) = self.items.iter().position(|it| it.kind.key() == d.key) else { return };
+        let dragged_is_pinned = di < sep;
+        // an open app joins the kept row only after crossing the first divider
+        if !dragged_is_pinned {
+            let divider = placed.get(sep).map(|p| p.x + p.size / 2.0).unwrap_or(f32::INFINITY);
+            if d.pos.0 >= divider {
+                return;
+            }
+        }
+        // rank among the kept apps = how many of them lie before the pointer
         let others: Vec<usize> = (0..sep).filter(|&i| i != di && is_app(&self.items[i])).collect();
         let rank = others.iter().filter(|&&i| placed[i].x + placed[i].size / 2.0 < d.pos.0).count();
-        let current = (0..di).filter(|&i| is_app(&self.items[i])).count();
-        if rank == current {
+        let current = (0..di.min(sep)).filter(|&i| is_app(&self.items[i])).count();
+        if dragged_is_pinned && rank == current {
             return;
         }
-        let rest = self.items.split_off(sep);
+        let mut rest = self.items.split_off(sep);
         let head = std::mem::take(&mut self.items);
         let mut apps: Vec<Item> = Vec::new();
         let mut dragged = None;
@@ -687,6 +730,12 @@ impl Dock {
                 _ => {} // shrinking out anyway
             }
         }
+        if dragged.is_none() {
+            // the app came from the open-apps row
+            if let Some(pos) = rest.iter().position(|it| it.kind.key() == d.key) {
+                dragged = Some(rest.remove(pos));
+            }
+        }
         if let Some(it) = dragged {
             apps.insert(rank.min(apps.len()), it);
         }
@@ -695,6 +744,18 @@ impl Dock {
             apps.insert(apps.len().min(1), l);
         }
         apps.extend(rest);
+        // pull the last open app across and its divider is left empty
+        let mut i = 0;
+        while i + 1 < apps.len() {
+            if apps[i].is_separator() && apps[i + 1].is_separator() {
+                apps.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        if apps.last().is_some_and(|it| it.is_separator()) {
+            apps.pop();
+        }
         self.items = apps;
         self.hovered = None;
     }
@@ -731,7 +792,11 @@ impl Dock {
             it.appear = 1.0;
         }
         if extra_minimized {
-            let at = items.len().saturating_sub(1); // before the Trash
+            // before the Trash, or at the very end when the Trash is hidden
+            let at = items
+                .iter()
+                .position(|i| matches!(i.kind, ItemKind::Trash))
+                .unwrap_or(items.len());
             items.insert(
                 at,
                 Item::new(
@@ -774,7 +839,11 @@ impl Dock {
             .collect();
         let next = self.settled(true);
         let (placed, _) = next.layout(surface_w, surface_h);
-        let at = next.items.len().saturating_sub(2);
+        let at = next
+            .items
+            .iter()
+            .position(|i| matches!(i.kind, ItemKind::Minimized { window_id: u64::MAX, .. }))
+            .unwrap_or(placed.len().saturating_sub(1));
         let slot = placed.get(at).map(|p| self.tile_rect(p, surface_w, surface_h));
         (tiles, slot)
     }
@@ -798,7 +867,7 @@ impl Dock {
     pub fn is_animating(&self, target_mag: f32) -> bool {
         (self.mag - target_mag).abs() > 0.001
             || (self.hidden - self.hidden_target()).abs() > 0.001
-            || (self.cfg.animate_launch && self.items.iter().any(|i| i.bounce_start.is_some()))
+            || self.items.iter().any(|i| i.bounce_start.is_some())
             || self.items.iter().any(|i| i.leaving || i.appear < 1.0)
             || self.missing_thumbs()
             || self.items.iter().any(|i| {
@@ -888,7 +957,6 @@ impl Dock {
             }
             let bounce = it
                 .bounce_start
-                .filter(|_| self.cfg.animate_launch)
                 .map(|t| {
                     let ph = t.elapsed().as_secs_f32() / 0.7 * std::f32::consts::PI;
                     ph.sin().abs() * 18.0
@@ -903,12 +971,7 @@ impl Dock {
             let (ix, iy, _, _) = self.map_rect((p.x, p.bottom - p.size - bounce, p.size, p.size), sw, sh);
             let (ix, top) = (ix * s, iy * s);
             let pressed = i == self.pressed.unwrap_or(usize::MAX);
-            let app_icon = |n: u32| {
-                it.icon_name
-                    .as_deref()
-                    .and_then(|name| apps.icon(name, n.max(1)))
-                    .or_else(|| apps.icon("application-x-executable", n.max(1)))
-            };
+            let app_icon = |n: u32| it.icon_name.as_deref().and_then(|name| apps.icon(name, n.max(1)));
             match &it.kind {
                 ItemKind::Launchpad => draw_launchpad_icon(pm, ix, top, size_px, pressed),
                 ItemKind::Minimized { thumb: Some(path), .. } if self.thumbs.contains_key(path) => {
@@ -940,10 +1003,10 @@ impl Dock {
                 }
                 _ => match app_icon(raster_px) {
                     Some(icon) => draw_icon(pm, &icon, ix, top, size_px, pressed),
-                    None => fill_rounded(pm, ix, top, size_px, size_px, p.size * 0.22 * s, [128, 128, 128, 200]),
+                    None => draw_fallback_icon(pm, fonts, &it.name, ix, top, size_px, pressed),
                 },
             }
-            if it.running && self.cfg.show_indicators && !it.leaving {
+            if it.running && !it.leaving {
                 let (dx, dy) = self.map_point(p.x + p.size / 2.0, p.bottom + DOT_SPACE * 0.55, sw, sh);
                 fill_circle(pm, dx * s, dy * s, 2.0 * s * it.appear, theme.dock_dot);
             }
@@ -962,13 +1025,10 @@ impl Dock {
             let (x, y, _, _) = self.map_rect((d.pos.0 - size / 2.0, v, size, size), sw, sh);
             let outside = self.drag_outside(sw, sh);
             let alpha = if outside { 0.55 } else { 1.0 };
-            if let Some(icon) = it
-                .icon_name
-                .as_deref()
-                .and_then(|n| apps.icon(n, (size * s).round() as u32))
-                .or_else(|| apps.icon("application-x-executable", (size * s).round() as u32))
-            {
+            if let Some(icon) = it.icon_name.as_deref().and_then(|n| apps.icon(n, (size * s).round() as u32)) {
                 draw_icon_alpha(pm, &icon, x * s, y * s, size * s, alpha);
+            } else {
+                draw_fallback_icon(pm, fonts, &it.name, x * s, y * s, size * s, false);
             }
             let pinned = matches!(it.kind, ItemKind::App { pinned: true, .. });
             if outside && pinned {
@@ -1077,6 +1137,46 @@ fn draw_icon_alpha(pm: &mut Pixmap, icon: &Rc<Pixmap>, x: f32, y: f32, size: f32
         ..Default::default()
     };
     pm.draw_pixmap(0, 0, icon.as_ref().as_ref(), &paint, Transform::from_row(k, 0.0, 0.0, k, x, y), None);
+}
+
+/// Tile for an app the icon theme has nothing for: a light squircle with the
+/// app's initial, instead of an empty transparent square.
+fn draw_fallback_icon(pm: &mut Pixmap, fonts: &Fonts, name: &str, x: f32, y: f32, size: f32, pressed: bool) {
+    use tiny_skia::{Color, GradientStop, LinearGradient, Paint, Point, SpreadMode};
+    let inset = size * 0.05;
+    let (bx, by, bs) = (x + inset, y + inset, size - 2.0 * inset);
+    let r = bs * 0.225;
+    // soft drop shadow, so the tile sits on the Dock like an app icon
+    fill_rounded(pm, bx, by + bs * 0.02, bs, bs, r, [0, 0, 0, 36]);
+    if let Some(path) = crate::draw::rounded_rect(bx, by, bs, bs, r) {
+        let mut paint = Paint::default();
+        paint.anti_alias = true;
+        paint.shader = LinearGradient::new(
+            Point::from_xy(bx, by),
+            Point::from_xy(bx, by + bs),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(250, 250, 252, 255)),
+                GradientStop::new(1.0, Color::from_rgba8(219, 219, 225, 255)),
+            ],
+            SpreadMode::Pad,
+            Transform::identity(),
+        )
+        .unwrap_or(paint.shader);
+        pm.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+    }
+    stroke_rounded(pm, bx + 0.5, by + 0.5, bs - 1.0, bs - 1.0, r, 1.0, [0, 0, 0, 28]);
+    let initial: String = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    let px = bs * 0.5;
+    let tw = fonts.measure(&initial, px, Weight::Bold);
+    let baseline = fonts.baseline_centered(by, bs, px, Weight::Bold);
+    fonts.draw(pm, &initial, bx + (bs - tw) / 2.0, baseline, px, Weight::Bold, [126, 126, 132, 255]);
+    if pressed {
+        fill_rounded(pm, bx, by, bs, bs, r, [0, 0, 0, 80]);
+    }
 }
 
 fn draw_icon(pm: &mut Pixmap, icon: &Rc<Pixmap>, x: f32, y: f32, size: f32, pressed: bool) {
@@ -1202,6 +1302,7 @@ mod tests {
             Item::new(ItemKind::Launchpad, "Launchpad".into(), None, false),
             app("b", true),
             app("c", true),
+            Item::new(ItemKind::Separator, String::new(), None, false),
             app("r", false),
             Item::new(ItemKind::Separator, String::new(), None, false),
             Item::new(ItemKind::Trash, "Trash".into(), None, false),
@@ -1231,7 +1332,7 @@ mod tests {
         // a running app dropped between kept ones gets kept there
         let mut d = real_dock();
         let (x, y) = center_of(&d, "app:r");
-        d.press_for_drag(4, x, y, 1000.0, 200.0);
+        d.press_for_drag(5, x, y, 1000.0, 200.0);
         let (bx, _) = center_of(&d, "app:b");
         d.drag_motion(bx - 5.0, y, 1000.0, 200.0);
         d.drag_motion(bx - 10.0, y, 1000.0, 200.0);
@@ -1239,6 +1340,19 @@ mod tests {
             d.finish_drag(1000.0, 200.0),
             Some(DragOutcome::Pinned(vec!["a".into(), "r".into(), "b".into(), "c".into()]))
         );
+    }
+
+    #[test]
+    fn open_apps_stay_after_the_divider_until_dragged_across() {
+        let mut d = real_dock();
+        let (x, y) = center_of(&d, "app:r");
+        d.press_for_drag(5, x, y, 1000.0, 200.0);
+        // moving within the open-apps row does not pin it among the kept apps
+        d.drag_motion(x + 30.0, y, 1000.0, 200.0);
+        let sep = d.items.iter().position(|i| i.is_separator()).unwrap();
+        let r = d.items.iter().position(|i| i.kind.key() == "app:r").unwrap();
+        assert!(r > sep, "still in the open-apps row");
+        assert_eq!(d.finish_drag(1000.0, 200.0), Some(DragOutcome::Pinned(vec!["a".into(), "b".into(), "c".into()])));
     }
 
     #[test]
@@ -1251,12 +1365,12 @@ mod tests {
         assert_eq!(d.finish_drag(1000.0, 200.0), Some(DragOutcome::Remove("b".into())));
         let mut d = real_dock();
         let (x, y) = center_of(&d, "app:r");
-        d.press_for_drag(4, x, y, 1000.0, 200.0);
+        d.press_for_drag(5, x, y, 1000.0, 200.0);
         d.drag_motion(x, y - 120.0, 1000.0, 200.0);
         assert_eq!(d.finish_drag(1000.0, 200.0), None);
         // the Trash cannot be dragged
         let mut d = real_dock();
-        d.press_for_drag(6, 10.0, 10.0, 1000.0, 200.0);
+        d.press_for_drag(7, 10.0, 10.0, 1000.0, 200.0);
         assert!(d.drag.is_none());
     }
 
@@ -1287,7 +1401,7 @@ mod tests {
     fn settings_change_sizes() {
         let mut d = dock_with(3);
         d.cfg.icon_size = 40.0;
-        d.cfg.magnification = false;
+        d.cfg.magnified_size = 40.0; // slider fully left: magnification off
         assert_eq!(d.icon_max(), 40.0);
         let (p, _) = d.layout(800.0, 200.0);
         assert!(p.iter().all(|p| (p.size - 40.0).abs() < 1e-3));
@@ -1318,5 +1432,29 @@ mod tests {
         d.step(1.0);
         assert!(d.is_hidden());
         assert_eq!(d.hit(p[1].x + 5.0, d.surface_height() - 1.0, 800.0, d.surface_height()), None);
+    }
+
+    #[test]
+    fn housekeeping_windows_stay_out_of_the_dock() {
+        let w = |app_id: &str, title: &str| WindowInfo {
+            id: 1,
+            app_id: app_id.into(),
+            title: title.into(),
+            focused: false,
+            minimized: false,
+            zoomed: false,
+            hidden: false,
+            menu: None,
+            x11_id: None,
+            gtk_menu: None,
+            pid: None,
+            thumb: None,
+        };
+        assert!(phantom_window(&w("", "winit window")));
+        assert!(phantom_window(&w("", "  ")));
+        assert!(!phantom_window(&w("", "My App")));
+        assert!(!phantom_window(&w("org.example.App", "winit window")));
+        assert!(placeholder_title("winit window"));
+        assert!(!placeholder_title("Herdr"));
     }
 }

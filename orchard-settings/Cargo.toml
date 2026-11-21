@@ -7,7 +7,7 @@ description = "System Settings for the Orchard compositor"
 
 [dependencies]
 orchard-config = { path = "../orchard-config" }
-orchard-ui = { path = "../../orchard-ui" }
+orchard-ui = { git = "https://github.com/corzyy/orchard-ui", branch = "main" }
 iced = { version = "0.13", features = ["tokio", "image", "svg", "canvas"] }
 tokio = { version = "1", features = ["time"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

@@ -249,8 +249,9 @@ impl ScreenshotTool {
         }
         self.last_size = (sw, sh);
         if !self.selection_initialized {
-            let w = (sw * 0.5).clamp(MIN_SEL, sw - 40.0).round();
-            let h = (sh * 0.5).clamp(MIN_SEL, sh - 160.0).round();
+            // a tiny/degenerate configure must not make clamp(min > max) panic
+            let w = (sw * 0.5).clamp(MIN_SEL, (sw - 40.0).max(MIN_SEL)).round();
+            let h = (sh * 0.5).clamp(MIN_SEL, (sh - 160.0).max(MIN_SEL)).round();
             let x = ((sw - w) * 0.5).round();
             let y = ((sh - h - 40.0) * 0.5).max(36.0).round();
             self.selection = (x, y, w, h);

@@ -302,6 +302,10 @@ impl Center {
             return;
         }
         self.banners.insert(0, Banner { n, shown: now, expires });
+        // Critical/resident/expire_timeout=0 banners never expire and only the
+        // newest MAX_VISIBLE are reachable, so a chatty app could otherwise grow
+        // this list (and its pixmaps) for the whole session.
+        self.banners.truncate(MAX_VISIBLE * 8);
     }
 
     /// Gone for good (dismissed, clicked, closed by the app). True if it was showing.

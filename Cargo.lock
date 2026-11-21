@@ -2959,6 +2959,7 @@ dependencies = [
 [[package]]
 name = "orchard-ui"
 version = "0.1.0"
+source = "git+https://github.com/corzyy/orchard-ui?branch=main#3d9e6b9c2d7a17b88df00424ee45bf3506d0361e"
 dependencies = [
  "iced",
  "serde_json",

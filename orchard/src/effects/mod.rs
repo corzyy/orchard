@@ -135,7 +135,7 @@ impl Transient {
             }
             TransientKind::Minimize | TransientKind::Restore { .. } => {
                 let s = crate::settings::get();
-                let genie = s.dock.minimize_effect == orchard_config::MinimizeEffect::Genie && !s.appearance.reduce_motion;
+                let genie = !s.appearance.reduce_motion;
                 (to_phys(self.target), 1.0, genie)
             }
         };

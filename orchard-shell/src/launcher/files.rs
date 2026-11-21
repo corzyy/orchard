@@ -232,8 +232,11 @@ pub fn percent_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            // Decode on bytes: slicing the &str at i+1..i+3 can cut through a
+            // multi-byte character (e.g. a literal '%' before '€').
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
@@ -602,6 +605,8 @@ mod tests {
     fn uri_and_decode() {
         assert_eq!(file_uri("/home/a b/ä.png"), "file:///home/a%20b/%C3%A4.png");
         assert_eq!(percent_decode("/home/a%20b/%C3%A4.png"), "/home/a b/ä.png");
+        // a literal percent before a multi-byte character must not split it
+        assert_eq!(percent_decode("/tmp/100%€.txt"), "/tmp/100%€.txt");
     }
 
     #[test]

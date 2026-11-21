@@ -87,8 +87,15 @@ unsafe extern "C" fn conversation(
             continue;
         }
         match (*m).msg_style {
+            // ECHO_OFF is a secret prompt (the password). ECHO_ON asks for a
+            // visible answer such as a login name or OTP; feeding it the
+            // password would disclose the secret and still fail the stack.
             PAM_PROMPT_ECHO_OFF | PAM_PROMPT_ECHO_ON => {
-                let copy = libc::strdup(password);
+                let copy = if (*m).msg_style == PAM_PROMPT_ECHO_OFF {
+                    libc::strdup(password)
+                } else {
+                    libc::strdup(c"".as_ptr())
+                };
                 if copy.is_null() {
                     for j in 0..i {
                         let r = (*out.offset(j)).resp;

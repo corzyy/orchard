@@ -371,22 +371,26 @@ impl<BackendData: Backend> OrchardState<BackendData> {
         };
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = dir.join(format!("{}-{n}.png", window.ipc_id().0));
-        // forget pictures of windows that are no longer minimized (done off the main thread)
-        let keep: Vec<String> = self.minimized.iter().filter_map(thumb_path_of).collect();
         window.user_data().insert_if_missing(|| ThumbPath(RefCell::new(None)));
         if let Some(t) = window.user_data().get::<ThumbPath>() {
             *t.0.borrow_mut() = Some(path.to_string_lossy().into_owned());
         }
-        std::thread::spawn(move || {
-            let _ = std::fs::create_dir_all(&dir);
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for e in entries.flatten() {
-                    let p = e.path().to_string_lossy().into_owned();
-                    if !keep.contains(&p) {
-                        let _ = std::fs::remove_file(e.path());
-                    }
+        // Forget pictures of windows that are no longer minimized. This sweep
+        // runs before the new file is written and on the main thread: doing it
+        // in the writer threads races with a later thumbnail and could delete
+        // the file that one just wrote (leaving an empty Dock tile).
+        let _ = std::fs::create_dir_all(&dir);
+        let mut keep: Vec<String> = self.minimized.iter().filter_map(thumb_path_of).collect();
+        keep.push(path.to_string_lossy().into_owned());
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path().to_string_lossy().into_owned();
+                if !keep.contains(&p) {
+                    let _ = std::fs::remove_file(e.path());
                 }
             }
+        }
+        std::thread::spawn(move || {
             let tmp = path.with_extension("tmp");
             let ok = image::RgbaImage::from_raw(w, h, rgba)
                 .map(|img| img.save_with_format(&tmp, image::ImageFormat::Png).is_ok())

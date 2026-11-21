@@ -402,9 +402,29 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                         }
                         Ok(n) => {
                             buf.extend_from_slice(&chunk[..n]);
+                            // Drain complete lines immediately: a client that keeps
+                            // streaming must not keep this loop busy forever or grow
+                            // our buffer while the event loop waits for it to go idle.
+                            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                                let line: Vec<u8> = buf.drain(..=pos).collect();
+                                let line = String::from_utf8_lossy(&line);
+                                let line = line.trim();
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                let reply = match serde_json::from_str::<Request>(line) {
+                                    Ok(req) => state.ipc_handle(id, stream, req),
+                                    Err(e) => Some(Event::Error {
+                                        message: e.to_string(),
+                                    }),
+                                };
+                                if let Some(reply) = reply {
+                                    let _ = send_line(stream, &reply);
+                                }
+                            }
                             // requests are tiny; a client that never sends a newline
                             // must not grow our memory without bound
-                            if buf.len() > MAX_REQUEST_BYTES && !buf.contains(&b'\n') {
+                            if buf.len() > MAX_REQUEST_BYTES {
                                 tracing::warn!(client = id, "IPC request too long, disconnecting");
                                 state.ipc.subscribers.remove(&id);
                                 return Ok(PostAction::Remove);
@@ -415,23 +435,6 @@ impl<BackendData: Backend + 'static> OrchardState<BackendData> {
                             state.ipc.subscribers.remove(&id);
                             return Ok(PostAction::Remove);
                         }
-                    }
-                }
-                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line);
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let reply = match serde_json::from_str::<Request>(line) {
-                        Ok(req) => state.ipc_handle(id, stream, req),
-                        Err(e) => Some(Event::Error {
-                            message: e.to_string(),
-                        }),
-                    };
-                    if let Some(reply) = reply {
-                        let _ = send_line(stream, &reply);
                     }
                 }
                 Ok(PostAction::Continue)

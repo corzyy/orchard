@@ -139,14 +139,6 @@ impl Default for AppearanceSettings {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum MinimizeEffect {
-    #[default]
-    Genie,
-    Scale,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
 pub enum TitlebarDoubleClick {
     #[default]
     Zoom,
@@ -203,16 +195,15 @@ impl Default for TilingSettings {
 pub struct DockSettings {
     /// Tile size in logical px.
     pub icon_size: f32,
-    pub magnification: bool,
-    /// Size of the tile under the pointer when magnification is on.
+    /// Size of the tile under the pointer. Equal to `icon_size` means
+    /// magnification is off.
     pub magnified_size: f32,
     /// When the Dock hides itself.
     pub autohide: DockAutohide,
-    pub show_indicators: bool,
-    pub animate_launch: bool,
-    pub minimize_effect: MinimizeEffect,
     /// Screen edge the Dock sits on.
     pub position: DockPosition,
+    /// Show the Trash at the end of the Dock.
+    pub show_trash: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -267,13 +258,10 @@ impl Default for DockSettings {
     fn default() -> Self {
         Self {
             icon_size: 52.0,
-            magnification: true,
             magnified_size: 84.0,
             autohide: DockAutohide::Never,
-            show_indicators: true,
-            animate_launch: true,
-            minimize_effect: MinimizeEffect::Genie,
             position: DockPosition::Bottom,
+            show_trash: true,
         }
     }
 }
@@ -956,12 +944,32 @@ impl Settings {
         let Ok(text) = std::fs::read_to_string(&path) else {
             return Settings::default();
         };
-        let (settings, problems) = Settings::from_json_lenient(&text);
+        let (mut settings, problems) = Settings::from_json_lenient(&text);
+        migrate_legacy(&text, &mut settings);
         if !problems.is_empty() {
-            for p in &problems {
-                eprintln!("orchard: {}: {p}; using the default there", path.display());
+            // Callers poll the file (the Settings app every couple of seconds,
+            // the compositor once a second). Report and back up each broken
+            // version only once instead of rewriting settings.json.bad and
+            // spamming the log forever.
+            let stamp = std::fs::metadata(&path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+            static LAST: std::sync::Mutex<Option<(PathBuf, std::time::SystemTime, u64)>> = std::sync::Mutex::new(None);
+            let key = stamp.map(|(mtime, len)| (path.clone(), mtime, len));
+            let already_reported = match (LAST.lock(), key) {
+                (Ok(mut last), Some(key)) => {
+                    let seen = last.as_ref() == Some(&key);
+                    if !seen {
+                        *last = Some(key);
+                    }
+                    seen
+                }
+                _ => false,
+            };
+            if !already_reported {
+                for p in &problems {
+                    eprintln!("orchard: {}: {p}; using the default there", path.display());
+                }
+                let _ = std::fs::copy(&path, path.with_extension("json.bad"));
             }
-            let _ = std::fs::copy(&path, path.with_extension("json.bad"));
         }
         settings
     }
@@ -988,15 +996,37 @@ impl Settings {
     }
 
     /// Atomically write the settings file.
+    ///
+    /// The temporary name is unique per process and save, so the Settings app
+    /// and the shell (or a Control Center toggle) saving at the same time can
+    /// never rename each other's half-written file. Durability is best effort:
+    /// sync the data before the rename, and the directory afterwards.
     pub fn save(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = settings_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("json.tmp");
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
         let json = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(tmp, path)
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write().and_then(|_| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1061,6 +1091,18 @@ fn overlay(root: &mut serde_json::Value, user: &serde_json::Value, ptr: &str, pr
     }
 }
 
+/// Carry settings whose meaning changed across versions forward.
+fn migrate_legacy(text: &str, settings: &mut Settings) {
+    // Older versions had a separate `dock.magnification` switch; the size
+    // slider is the switch now (equal sizes = off). Preserve a user who had
+    // magnification turned off instead of turning it back on.
+    if let Ok(raw) = serde_json::from_str::<serde_json::Value>(text) {
+        if raw.pointer("/dock/magnification").and_then(|v| v.as_bool()) == Some(false) {
+            settings.dock.magnified_size = settings.dock.icon_size;
+        }
+    }
+}
+
 /// Path of the compositor's IPC socket.
 pub fn socket_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("ORCHARD_SOCKET") {
@@ -1117,6 +1159,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_magnification_off_stays_off() {
+        let json = r#"{"dock":{"icon_size":60.0,"magnified_size":90.0,"magnification":false}}"#;
+        let (mut s, p) = Settings::from_json_lenient(json);
+        assert!(p.is_empty(), "{p:?}");
+        migrate_legacy(json, &mut s);
+        assert_eq!(s.dock.magnified_size, 60.0);
+        // and an explicit size from the new slider is left alone
+        let json = r#"{"dock":{"icon_size":60.0,"magnified_size":90.0}}"#;
+        let (mut s, _) = Settings::from_json_lenient(json);
+        migrate_legacy(json, &mut s);
+        assert_eq!(s.dock.magnified_size, 90.0);
+    }
+
+    #[test]
     fn one_bad_field_keeps_the_rest() {
         let mut want = Settings::default();
         want.appearance.accent = Accent::Green;
@@ -1124,7 +1180,7 @@ mod tests {
         let mut v = serde_json::to_value(&want).unwrap();
         // an accent this version doesn't know, plus a type error elsewhere
         v["appearance"]["accent"] = "ultraviolet".into();
-        v["dock"] = serde_json::json!({ "magnification": "very" });
+        v["dock"] = serde_json::json!({ "icon_size": "huge" });
         let (s, p) = Settings::from_json_lenient(&v.to_string());
         assert_eq!(p.len(), 2, "{p:?}");
         assert_eq!(s.appearance.mode, ThemeMode::Dark, "valid sibling kept");

@@ -478,11 +478,16 @@ fn place_new_window(
 
     let max_x = output_geometry.loc.x + (((output_geometry.size.w as f32) / 3.0) * 2.0) as i32;
     let max_y = output_geometry.loc.y + (((output_geometry.size.h as f32) / 3.0) * 2.0) as i32;
-    let x_range = Uniform::new(output_geometry.loc.x, max_x);
-    let y_range = Uniform::new(output_geometry.loc.y, max_y);
-    let mut rng = rand::thread_rng();
-    let x = x_range.sample(&mut rng);
-    let y = y_range.sample(&mut rng);
+    // An exclusive layer surface (a panel with ExclusiveZone::Exclusive on all
+    // edges) can leave no usable area at all; Uniform::new panics on low >= high.
+    let (x, y) = if max_x > output_geometry.loc.x && max_y > output_geometry.loc.y {
+        let x_range = Uniform::new(output_geometry.loc.x, max_x);
+        let y_range = Uniform::new(output_geometry.loc.y, max_y);
+        let mut rng = rand::thread_rng();
+        (x_range.sample(&mut rng), y_range.sample(&mut rng))
+    } else {
+        (output_geometry.loc.x, output_geometry.loc.y)
+    };
 
     // Orchard re-centers the window on its first sized commit (see wm.rs)
     window

@@ -195,6 +195,13 @@ pub type Job = Bg<Result<String, String>>;
 
 impl Job {
     pub fn run_cmd(&mut self, wake: &Wake, cmd: &str, args: &[&str]) {
+        // One command at a time; dropping the second silently also threw away
+        // its pending value, so the UI could show the first command's result
+        // as if it belonged to the second. Keep the previous value and say so.
+        if self.rx.is_some() {
+            eprintln!("orchard-settings: {cmd} ignored; the previous action is still running");
+            return;
+        }
         let cmd = cmd.to_string();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         self.value = None;

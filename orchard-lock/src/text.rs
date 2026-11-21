@@ -46,6 +46,45 @@ fn load_first(candidates: &[(&str, Option<&str>)]) -> Option<TtfFace> {
     None
 }
 
+/// Last resort when fontconfig (or `fc-match`) is broken: take any parseable
+/// font file from the usual directories. The lock screen must never panic or
+/// leave the session without a UI because one lookup failed.
+fn load_any_font() -> Option<TtfFace> {
+    fn scan(dir: &std::path::Path, depth: u8) -> Option<TtfFace> {
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth > 0 {
+                    dirs.push(path);
+                }
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+            if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&path) else { continue };
+            // the process lives as long as the lock: keep the bytes for good
+            let data: &'static [u8] = Box::leak(data.into_boxed_slice());
+            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
+                return Some(face);
+            }
+        }
+        dirs.into_iter().find_map(|d| scan(&d, depth - 1))
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut dirs = vec![
+        std::path::PathBuf::from("/usr/share/fonts"),
+        std::path::PathBuf::from("/usr/local/share/fonts"),
+    ];
+    if let Some(home) = home {
+        dirs.push(home.join(".local/share/fonts"));
+        dirs.push(home.join(".fonts"));
+    }
+    dirs.iter().find_map(|d| scan(d, 6))
+}
+
 pub struct Fonts {
     clock: TtfFace,
     semibold: TtfFace,
@@ -87,8 +126,9 @@ impl ttf_parser::OutlineBuilder for Outline<'_> {
 
 impl Fonts {
     /// Finds and maps the fonts on background threads (fc-match is a process
-    /// per font); `join` waits for them.
-    pub fn spawn() -> thread::JoinHandle<Fonts> {
+    /// per font); `join` waits for them. `None` when the system really has no
+    /// usable font at all.
+    pub fn spawn() -> thread::JoinHandle<Option<Fonts>> {
         thread::spawn(|| {
             let clock = thread::spawn(|| {
                 load_first(&[
@@ -110,10 +150,10 @@ impl Fonts {
                 ("Inter", Some("inter")),
                 ("sans-serif", None),
             ])
-            .expect("no usable font (fc-match)");
+            .or_else(load_any_font)?;
             let semibold = semibold.join().ok().flatten().unwrap_or_else(|| regular.clone());
             let clock = clock.join().ok().flatten().unwrap_or_else(|| semibold.clone());
-            Fonts { clock, semibold, regular }
+            Some(Fonts { clock, semibold, regular })
         })
     }
 

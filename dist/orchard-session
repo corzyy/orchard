@@ -9,9 +9,23 @@ export MOZ_ENABLE_WAYLAND=1
 export ELECTRON_OZONE_PLATFORM_HINT=auto
 export SDL_VIDEODRIVER=wayland
 export _JAVA_AWT_WM_NONREPARENTING=1
-# NVIDIA: GBM backend + explicit sync are handled by the compositor
-export GBM_BACKEND="${GBM_BACKEND:-nvidia-drm}"
-export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+# NVIDIA-only machines need NVIDIA's GBM backend and GLX vendor library.
+# Forcing them on AMD/Intel (or a hybrid laptop whose primary GPU is the
+# iGPU) makes gbm::Device::new fail and breaks GLX in Xwayland, so only
+# choose them when the machine has NVIDIA and no other GPU.
+nvidia=0
+other=0
+for f in /sys/class/drm/card*/device/vendor; do
+    [ -f "$f" ] || continue
+    case "$(cat "$f" 2>/dev/null)" in
+        0x10de) nvidia=1 ;;
+        0x1002|0x8086) other=1 ;;
+    esac
+done
+if [ "$nvidia" = 1 ] && [ "$other" = 0 ]; then
+    export GBM_BACKEND="${GBM_BACKEND:-nvidia-drm}"
+    export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+fi
 
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/orchard"
 mkdir -p "$LOG_DIR"

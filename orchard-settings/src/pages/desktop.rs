@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use orchard_config::{
-    CornerAction, DockAutohide, DockPosition, MinimizeEffect, NightShiftSchedule, NightShiftSettings, Settings,
+    CornerAction, DockAutohide, DockPosition, NightShiftSchedule, NightShiftSettings, Settings,
     TitlebarDoubleClick,
 };
 
@@ -44,42 +44,43 @@ fn corner_from_key(k: &str) -> CornerAction {
 
 pub fn desktop_dock(s: &Settings) -> El {
     let d = &s.dock;
-    let mut dock_rows = vec![
-        form::slider_row("Size", None, 32.0..=96.0, d.icon_size as f64, 1.0, Some(("Small", "Large")), |v| {
-            edit(move |s| {
-                s.dock.icon_size = v.round() as f32;
-                s.dock.magnified_size = s.dock.magnified_size.max(s.dock.icon_size);
-            })
-        }),
-        form::toggle_row("Magnification", None, d.magnification, |v| edit(move |s| s.dock.magnification = v)),
-    ];
-    if d.magnification {
-        let lo = d.icon_size as f64;
-        dock_rows.push(form::slider_row(
-            "Magnified size",
-            None,
-            lo..=128.0_f64.max(lo),
-            (d.magnified_size as f64).clamp(lo, 128.0_f64.max(lo)),
-            1.0,
-            Some(("Small", "Large")),
-            |v| edit(move |s| s.dock.magnified_size = v.round() as f32),
-        ));
-    }
     let cur_pos = match d.position {
         DockPosition::Left => "left",
         DockPosition::Bottom => "bottom",
         DockPosition::Right => "right",
-    };
-    let cur_eff = match d.minimize_effect {
-        MinimizeEffect::Genie => "genie",
-        MinimizeEffect::Scale => "scale",
     };
     let cur_hide = match d.autohide {
         DockAutohide::Never => "never",
         DockAutohide::AvoidWindows => "avoid",
         DockAutohide::Always => "always",
     };
-    dock_rows.extend([
+    // The magnification slider starts at the base size: dragged fully left,
+    // icons no longer grow under the pointer.
+    let mag_lo = d.icon_size as f64;
+    let mag_hi = 128.0_f64.max(mag_lo);
+    let dock_rows = vec![
+        form::slider_row("Size", None, 32.0..=96.0, d.icon_size as f64, 1.0, Some(("Small", "Large")), |v| {
+            edit(move |s| {
+                // keep the magnification strength when the base size changes
+                let ratio = if s.dock.magnified_size > s.dock.icon_size + 0.5 {
+                    s.dock.magnified_size / s.dock.icon_size
+                } else {
+                    1.0
+                };
+                let icon = v.round() as f32;
+                s.dock.icon_size = icon;
+                s.dock.magnified_size = (icon * ratio).clamp(icon, 128.0);
+            })
+        }),
+        form::slider_row(
+            "Magnification",
+            None,
+            mag_lo..=mag_hi,
+            (d.magnified_size as f64).clamp(mag_lo, mag_hi),
+            1.0,
+            Some(("Off", "Large")),
+            |v| edit(move |s| s.dock.magnified_size = v.round() as f32),
+        ),
         form::popup_row(
             "Position on screen",
             None,
@@ -92,17 +93,6 @@ pub fn desktop_dock(s: &Settings) -> El {
                         "right" => DockPosition::Right,
                         _ => DockPosition::Bottom,
                     }
-                })
-            },
-        ),
-        form::popup_row(
-            "Minimise windows using",
-            None,
-            choices([("genie", "Genie Effect"), ("scale", "Scale Effect")]),
-            cur_eff,
-            |v| {
-                edit(move |s| {
-                    s.dock.minimize_effect = if v == "scale" { MinimizeEffect::Scale } else { MinimizeEffect::Genie }
                 })
             },
         ),
@@ -121,13 +111,10 @@ pub fn desktop_dock(s: &Settings) -> El {
                 })
             },
         ),
-        form::toggle_row("Animate opening applications", None, d.animate_launch, |v| {
-            edit(move |s| s.dock.animate_launch = v)
+        form::toggle_row("Show Trash in Dock", None, d.show_trash, |v| {
+            edit(move |s| s.dock.show_trash = v)
         }),
-        form::toggle_row("Show indicators for open applications", None, d.show_indicators, |v| {
-            edit(move |s| s.dock.show_indicators = v)
-        }),
-    ]);
+    ];
 
     let cur_dbl = match s.windows.double_click_titlebar {
         TitlebarDoubleClick::Zoom => "zoom",
