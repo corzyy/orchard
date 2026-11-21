@@ -1077,12 +1077,18 @@ impl Launcher {
             }
             _ if cmd => {
                 let k = utf8.map(|s| s.to_lowercase()).unwrap_or_default();
-                // Ctrl turns letters into control characters: use the keysym
+                // Ctrl turns letters into control characters, so fall back to
+                // the keysym's name. XKB names carry an "XK_" prefix ("XK_a").
                 let name = sym.name().unwrap_or("").to_lowercase();
+                let name = name.strip_prefix("xk_").unwrap_or(&name);
                 let is = |c: &str| k == c || name == c;
                 if is("a") {
-                    self.sel_all = !self.query.is_empty();
-                    self.cursor = self.query.len();
+                    // Always select everything, like any other text field:
+                    // pressing Ctrl+A twice must not clear the selection.
+                    if !self.query.is_empty() {
+                        self.sel_all = true;
+                        self.cursor = self.query.len();
+                    }
                     Outcome::Redraw
                 } else if is("c") {
                     Outcome::Copy
@@ -1873,6 +1879,30 @@ mod tests {
         let mut l = launcher("x");
         assert_eq!(l.key(Keysym::Escape, None, &m), Outcome::Changed);
         assert_eq!(l.key(Keysym::Escape, None, &m), Outcome::Close);
+    }
+
+    #[test]
+    fn ctrl_a_always_selects_everything() {
+        let m = Modifiers::default();
+        let ctrl = Modifiers { ctrl: true, ..m };
+        // XKB reports a control character in `utf8` for Ctrl+A; the keysym
+        // still identifies the letter.
+        let mut l = launcher("hello");
+        assert!(!l.sel_all);
+        assert_eq!(l.key(Keysym::a, Some("\u{1}"), &ctrl), Outcome::Redraw);
+        assert!(l.sel_all);
+        assert_eq!(l.cursor, 5);
+        // a second Ctrl+A keeps the selection instead of toggling it off
+        assert_eq!(l.key(Keysym::a, Some("\u{1}"), &ctrl), Outcome::Redraw);
+        assert!(l.sel_all);
+        // reopening with a selected previous query must not deselect either
+        let mut l = Launcher::new("old", 0, false);
+        assert!(l.sel_all);
+        l.key(Keysym::a, Some("\u{1}"), &ctrl);
+        assert!(l.sel_all);
+        // typing replaces the selection, like anywhere else
+        l.insert("new");
+        assert_eq!(l.query, "new");
     }
 
     #[test]
