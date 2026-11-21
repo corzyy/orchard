@@ -950,7 +950,7 @@ impl ControlKind {
     pub fn default_size(self) -> ControlSize {
         match self {
             ControlKind::Connectivity | ControlKind::NowPlaying => ControlSize::Large,
-            ControlKind::Brightness | ControlKind::Volume => ControlSize::Wide,
+            ControlKind::Brightness | ControlKind::Volume => ControlSize::Tall,
             _ => ControlSize::Small,
         }
     }
@@ -1030,10 +1030,14 @@ impl Default for ControlCenterSettings {
                 ControlItem::new(ControlKind::NowPlaying, ControlSize::Large),
                 ControlItem::new(ControlKind::Focus, ControlSize::Small),
                 ControlItem::new(ControlKind::NightShift, ControlSize::Small),
+                ControlItem::new(ControlKind::Brightness, ControlSize::Tall),
+                ControlItem::new(ControlKind::Volume, ControlSize::Tall),
                 ControlItem::new(ControlKind::GameMode, ControlSize::Small),
                 ControlItem::new(ControlKind::Displays, ControlSize::Small),
-                ControlItem::new(ControlKind::Brightness, ControlSize::Wide),
-                ControlItem::new(ControlKind::Volume, ControlSize::Wide),
+                ControlItem::new(ControlKind::Network, ControlSize::Small),
+                ControlItem::new(ControlKind::Sound, ControlSize::Small),
+                ControlItem::new(ControlKind::Wifi, ControlSize::Small),
+                ControlItem::new(ControlKind::Bluetooth, ControlSize::Small),
             ]],
         }
     }

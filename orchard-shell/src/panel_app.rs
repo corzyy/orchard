@@ -150,7 +150,13 @@ impl App {
         if let Some(ref t) = target {
             if matches!(
                 t,
-                Target::Volume(..) | Target::Brightness(..) | Target::VolumeMute | Target::AppVolume(..) | Target::AppMute(_)
+                Target::Volume(..)
+                    | Target::VolumeVertical(..)
+                    | Target::Brightness(..)
+                    | Target::BrightnessVertical(..)
+                    | Target::VolumeMute
+                    | Target::AppVolume(..)
+                    | Target::AppMute(_)
             ) {
                 let t = t.clone();
                 if let Some(p) = self.panel.as_ref() {
@@ -220,7 +226,7 @@ impl App {
                 }
             }
             match p.dragging {
-                Some(Target::Volume(..)) => p.control.volume = volume,
+                Some(Target::Volume(..) | Target::VolumeVertical(..)) => p.control.volume = volume,
                 Some(Target::AppVolume(idx, ..)) => {
                     if let (Some(old), Some(cur)) = (streams.get(idx), p.control.streams.get_mut(idx)) {
                         if old.name == cur.name {
@@ -229,7 +235,7 @@ impl App {
                         }
                     }
                 }
-                Some(Target::Brightness(idx, ..)) => {
+                Some(Target::Brightness(idx, ..) | Target::BrightnessVertical(idx, ..)) => {
                     if let (Some(old), Some(cur)) = (displays.get(idx), p.control.displays.get_mut(idx)) {
                         cur.value = old.value;
                     }
@@ -319,18 +325,18 @@ impl App {
         self.set_backdrop_alpha("orchard-panel", Some((x, y, w, h, radius, alpha)));
     }
 
-    fn set_slider(&mut self, target: &Target, x: f32) {
-        let Some(v) = Panel::slider_value(target, x) else { return };
+    fn set_slider(&mut self, target: &Target, x: f32, y: f32) {
+        let Some(v) = Panel::slider_value(target, x, y) else { return };
         if let Some(p) = self.panel.as_mut() {
             match target {
-                Target::Volume(..) => {
+                Target::Volume(..) | Target::VolumeVertical(..) => {
                     p.control.volume = Some((v, false));
                     if self.menubar.volume != Some((v, false)) {
                         self.menubar.volume = Some((v, false));
                         self.redraw(Which::Bar);
                     }
                 }
-                Target::Brightness(idx, ..) => {
+                Target::Brightness(idx, ..) | Target::BrightnessVertical(idx, ..) => {
                     if let Some(d) = p.control.displays.get_mut(*idx) {
                         d.value = v;
                     }
@@ -374,7 +380,7 @@ impl App {
                     }
                     self.redraw(Which::Panel);
                 } else if let Some(t) = dragging {
-                    self.set_slider(&t, x);
+                    self.set_slider(&t, x, y);
                 } else {
                     let new_hit = self.panel.as_ref().and_then(|p| p.hit(x, y));
                     if new_hit != prev_hit {
@@ -418,7 +424,7 @@ impl App {
                 let dragging = self.panel.as_mut().and_then(|p| p.dragging.take());
                 if let Some(t) = dragging {
                     // final value, whatever the throttle skipped
-                    let v = Panel::slider_value(&t, x);
+                    let v = Panel::slider_value(&t, x, y);
                     self.refresh_control(Some(t), v);
                 }
             }
@@ -601,12 +607,16 @@ impl App {
                         self.redraw(Which::Panel);
                         self.refresh_control(Some(Target::AppMute(idx)), None);
                     }
-                    Target::Volume(..) | Target::Brightness(..) | Target::AppVolume(..) => {
+                    Target::Volume(..)
+                    | Target::VolumeVertical(..)
+                    | Target::Brightness(..)
+                    | Target::BrightnessVertical(..)
+                    | Target::AppVolume(..) => {
                         if let Some(p) = self.panel.as_mut() {
                             p.dragging = Some(target.clone());
                         }
                         self.last_slider_cmd = Instant::now() - std::time::Duration::from_secs(1);
-                        self.set_slider(&target, x);
+                        self.set_slider(&target, x, y);
                     }
                     other => {
                         // optimistic toggle, then the real state from the system

@@ -32,18 +32,18 @@ const SUBMENU_ANIM: Duration = Duration::from_millis(210);
 const PAGE_ANIM: Duration = Duration::from_millis(260);
 
 const CC_COLS: usize = 4;
-/// Outer page padding: the same inset on all sides of the grid.
-const CC_PAD: f32 = 16.0;
-const CC_GAP: f32 = 10.0;
-const CC_CELL: f32 = 75.0;
-const CC_TOP: f32 = 16.0;
-const CC_BOTTOM: f32 = 12.0;
-const CC_FOOTER: f32 = 34.0;
-const CC_RADIUS: f32 = 28.0;
-const MODULE_RADIUS: f32 = 22.0;
-/// Inner padding shared by large modules (media, sliders, wide controls).
-const MODULE_PAD: f32 = 16.0;
-const GROUP_PAD: f32 = 12.0;
+/// The panel uses generous side margins and compact controls, like the iOS
+/// Control Center grid: 4 × 63 px cells, 14 px gutters, 34 px outer padding.
+const CC_PAD: f32 = 34.0;
+const CC_GAP: f32 = 14.0;
+const CC_CELL: f32 = 63.0;
+const CC_TOP: f32 = 20.0;
+const CC_BOTTOM: f32 = 16.0;
+const CC_FOOTER: f32 = 36.0;
+const CC_RADIUS: f32 = 30.0;
+const MODULE_RADIUS: f32 = 24.0;
+/// Inner padding shared by 2 × 2 modules.
+const MODULE_PAD: f32 = 14.0;
 const GROUP_GAP: f32 = 8.0;
 const GALLERY_HEADER: f32 = 34.0;
 const PAGE_DOT: f32 = 3.5;
@@ -270,6 +270,7 @@ fn content_height(placed: &[PlacedModule]) -> f32 {
 /// staggered entrance so no per-shape alpha maths is needed later.
 #[derive(Clone, Copy)]
 struct CcLook {
+    dark: bool,
     text: Rgba,
     sub: Rgba,
     faint: Rgba,
@@ -277,7 +278,6 @@ struct CcLook {
     card_hover: Rgba,
     border: Rgba,
     off: Rgba,
-    hover: Rgba,
     accent: Rgba,
 }
 
@@ -288,6 +288,7 @@ impl CcLook {
         let f = |c: Rgba| scale_alpha(c, alpha);
         if dark {
             Self {
+                dark: true,
                 text: f([245, 245, 247, 250]),
                 sub: f([235, 235, 240, 155]),
                 faint: f([235, 235, 240, 90]),
@@ -295,11 +296,11 @@ impl CcLook {
                 card_hover: f([255, 255, 255, 46]),
                 border: f([255, 255, 255, 18]),
                 off: f([120, 120, 128, 125]),
-                hover: f([255, 255, 255, 20]),
                 accent: f(theme.menu_selection),
             }
         } else {
             Self {
+                dark: false,
                 text: f([20, 20, 22, 255]),
                 sub: f([60, 60, 67, 145]),
                 faint: f([60, 60, 67, 85]),
@@ -307,7 +308,6 @@ impl CcLook {
                 card_hover: f([255, 255, 255, 232]),
                 border: f([0, 0, 0, 20]),
                 off: f([106, 106, 113, 150]),
-                hover: f([0, 0, 0, 13]),
                 accent: f(theme.menu_selection),
             }
         }
@@ -320,10 +320,7 @@ fn next_module_size(kind: ControlKind, size: ControlSize) -> ControlSize {
             ControlSize::Large => ControlSize::Wide,
             _ => ControlSize::Large,
         },
-        ControlKind::Brightness | ControlKind::Volume => match size {
-            ControlSize::Wide => ControlSize::Full,
-            _ => ControlSize::Wide,
-        },
+        ControlKind::Brightness | ControlKind::Volume => ControlSize::Tall,
         _ => match size {
             ControlSize::Small => ControlSize::Wide,
             _ => ControlSize::Small,
@@ -408,6 +405,13 @@ pub enum Submenu {
     Ethernet,
     Bluetooth,
     Sound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetRow {
+    Wifi,
+    Ethernet,
+    Bluetooth,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -663,9 +667,13 @@ pub enum Target {
     OpenSettings(&'static str),
     /// slider: x range of the track
     Volume(f32, f32),
+    /// vertical slider: `(top_y, bottom_y)`
+    VolumeVertical(f32, f32),
     VolumeMute,
     /// `(display_index, min_x, max_x)`
     Brightness(usize, f32, f32),
+    /// `(display_index, top_y, bottom_y)`
+    BrightnessVertical(usize, f32, f32),
     /// per-app volume: `(stream_index, min_x, max_x)`
     AppVolume(usize, f32, f32),
     AppMute(usize),
@@ -771,6 +779,14 @@ impl Panel {
         let mut pages = settings.control_center.sanitized().pages;
         if pages.is_empty() {
             pages = ControlCenterSettings::default().pages;
+        }
+        // Brightness and volume are fixed iOS-style vertical sliders.
+        for page in &mut pages {
+            for item in page.iter_mut() {
+                if matches!(item.kind, ControlKind::Brightness | ControlKind::Volume) {
+                    item.size = ControlSize::Tall;
+                }
+            }
         }
         if pages.is_empty() {
             pages.push(Vec::new());
@@ -1209,7 +1225,7 @@ impl Panel {
         self.anim.bluetooth.set_target(bt, now);
         self.anim.wifi_others.set_target(others, now);
 
-        if matches!(self.dragging, Some(Target::Volume(..))) {
+        if matches!(self.dragging, Some(Target::Volume(..) | Target::VolumeVertical(..))) {
             self.anim.vol.snap(vol);
         } else {
             self.anim.vol.set_target(vol, now);
@@ -1225,7 +1241,7 @@ impl Panel {
         } else {
             for (idx, (sp, d)) in self.anim.displays.iter_mut().zip(&self.control.displays).enumerate() {
                 let target = d.value.clamp(0.0, 1.0);
-                if matches!(self.dragging, Some(Target::Brightness(i, ..)) if i == idx) {
+                if matches!(self.dragging, Some(Target::Brightness(i, ..) | Target::BrightnessVertical(i, ..)) if i == idx) {
                     sp.snap(target);
                 } else {
                     sp.set_target(target, now);
@@ -1292,11 +1308,14 @@ impl Panel {
         (x >= px && x < px + pw && y >= py && y < py + ph).then_some(Target::Panel)
     }
 
-    /// Slider value for pointer x.
-    pub fn slider_value(target: &Target, x: f32) -> Option<f32> {
+    /// Slider value for a pointer position.
+    pub fn slider_value(target: &Target, x: f32, y: f32) -> Option<f32> {
         match target {
             Target::Volume(a, b) | Target::Brightness(_, a, b) | Target::AppVolume(_, a, b) => {
                 Some(((x - a) / (b - a)).clamp(0.0, 1.0))
+            }
+            Target::VolumeVertical(top, bottom) | Target::BrightnessVertical(_, top, bottom) => {
+                Some(((bottom - y) / (bottom - top)).clamp(0.0, 1.0))
             }
             _ => None,
         }
@@ -1877,9 +1896,10 @@ impl Panel {
         fill_circle(pm, cx * s, cy * s, 10.5 * s, [255, 69, 58, 255]);
         minus(pm, cx * s, cy * s, 4.2 * s, [255, 255, 255, 255]);
         targets.push(((cx - 13.0, cy - 13.0, 26.0, 26.0), Target::RemoveModule(kind)));
-        // Resize handle appears on hover, so the labels stay readable while
-        // the remove badges are always visible.
-        if self.hovered(x, y, w, h) {
+        // Resize handle appears on hover. Sliders only have their iOS size.
+        if !matches!(kind, ControlKind::Brightness | ControlKind::Volume)
+            && self.hovered(x, y, w, h)
+        {
             let (rx, ry) = (x + w - 14.0, y + h - 14.0);
             fill_circle(pm, rx * s, (ry + 0.7) * s, 11.0 * s, [0, 0, 0, 40]);
             fill_circle(pm, rx * s, ry * s, 10.5 * s, [242, 242, 247, 255]);
@@ -2012,21 +2032,21 @@ impl Panel {
             if hovered { look.card_hover } else { look.card },
         );
         stroke_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, 1.0 * s, look.border);
-        let (cx, cy) = (x + w / 2.0, y + 26.0);
-        fill_circle(pm, cx * s, cy * s, 15.0 * s, look.off);
-        module_glyph(pm, s, kind, cx, cy, 6.5, look.text);
-        let label = module_name(kind, german);
-        let lw = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
-        let base = fonts.baseline_centered((y + 45.0) * s, 24.0 * s, 10.0 * s, Weight::Bold);
-        fonts.draw(pm, label, (x + (w - lw) / 2.0) * s, base, 10.0 * s, Weight::Bold, look.text);
+        let (cx, cy) = (x + w / 2.0, y + 22.0);
+        fill_circle(pm, cx * s, cy * s, 13.5 * s, look.off);
+        module_glyph(pm, s, kind, cx, cy, 5.8, look.text);
+        let label = fonts.elide(module_name(kind, german), 9.5 * s, Weight::Bold, (w - 8.0) * s);
+        let lw = fonts.measure(&label, 9.5 * s, Weight::Bold) / s;
+        let base = fonts.baseline_centered((y + 38.0) * s, 20.0 * s, 9.5 * s, Weight::Bold);
+        fonts.draw(pm, &label, (x + (w - lw) / 2.0) * s, base, 9.5 * s, Weight::Bold, look.text);
         // Add / already-added badge.
-        let (bx, by) = (x + w - 10.0, y + 10.0);
+        let (bx, by) = (x + w - 9.0, y + 9.0);
         if added {
-            fill_circle(pm, bx * s, by * s, 7.0 * s, [52, 199, 89, 255]);
-            check(pm, bx * s, by * s, 3.3 * s, [255, 255, 255, 255]);
+            fill_circle(pm, bx * s, by * s, 6.5 * s, [52, 199, 89, 255]);
+            check(pm, bx * s, by * s, 3.1 * s, [255, 255, 255, 255]);
         } else {
-            fill_circle(pm, bx * s, by * s, 7.0 * s, look.accent);
-            plus(pm, bx * s, by * s, 3.4 * s, [255, 255, 255, 255]);
+            fill_circle(pm, bx * s, by * s, 6.5 * s, look.accent);
+            plus(pm, bx * s, by * s, 3.2 * s, [255, 255, 255, 255]);
         }
     }
 
@@ -2122,14 +2142,23 @@ impl Panel {
             self.paint_round_button(pm, s, rect, kind, look, german, interactive, targets, now);
             return;
         }
+        // Connectivity is composed of iOS pill rows, and the tall sliders are
+        // capsules themselves; neither sits on a square module card.
+        let vertical_slider = matches!(kind, ControlKind::Brightness | ControlKind::Volume) && h > w + 1.0;
+        if kind == ControlKind::Connectivity {
+            self.paint_connectivity(pm, s, rect, look, fonts, german, interactive, targets, now);
+            return;
+        }
+        if vertical_slider {
+            self.paint_vertical_slider(pm, s, rect, kind, look, interactive, targets, now);
+            return;
+        }
         let hovered = self.module_hovered(x, y, w, h);
         let card = if hovered { look.card_hover } else { look.card };
         fill_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, card);
         stroke_rounded(pm, x * s, y * s, w * s, h * s, MODULE_RADIUS * s, 1.0 * s, look.border);
         match kind {
-            ControlKind::Connectivity => {
-                self.paint_connectivity(pm, s, rect, look, fonts, interactive, targets, now);
-            }
+            ControlKind::Connectivity => {}
             ControlKind::NowPlaying => {
                 self.paint_now_playing(pm, s, rect, look, fonts, theme, german, interactive, targets);
             }
@@ -2243,7 +2272,13 @@ impl Panel {
             ),
         };
         let hovered = interactive && self.module_hovered(x, y, w, h);
-        let mut circle = lerp_rgba(look.off, on_col, on_t);
+        let white = [250, 250, 252, look.text[3]];
+        let off_glyph = [255, 255, 255, look.text[3]];
+        let (mut circle, glyph) = if look.dark {
+            (lerp_rgba(look.off, white, on_t), lerp_rgba(off_glyph, on_col, on_t))
+        } else {
+            (lerp_rgba(look.off, on_col, on_t), off_glyph)
+        };
         if hovered {
             circle[3] = circle[3].saturating_add(20);
         }
@@ -2252,8 +2287,7 @@ impl Panel {
         let r = (d / 2.0 - 1.0).max(1.0);
         let (ps, _) = tap_scale(self.anim.pulses[pulse], now);
         fill_circle(pm, cx * s, cy * s, r * ps * s, circle);
-        let glyph = [255, 255, 255, look.text[3]];
-        module_glyph(pm, s, kind, cx, cy, 13.0 * ps, glyph);
+        module_glyph(pm, s, kind, cx, cy, 10.5 * ps, glyph);
         if interactive {
             targets.push(((cx - r, cy - r, r * 2.0, r * 2.0), target));
         }
@@ -2268,119 +2302,211 @@ impl Panel {
         rect: (f32, f32, f32, f32),
         look: CcLook,
         fonts: &Fonts,
+        german: bool,
         interactive: bool,
         targets: &mut Vec<((f32, f32, f32, f32), Target)>,
         now: Instant,
     ) {
         let (x, y, w, h) = rect;
-        let wifi_on = self.anim.wifi.sample(now).clamp(0.0, 1.0);
-        let bt_on = self.anim.bluetooth.sample(now).clamp(0.0, 1.0);
-        let eth = self.anim.ethernet.sample(now).clamp(0.0, 1.0);
-        let nw = self.control.wifi.is_some();
-        let nb = self.control.bluetooth.is_some();
-        let ne = !self.control.ethernet.is_empty() || self.network_hint == Network::Wired;
-        let compact = h < CC_CELL + 10.0;
-        let (pad, gap, cols, rows) = if compact {
-            if w < CC_CELL + 44.0 {
-                (8.0, 5.0, 2usize, 2usize)
-            } else {
-                (10.0, 4.0, 4usize, 1usize)
-            }
+        let network_eth = self.control.show_ethernet() && !self.control.wifi_connected();
+        let first = if network_eth { NetRow::Ethernet } else { NetRow::Wifi };
+        let second = NetRow::Bluetooth;
+        let stacked = h > w * 0.72;
+        if stacked {
+            let row_h = ((h - GROUP_GAP) / 2.0).max(1.0);
+            let top = (x, y, w, row_h);
+            let bottom = (x, y + row_h + GROUP_GAP, w, row_h);
+            self.paint_connectivity_row(pm, s, top, first, look, fonts, german, interactive, targets, now);
+            self.paint_connectivity_row(pm, s, bottom, second, look, fonts, german, interactive, targets, now);
+        } else if w > CC_CELL * 3.0 {
+            // Full width: two pill rows side by side, like iOS landscape.
+            let col_w = (w - GROUP_GAP) / 2.0;
+            self.paint_connectivity_row(pm, s, (x, y, col_w, h), first, look, fonts, german, interactive, targets, now);
+            self.paint_connectivity_row(
+                pm,
+                s,
+                (x + col_w + GROUP_GAP, y, col_w, h),
+                second,
+                look,
+                fonts,
+                german,
+                interactive,
+                targets,
+                now,
+            );
         } else {
-            (GROUP_PAD, GROUP_GAP, 2, 2)
-        };
-        let cw = (w - pad * 2.0 - gap * (cols - 1) as f32) / cols as f32;
-        let ch = (h - pad * 2.0 - gap * (rows - 1) as f32) / rows as f32;
-        // Clicking the gaps in the group opens the network detail sheet.
-        if interactive && !compact {
-            targets.push(((x + pad, y + pad, w - pad * 2.0, h - pad * 2.0), Target::OpenSubmenu(Submenu::Wifi)));
+            self.paint_connectivity_row(pm, s, rect, first, look, fonts, german, interactive, targets, now);
         }
-        let cells = [
-            (0usize, 0usize, "Wi-Fi", wifi_on, nw, PULSE_WIFI),
-            (1, 0, "Bluetooth", bt_on, nb, PULSE_BT),
-            (0, 1, "Ethernet", eth, ne, PULSE_WIFI),
-            (1, 1, "Network", 0.0, true, PULSE_WIFI),
-        ];
-        for (col, row, label, on, available, pulse) in cells {
-            let (col, row) = if compact && cols == 4 {
-                // A wide connectivity module becomes a single row of four
-                // compact icons.
-                (col + row * 2, 0)
-            } else {
-                (col, row)
-            };
-            let cx0 = x + pad + col as f32 * (cw + gap);
-            let cy0 = y + pad + row as f32 * (ch + gap);
-            let hov = interactive && self.module_hovered(cx0, cy0, cw, ch);
-            if hov {
-                fill_rounded(pm, cx0 * s, cy0 * s, cw * s, ch * s, 16.0 * s, look.hover);
-            }
-            let (cx, cy) = if compact {
-                (cx0 + cw / 2.0, cy0 + ch / 2.0)
-            } else {
-                (cx0 + cw / 2.0, cy0 + 22.0)
-            };
-            let r = if compact {
-                (cw.min(ch) * 0.36).clamp(8.0, 15.0)
-            } else {
-                17.0
-            };
-            let (ps, _) = tap_scale(self.anim.pulses[pulse], now);
-            let gs = ps * (r / 15.0);
-            let is_network = label == "Network";
-            let circle = if is_network {
-                look.off
-            } else {
-                lerp_rgba(look.off, look.accent, if available { on } else { 0.0 })
-            };
-            fill_circle(pm, cx * s, cy * s, r * ps * s, circle);
-            let glyph_col = if available && (is_network || on > 0.5) {
-                [255, 255, 255, look.text[3]]
-            } else {
-                [255, 255, 255, look.faint[3].max(80)]
-            };
-            match label {
-                "Wi-Fi" | "Network" => {
-                    crate::menubar::draw_network(pm, cx * s, (cy - 1.0) * s, s * 0.76 * gs, Network::Wifi(3), glyph_col)
-                }
-                "Ethernet" => {
-                    crate::menubar::draw_network(pm, cx * s, cy * s, s * 0.90 * gs, Network::Wired, glyph_col)
-                }
-                _ => bluetooth(pm, cx * s, cy * s, 7.0 * gs * s, glyph_col),
-            }
-            if !compact {
-                let label_w = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
-                let base = fonts.baseline_centered((cy0 + 41.0) * s, 18.0 * s, 10.0 * s, Weight::Bold);
-                fonts.draw(
-                    pm,
-                    label,
-                    (cx - label_w / 2.0) * s,
-                    base,
-                    10.0 * s,
-                    Weight::Bold,
-                    if available { look.text } else { look.faint },
-                );
-            }
-            if interactive {
-                // The whole cell opens its detail sheet; tapping the circle
-                // itself flips the radio (like quick settings on iOS).
-                let detail = match label {
-                    "Bluetooth" => Submenu::Bluetooth,
-                    "Ethernet" => Submenu::Ethernet,
-                    _ => Submenu::Wifi,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_connectivity_row(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        row: NetRow,
+        look: CcLook,
+        fonts: &Fonts,
+        german: bool,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+        now: Instant,
+    ) {
+        let t = |en: &'static str, de: &'static str| if german { de } else { en };
+        let (x, y, w, h) = rect;
+        let radius = (h / 2.0).min(w / 2.0);
+        let hovered = interactive && self.module_hovered(x, y, w, h);
+        fill_rounded(
+            pm,
+            x * s,
+            y * s,
+            w * s,
+            h * s,
+            radius * s,
+            if hovered { look.card_hover } else { look.card },
+        );
+        stroke_rounded(pm, x * s, y * s, w * s, h * s, radius * s, 1.0 * s, look.border);
+
+        let (on_t, tint, title, status, available, toggle, detail, pulse, icon) = match row {
+            NetRow::Wifi => {
+                let (title, status) = match &self.control.wifi {
+                    Some((true, Some(ssid))) => (ssid.clone(), t("Connected", "Verbunden").to_string()),
+                    Some((true, None)) => ("Wi-Fi".into(), t("Not Connected", "Nicht verbunden").to_string()),
+                    Some((false, _)) => ("Wi-Fi".into(), t("Off", "Aus").to_string()),
+                    None => ("Wi-Fi".into(), t("Unavailable", "Nicht verfügbar").to_string()),
                 };
-                targets.push(((cx0, cy0, cw, ch), Target::OpenSubmenu(detail)));
-                let toggle = match label {
-                    "Wi-Fi" if available => Some(Target::WifiToggle),
-                    "Bluetooth" if available => Some(Target::BluetoothToggle),
-                    "Ethernet" if available && self.control.ethernet.iter().any(|e| e.managed && e.plugged) => {
-                        Some(Target::EthernetToggle)
-                    }
-                    _ => None,
+                (
+                    self.anim.wifi.sample(now).clamp(0.0, 1.0),
+                    look.accent,
+                    title,
+                    status,
+                    self.control.wifi.is_some(),
+                    Target::WifiToggle,
+                    Submenu::Wifi,
+                    PULSE_WIFI,
+                    NetRow::Wifi,
+                )
+            }
+            NetRow::Ethernet => {
+                let dev = self.control.ethernet.first();
+                let title = dev
+                    .and_then(|d| d.connection.clone())
+                    .or_else(|| dev.map(|d| d.device.clone()))
+                    .unwrap_or_else(|| "Ethernet".into());
+                let status = match dev {
+                    Some(d) if d.connected => d
+                        .ip
+                        .clone()
+                        .unwrap_or_else(|| t("Connected", "Verbunden").to_string()),
+                    Some(d) if d.plugged => t("Disconnected", "Getrennt").to_string(),
+                    Some(_) => t("Cable unplugged", "Kein Kabel").to_string(),
+                    None => t("Unavailable", "Nicht verfügbar").to_string(),
                 };
-                if let Some(toggle) = toggle {
-                    targets.push(((cx - r, cy - r, r * 2.0, r * 2.0), toggle));
-                }
+                (
+                    self.anim.ethernet.sample(now).clamp(0.0, 1.0),
+                    look.accent,
+                    title,
+                    status,
+                    dev.is_some_and(|d| d.managed && d.plugged),
+                    Target::EthernetToggle,
+                    Submenu::Ethernet,
+                    PULSE_WIFI,
+                    NetRow::Ethernet,
+                )
+            }
+            NetRow::Bluetooth => {
+                let connected: Vec<&str> = self
+                    .control
+                    .bt_devices
+                    .iter()
+                    .filter(|d| d.connected)
+                    .map(|d| d.name.as_str())
+                    .collect();
+                let status = match self.control.bluetooth {
+                    Some(true) => match connected.len() {
+                        0 => t("On", "Ein").to_string(),
+                        1 => connected[0].to_string(),
+                        n => {
+                            if german {
+                                format!("{n} Geräte")
+                            } else {
+                                format!("{n} devices")
+                            }
+                        }
+                    },
+                    Some(false) => t("Off", "Aus").to_string(),
+                    None => t("Unavailable", "Nicht verfügbar").to_string(),
+                };
+                (
+                    self.anim.bluetooth.sample(now).clamp(0.0, 1.0),
+                    look.accent,
+                    "Bluetooth".to_string(),
+                    status,
+                    self.control.bluetooth.is_some(),
+                    Target::BluetoothToggle,
+                    Submenu::Bluetooth,
+                    PULSE_BT,
+                    NetRow::Bluetooth,
+                )
+            }
+        };
+
+        // White circle + tinted symbol when on, grey circle + white symbol off.
+        let icon_d = (h - 14.0).clamp(24.0, 54.0);
+        let icon_r = icon_d / 2.0;
+        let (icx, icy) = (x + icon_r + 7.0, y + h / 2.0);
+        let white = [250, 250, 252, look.text[3]];
+        let off_glyph = [255, 255, 255, look.text[3]];
+        let circle = if look.dark {
+            lerp_rgba(look.off, white, on_t)
+        } else {
+            lerp_rgba(look.off, tint, on_t)
+        };
+        let glyph = if look.dark {
+            lerp_rgba(off_glyph, tint, on_t)
+        } else {
+            off_glyph
+        };
+        let (ps, _) = tap_scale(self.anim.pulses[pulse], now);
+        fill_circle(pm, icx * s, icy * s, icon_r * ps * s, circle);
+        match icon {
+            NetRow::Wifi => {
+                crate::menubar::draw_network(pm, icx * s, (icy - 1.0) * s, s * 0.8 * ps, Network::Wifi(3), glyph)
+            }
+            NetRow::Ethernet => {
+                crate::menubar::draw_network(pm, icx * s, icy * s, s * 0.92 * ps, Network::Wired, glyph)
+            }
+            NetRow::Bluetooth => bluetooth(pm, icx * s, icy * s, 7.4 * ps * s, glyph),
+        }
+
+        let tx = icx + icon_r + 9.0;
+        let maxw = (x + w - 12.0 - tx).max(24.0);
+        let title_base = fonts.baseline_centered((y + h / 2.0 - 15.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
+        fonts.draw(
+            pm,
+            &fonts.elide(&title, 11.5 * s, Weight::Bold, maxw * s),
+            tx * s,
+            title_base,
+            11.5 * s,
+            Weight::Bold,
+            look.text,
+        );
+        let status_base = fonts.baseline_centered((y + h / 2.0 + 3.0) * s, 16.0 * s, 10.0 * s, Weight::Regular);
+        fonts.draw(
+            pm,
+            &fonts.elide(&status, 10.0 * s, Weight::Regular, maxw * s),
+            tx * s,
+            status_base,
+            10.0 * s,
+            Weight::Regular,
+            look.sub,
+        );
+
+        if interactive {
+            targets.push((rect, Target::OpenSubmenu(detail)));
+            if available {
+                targets.push(((icx - icon_r, icy - icon_r, icon_r * 2.0, icon_r * 2.0), toggle));
             }
         }
     }
@@ -2403,28 +2529,30 @@ impl Panel {
         let large = h > CC_CELL + 10.0;
         let media = self.control.media.clone();
         let has = media.is_some();
-        let art = if large { 60.0 } else { 40.0 };
-        let ax = x + if large { MODULE_PAD } else { 14.0 };
-        let ay = y + if large { MODULE_PAD } else { 17.0 };
-        let art_col = if has { scale_alpha(look.accent, 0.92) } else { look.off };
-        fill_rounded(pm, ax * s, ay * s, art * s, art * s, 14.0 * s, art_col);
-        let fade = look.text[3] as f32 / 255.0;
-        fill_rounded(
-            pm,
-            (ax + 4.0) * s,
-            (ay + 4.0) * s,
-            (art - 8.0) * s,
-            (art - 8.0) * s,
-            10.0 * s,
-            scale_alpha([255, 255, 255, 255], (if has { 0.16 } else { 0.06 }) * fade),
-        );
-        music_note(
-            pm,
-            (ax + art / 2.0) * s,
-            (ay + art / 2.0) * s,
-            (art * 0.19) * s,
-            if has { [255, 255, 255, look.text[3]] } else { look.faint },
-        );
+        let art = 52.0;
+        if large {
+            let ax = x + MODULE_PAD;
+            let ay = y + MODULE_PAD;
+            let art_col = if has { scale_alpha(look.accent, 0.92) } else { look.off };
+            fill_rounded(pm, ax * s, ay * s, art * s, art * s, 14.0 * s, art_col);
+            let fade = look.text[3] as f32 / 255.0;
+            fill_rounded(
+                pm,
+                (ax + 4.0) * s,
+                (ay + 4.0) * s,
+                (art - 8.0) * s,
+                (art - 8.0) * s,
+                10.0 * s,
+                scale_alpha([255, 255, 255, 255], (if has { 0.16 } else { 0.06 }) * fade),
+            );
+            music_note(
+                pm,
+                (ax + art / 2.0) * s,
+                (ay + art / 2.0) * s,
+                (art * 0.19) * s,
+                if has { [255, 255, 255, look.text[3]] } else { look.faint },
+            );
+        }
 
         let (title, artist, playing) = match &media {
             Some(m) => (
@@ -2441,16 +2569,16 @@ impl Panel {
         let (text_x, title_base, artist_base, maxw) = if large {
             (
                 x + MODULE_PAD,
-                fonts.baseline_centered((y + 84.0) * s, 20.0 * s, 12.5 * s, Weight::Bold),
-                fonts.baseline_centered((y + 102.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
+                fonts.baseline_centered((y + 70.0) * s, 20.0 * s, 12.5 * s, Weight::Bold),
+                fonts.baseline_centered((y + 87.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
                 w - MODULE_PAD * 2.0,
             )
         } else {
             (
-                ax + art + 10.0,
-                fonts.baseline_centered((y + 16.0) * s, 18.0 * s, 12.5 * s, Weight::Bold),
-                fonts.baseline_centered((y + 35.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
-                w - art - 68.0,
+                x + MODULE_PAD,
+                fonts.baseline_centered((y + 12.0) * s, 18.0 * s, 12.5 * s, Weight::Bold),
+                fonts.baseline_centered((y + 31.0) * s, 16.0 * s, 10.5 * s, Weight::Regular),
+                w - MODULE_PAD - 48.0,
             )
         };
         let title = fonts.elide(&title, 12.5 * s, Weight::Bold, maxw.max(30.0) * s);
@@ -2458,43 +2586,110 @@ impl Panel {
         let artist = fonts.elide(if artist.is_empty() { t("Nothing playing", "Nichts läuft") } else { &artist }, 10.5 * s, Weight::Regular, maxw.max(30.0) * s);
         fonts.draw(pm, &artist, text_x * s, artist_base, 10.5 * s, Weight::Regular, look.sub);
 
-        // Transport controls. The wide variant only has room for play/pause.
+        // Plain transport glyphs, like the iOS music control.
         if large {
-            let (bx, cy, step, play_r) = (x + w / 2.0 - 36.0, y + h - 28.0, 36.0, 14.0);
+            let (bx, cy, step) = (x + w / 2.0 - 34.0, y + h - 22.0, 34.0);
             for (i, target) in [Target::MediaPrev, Target::MediaPlay, Target::MediaNext].into_iter().enumerate() {
                 let cx = bx + i as f32 * step;
                 let glyph = if has { look.text } else { look.faint };
                 match target {
-                    Target::MediaPrev => transport(pm, cx * s, cy * s, 5.6 * s, -1, glyph),
-                    Target::MediaNext => transport(pm, cx * s, cy * s, 5.6 * s, 1, glyph),
-                    _ => {
-                        fill_circle(pm, cx * s, cy * s, play_r * s, if has { look.accent } else { look.off });
-                        let c = if has { [255, 255, 255, look.text[3]] } else { look.faint };
-                        if playing {
-                            pause(pm, cx * s, cy * s, 5.2 * s, c);
-                        } else {
-                            play(pm, cx * s, cy * s, 5.8 * s, c);
-                        }
-                    }
+                    Target::MediaPrev => transport(pm, cx * s, cy * s, 6.0 * s, -1, glyph),
+                    Target::MediaNext => transport(pm, cx * s, cy * s, 6.0 * s, 1, glyph),
+                    _ if playing => pause(pm, cx * s, cy * s, 7.0 * s, glyph),
+                    _ => play(pm, cx * s, cy * s, 7.6 * s, glyph),
                 }
                 if interactive && has {
-                    targets.push(((cx - 17.0, cy - 17.0, 34.0, 34.0), target));
+                    targets.push(((cx - 16.0, cy - 16.0, 32.0, 32.0), target));
                 }
             }
         } else {
-            let (cx, cy) = (x + w - 27.0, y + h / 2.0);
-            fill_circle(pm, cx * s, cy * s, 15.0 * s, if has { look.accent } else { look.off });
-            let c = if has { [255, 255, 255, look.text[3]] } else { look.faint };
+            let (cx, cy) = (x + w - 26.0, y + h / 2.0);
+            let glyph = if has { look.text } else { look.faint };
             if playing {
-                pause(pm, cx * s, cy * s, 5.4 * s, c);
+                pause(pm, cx * s, cy * s, 6.4 * s, glyph);
             } else {
-                play(pm, cx * s, cy * s, 6.0 * s, c);
+                play(pm, cx * s, cy * s, 7.0 * s, glyph);
             }
             if interactive && has {
                 targets.push(((cx - 18.0, cy - 18.0, 36.0, 36.0), Target::MediaPlay));
             }
         }
         let _ = theme;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_vertical_slider(
+        &mut self,
+        pm: &mut Pixmap,
+        s: f32,
+        rect: (f32, f32, f32, f32),
+        kind: ControlKind,
+        look: CcLook,
+        interactive: bool,
+        targets: &mut Vec<((f32, f32, f32, f32), Target)>,
+        now: Instant,
+    ) {
+        let (x, y, w, h) = rect;
+        let brightness = kind == ControlKind::Brightness;
+        let (value, muted, available) = if brightness {
+            let animated = self.anim.displays.first_mut().map(|sp| sp.sample(now));
+            let value = animated
+                .or_else(|| self.control.displays.first().map(|d| d.value))
+                .unwrap_or(0.0);
+            (value.clamp(0.0, 1.0), false, !self.control.displays.is_empty())
+        } else {
+            let (_, muted) = self.control.volume.unwrap_or((0.0, true));
+            (self.anim.vol.sample(now).clamp(0.0, 1.0), muted, self.control.volume.is_some())
+        };
+        let hovered = interactive && self.module_hovered(x, y, w, h);
+        let r = w / 2.0;
+        let alpha = look.text[3] as f32 / 255.0;
+        let white = [252, 252, 255, (248.0 * alpha).round().clamp(0.0, 255.0) as u8];
+
+        fill_rounded(pm, x * s, y * s, w * s, h * s, r * s, look.off);
+        if hovered {
+            fill_rounded(
+                pm,
+                x * s,
+                y * s,
+                w * s,
+                h * s,
+                r * s,
+                [255, 255, 255, (14.0 * alpha).round() as u8],
+            );
+        }
+        let fh = h * value;
+        fill_vertical_slider(pm, x * s, (y + h - fh) * s, w * s, fh * s, white);
+        stroke_rounded(pm, x * s, y * s, w * s, h * s, r * s, 1.0 * s, look.border);
+
+        let icon_cy = y + h - 23.0;
+        let icon = if brightness {
+            [255, 204, 0, look.text[3]]
+        } else {
+            [look.accent[0], look.accent[1], look.accent[2], look.text[3]]
+        };
+        if brightness {
+            crate::osd::sun(pm, (x + w / 2.0) * s, icon_cy * s, 8.4 * s, value, icon);
+        } else {
+            crate::osd::speaker(
+                pm,
+                (x + w / 2.0) * s,
+                icon_cy * s,
+                7.8 * s,
+                value,
+                muted || !available,
+                icon,
+            );
+        }
+
+        if interactive && available {
+            let target = if brightness {
+                Target::BrightnessVertical(0, y + 4.0, y + h - 4.0)
+            } else {
+                Target::VolumeVertical(y + 4.0, y + h - 4.0)
+            };
+            targets.push(((x, y, w, h), target));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2654,27 +2849,38 @@ impl Panel {
             ControlKind::Sound => (0.0, look.accent, PULSE_WIFI, Target::OpenSubmenu(Submenu::Sound)),
             _ => (0.0, look.accent, PULSE_WIFI, Target::Panel),
         };
-        let circle = lerp_rgba(look.off, on_col, on_t);
+        let white = [250, 250, 252, look.text[3]];
+        let circle = if look.dark {
+            lerp_rgba(look.off, white, on_t)
+        } else {
+            lerp_rgba(look.off, on_col, on_t)
+        };
         let wide = w > CC_CELL + 10.0;
         let tall = h > CC_CELL + 10.0;
+        let icon_r = if wide { (h / 2.0 - 9.0).clamp(12.0, 26.0) } else { 16.0 };
         let (cx, cy) = if wide {
-            (x + MODULE_PAD + 16.0, y + h / 2.0)
+            (x + 7.0 + icon_r, y + h / 2.0)
         } else if tall {
             (x + w / 2.0, y + h / 2.0 - 12.0)
         } else {
             (x + w / 2.0, y + 26.0)
         };
         let (ps, _) = tap_scale(self.anim.pulses[pulse], now);
-        fill_circle(pm, cx * s, cy * s, 16.0 * ps * s, circle);
-        // White symbols read correctly on both the accent and grey circles.
-        let glyph = [255, 255, 255, look.text[3]];
-        module_glyph(pm, s, kind, cx, cy, 6.5 * ps, glyph);
+        fill_circle(pm, cx * s, cy * s, icon_r * ps * s, circle);
+        let off_glyph = [255, 255, 255, look.text[3]];
+        let glyph = if look.dark {
+            lerp_rgba(off_glyph, on_col, on_t)
+        } else {
+            off_glyph
+        };
+        let glyph_r = 6.5 * (icon_r / 16.0);
+        module_glyph(pm, s, kind, cx, cy, glyph_r * ps, glyph);
         let label = module_name(kind, german);
         if wide {
-            let tx = x + MODULE_PAD + 40.0;
-            let maxw = (w - (MODULE_PAD * 2.0 + 40.0)).max(30.0);
-            let base = fonts.baseline_centered((y + 19.0) * s, 18.0 * s, 11.5 * s, Weight::Bold);
-            fonts.draw(pm, &fonts.elide(label, 11.5 * s, Weight::Bold, maxw * s), tx * s, base, 11.5 * s, Weight::Bold, look.text);
+            let tx = x + 7.0 + icon_r * 2.0 + 8.0;
+            let maxw = (x + w - 10.0 - tx).max(30.0);
+            let base = fonts.baseline_centered((y + 19.0) * s, 18.0 * s, 11.0 * s, Weight::Bold);
+            fonts.draw(pm, &fonts.elide(label, 11.0 * s, Weight::Bold, maxw * s), tx * s, base, 11.0 * s, Weight::Bold, look.text);
             let status = match kind {
                 ControlKind::Displays => {
                     if german {
@@ -2705,8 +2911,8 @@ impl Panel {
                     }
                 }
             };
-            let sb = fonts.baseline_centered((y + 39.0) * s, 16.0 * s, 10.0 * s, Weight::Regular);
-            fonts.draw(pm, status, tx * s, sb, 10.0 * s, Weight::Regular, look.sub);
+            let sb = fonts.baseline_centered((y + 39.0) * s, 16.0 * s, 9.5 * s, Weight::Regular);
+            fonts.draw(pm, status, tx * s, sb, 9.5 * s, Weight::Regular, look.sub);
         } else {
             let lw = fonts.measure(label, 10.0 * s, Weight::Bold) / s;
             let top = if tall { y + h / 2.0 + 10.0 } else { y + 46.0 };
@@ -3325,6 +3531,39 @@ fn pm_draw_icon(pm: &mut Pixmap, icon: &Pixmap, x: f32, y: f32, size: f32) {
         Transform::from_row(k, 0.0, 0.0, k, x, y),
         None,
     );
+}
+
+/// White fill of an iOS vertical slider: a straight top with soft corners and
+/// a full semicircular bottom. One path avoids the double-alpha seam that two
+/// overlapping shapes would leave on the translucent module.
+fn fill_vertical_slider(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, c: Rgba) {
+    if w <= 0.5 || h <= 0.5 {
+        return;
+    }
+    let r = w / 2.0;
+    if h <= r {
+        fill_rounded(pm, x, y, w, h, h / 2.0, c);
+        return;
+    }
+    let x1 = x + w;
+    let y1 = y + h;
+    let top_r = (w * 0.10).min(w * 0.25).min(h * 0.25);
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + top_r, y);
+    pb.line_to(x1 - top_r, y);
+    pb.quad_to(x1, y, x1, y + top_r);
+    pb.line_to(x1, y1 - r);
+    let steps = 16;
+    for k in 1..=steps {
+        let a = std::f32::consts::PI * k as f32 / steps as f32;
+        pb.line_to(x + r + r * a.cos(), y1 - r + r * a.sin());
+    }
+    pb.line_to(x, y + top_r);
+    pb.quad_to(x, y, x + top_r, y);
+    pb.close();
+    if let Some(path) = pb.finish() {
+        pm.fill_path(&path, &paint(c), FillRule::Winding, Transform::identity(), None);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4600,7 +4839,7 @@ pub fn run_control_slider(
                 }
             }
         }
-        Target::Volume(..) => {
+        Target::Volume(..) | Target::VolumeVertical(..) => {
             if let Some(v) = value {
                 let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
                 let _ = cmd("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{:.3}", v)]);
@@ -4609,7 +4848,7 @@ pub fn run_control_slider(
         Target::VolumeMute => {
             let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]);
         }
-        Target::Brightness(idx, ..) => {
+        Target::Brightness(idx, ..) | Target::BrightnessVertical(idx, ..) => {
             if let (Some(v), Some(d)) = (value, displays.get(*idx)) {
                 crate::ddc::set_brightness(d.bus, v);
             }
@@ -4674,7 +4913,7 @@ pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) 
         Target::AudioSelectSink(name) => {
             cmd("pactl", &["set-default-sink", name]);
         }
-        Target::Volume(..) => {
+        Target::Volume(..) | Target::VolumeVertical(..) => {
             if let Some(v) = value {
                 let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "0"]);
                 let _ = cmd("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &format!("{:.3}", v)]);
@@ -4683,7 +4922,7 @@ pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) 
         Target::VolumeMute => {
             let _ = cmd("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]);
         }
-        Target::Brightness(idx, ..) => {
+        Target::Brightness(idx, ..) | Target::BrightnessVertical(idx, ..) => {
             if let (Some(v), Some(d)) = (value, current.displays.get(*idx)) {
                 crate::ddc::set_brightness(d.bus, v);
             }
@@ -5062,17 +5301,21 @@ wlan0:wifi:connected:OfficeWiFi
     fn pack_page_uses_a_four_column_ios_grid() {
         let pages = ControlCenterSettings::default().pages;
         let placed = pack_page(&pages[0]);
-        assert_eq!(placed.len(), 8);
-        assert_eq!((placed[0].x, placed[0].y, placed[0].w, placed[0].h), (16.0, 0.0, 160.0, 160.0));
-        assert_eq!((placed[1].x, placed[1].y), (186.0, 0.0));
-        assert_eq!((placed[2].x, placed[2].y), (16.0, 170.0));
-        assert_eq!((placed[3].x, placed[3].y), (101.0, 170.0));
-        assert_eq!((placed[4].x, placed[4].y), (186.0, 170.0));
-        assert_eq!((placed[5].x, placed[5].y), (271.0, 170.0));
-        assert_eq!((placed[6].x, placed[6].y, placed[6].w), (16.0, 255.0, 160.0));
-        assert_eq!((placed[7].x, placed[7].y, placed[7].w), (186.0, 255.0, 160.0));
-        assert_eq!(content_rows(&placed), 4);
-        assert_eq!(content_height(&placed), 330.0);
+        assert_eq!(placed.len(), 12);
+        assert_eq!((placed[0].x, placed[0].y, placed[0].w, placed[0].h), (34.0, 0.0, 140.0, 140.0));
+        assert_eq!((placed[1].x, placed[1].y), (188.0, 0.0));
+        assert_eq!((placed[2].x, placed[2].y), (34.0, 154.0));
+        assert_eq!((placed[3].x, placed[3].y), (111.0, 154.0));
+        assert_eq!((placed[4].x, placed[4].y, placed[4].w, placed[4].h), (188.0, 154.0, 63.0, 140.0));
+        assert_eq!((placed[5].x, placed[5].y, placed[5].w, placed[5].h), (265.0, 154.0, 63.0, 140.0));
+        assert_eq!((placed[6].x, placed[6].y), (34.0, 231.0));
+        assert_eq!((placed[7].x, placed[7].y), (111.0, 231.0));
+        assert_eq!((placed[8].x, placed[8].y), (34.0, 308.0));
+        assert_eq!((placed[9].x, placed[9].y), (111.0, 308.0));
+        assert_eq!((placed[10].x, placed[10].y), (188.0, 308.0));
+        assert_eq!((placed[11].x, placed[11].y), (265.0, 308.0));
+        assert_eq!(content_rows(&placed), 5);
+        assert_eq!(content_height(&placed), 371.0);
     }
 
     #[test]
@@ -5132,8 +5375,8 @@ wlan0:wifi:connected:OfficeWiFi
     fn resize_cycles_to_sensible_sizes() {
         assert_eq!(next_module_size(ControlKind::Connectivity, ControlSize::Large), ControlSize::Wide);
         assert_eq!(next_module_size(ControlKind::Connectivity, ControlSize::Wide), ControlSize::Large);
-        assert_eq!(next_module_size(ControlKind::Brightness, ControlSize::Wide), ControlSize::Full);
-        assert_eq!(next_module_size(ControlKind::Brightness, ControlSize::Full), ControlSize::Wide);
+        assert_eq!(next_module_size(ControlKind::Brightness, ControlSize::Tall), ControlSize::Tall);
+        assert_eq!(next_module_size(ControlKind::Volume, ControlSize::Wide), ControlSize::Tall);
         assert_eq!(next_module_size(ControlKind::Focus, ControlSize::Small), ControlSize::Wide);
         assert_eq!(next_module_size(ControlKind::Focus, ControlSize::Wide), ControlSize::Small);
     }
@@ -5179,16 +5422,20 @@ wlan0:wifi:connected:OfficeWiFi
         }
         assert!(has!(Target::WifiToggle));
         assert!(has!(Target::BluetoothToggle));
-        assert!(has!(Target::EthernetToggle));
         assert!(has!(Target::OpenSubmenu(Submenu::Wifi)));
         assert!(has!(Target::OpenSubmenu(Submenu::Bluetooth)));
-        assert!(has!(Target::OpenSubmenu(Submenu::Ethernet)));
         assert!(has!(Target::Dnd));
         assert!(has!(Target::NightShift));
         assert!(has!(Target::GameMode));
         assert!(has!(Target::OpenSettings("displays")));
-        assert!(panel.targets.iter().any(|(_, t)| matches!(t, Target::Volume(..))));
-        assert!(panel.targets.iter().any(|(_, t)| matches!(t, Target::Brightness(0, ..))));
+        assert!(panel
+            .targets
+            .iter()
+            .any(|(_, t)| matches!(t, Target::VolumeVertical(..) | Target::Volume(..))));
+        assert!(panel
+            .targets
+            .iter()
+            .any(|(_, t)| matches!(t, Target::BrightnessVertical(0, ..) | Target::Brightness(0, ..))));
         assert!(has!(Target::MediaPlay));
         assert!(has!(Target::ToggleEdit));
         let (_, _, w, h) = panel.rect();
@@ -5206,7 +5453,7 @@ wlan0:wifi:connected:OfficeWiFi
         // The gallery lists added and addable controls.
         panel.cc_open_gallery();
         panel.paint(&mut pm, 1.0, 750.0, 800.0, &center, &apps, &fonts, &theme, false);
-        assert!(has!(Target::AddModule(ControlKind::Wifi)));
+        assert!(has!(Target::RemoveModule(ControlKind::Wifi)));
         assert!(has!(Target::RemoveModule(ControlKind::Connectivity)));
         assert!(has!(Target::PageAdd));
         assert!(has!(Target::CloseGallery));
