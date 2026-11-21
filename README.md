@@ -143,7 +143,7 @@ dist/dev.sh manual           # back to the default: Rust is only built when you 
 - System Settings (`orchard-settings`): targeted rebuild and reopened on the same page if it was open.
 - compositor (`orchard`): targeted rebuild; if a nested Orchard window (`dist/nested.sh`) is open it is restarted automatically. The live session compositor can't be replaced under running apps, so the new build is used at the next login with no reinstall needed.
 
-The real-hardware backend links against `libinput` and `libseat`. Without their `-devel` packages it builds through a shim in `.devshim/` (see `.cargo/config.toml`). The proper fix is:
+The real-hardware backend links against `libinput` and `libseat`. Install their development packages first:
 `sudo dnf install libinput-devel libseat-devel`
 
 Screen sharing uses `xdg-desktop-portal-hyprland` (already installed with Hyprland's portal package) through wlr-screencopy.
