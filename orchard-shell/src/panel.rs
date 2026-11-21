@@ -191,6 +191,114 @@ impl ControlState {
     }
 }
 
+/// Which parts of a [`ControlState`] were actually read on this pass. A helper
+/// daemon that is briefly busy (or a `timeout` killed command) leaves its bit
+/// unset, and the previous value is kept instead of the tile flickering away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlFresh {
+    pub wifi: bool,
+    pub wifi_networks: bool,
+    pub ethernet: bool,
+    pub bluetooth: bool,
+    pub volume: bool,
+    pub audio_sinks: bool,
+    pub displays: bool,
+}
+
+/// A Control Center job for the background worker. Queries and actions are
+/// processed one at a time so a slow state read can never race an action and
+/// paint a stale switch back over it.
+pub struct ControlRequest {
+    /// Monotonic request id; results older than the newest applied one are dropped.
+    pub seq: u64,
+    pub target: Option<Target>,
+    pub value: Option<f32>,
+    /// State the UI knows at request time (used to resolve what an action toggles).
+    pub current: ControlState,
+}
+
+/// A finished Control Center job, on its way back to the UI thread.
+pub struct ControlUpdate {
+    pub seq: u64,
+    pub state: ControlState,
+    pub fresh: ControlFresh,
+}
+
+impl ControlUpdate {
+    /// Fill fields that could not be read this round from the last known state,
+    /// so a busy NetworkManager/BlueZ/PipeWire never makes a tile disappear.
+    pub fn merged(self, prev: &ControlState) -> ControlState {
+        let mut st = self.state;
+        if !self.fresh.ethernet {
+            st.ethernet = prev.ethernet.clone();
+        }
+        if !self.fresh.wifi {
+            st.wifi = prev.wifi.clone();
+        }
+        if !self.fresh.wifi_networks {
+            st.wifi_networks = prev.wifi_networks.clone();
+            // keep showing the SSID we are on when only the scan failed
+            if matches!(st.wifi, Some((true, None))) {
+                if let Some((true, Some(ssid))) = &prev.wifi {
+                    st.wifi = Some((true, Some(ssid.clone())));
+                }
+            }
+        }
+        if !self.fresh.bluetooth {
+            st.bluetooth = prev.bluetooth;
+            st.bt_devices = prev.bt_devices.clone();
+        }
+        if !self.fresh.volume {
+            st.volume = prev.volume;
+        }
+        if !self.fresh.audio_sinks {
+            st.audio_sinks = prev.audio_sinks.clone();
+        }
+        if !self.fresh.displays {
+            st.displays = prev.displays.clone();
+        }
+        st
+    }
+}
+
+/// Run Control Center jobs on one helper thread, in order.
+///
+/// Serialising them means a full state query always finishes before the
+/// next action starts, so the state that reaches the UI reflects the last
+/// click instead of whichever thread happened to finish last. Queued plain
+/// refreshes are collapsed: only the newest one is worth running.
+pub fn spawn_control_worker(requests: std::sync::mpsc::Receiver<ControlRequest>, send: impl Fn(ControlUpdate) + Send + 'static) {
+    let _ = std::thread::Builder::new().name("control-center".into()).spawn(move || {
+        let mut pending: std::collections::VecDeque<ControlRequest> = std::collections::VecDeque::new();
+        loop {
+            if pending.is_empty() {
+                match requests.recv() {
+                    Ok(r) => pending.push_back(r),
+                    Err(_) => return,
+                }
+            }
+            while let Ok(r) = requests.try_recv() {
+                pending.push_back(r);
+            }
+
+            // Actions keep their order; when only refreshes are left, the newest
+            // one supersedes the older snapshots still waiting in the queue.
+            let req = match pending.iter().position(|r| r.target.is_some()) {
+                Some(i) => pending.remove(i).expect("index from position"),
+                None => pending.pop_back().expect("queue not empty"),
+            };
+            // Anything older than a request that has now been handled is stale.
+            pending.retain(|r| r.seq > req.seq);
+
+            let (state, fresh) = match req.target.as_ref() {
+                Some(t) => run_control(t, req.value, &req.current),
+                None => query_control_fresh(),
+            };
+            send(ControlUpdate { seq: req.seq, state, fresh });
+        }
+    });
+}
+
 /// One app's playback streams (a browser's tabs share one row).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AppStream {
@@ -277,7 +385,7 @@ pub struct Panel {
     /// x of the right edge of the Control Center icon (Control Center anchors there)
     pub anchor_right: f32,
     pub control: ControlState,
-    /// Live menu-bar network state, used before the first async `query_control()` completes.
+    /// Live menu-bar network state, used before the first async query completes.
     pub network_hint: Network,
     /// slider being dragged
     pub dragging: Option<Target>,
@@ -2461,10 +2569,16 @@ fn parse_audio_sinks(json: &str, default_sink: &str) -> Vec<AudioSink> {
     sinks
 }
 
-fn query_wifi_networks() -> Vec<WifiNetwork> {
-    let list = cmd_localized("nmcli", &["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "dev", "wifi", "list"]).unwrap_or_default();
-    let cons = cmd_localized("nmcli", &["-t", "-f", "NAME,TYPE", "con", "show"]).unwrap_or_default();
-    parse_wifi_networks(&list, &cons)
+/// Scan results, plus whether the scan itself could be read (a failed command
+/// must not look like "there are no networks around").
+fn query_wifi_networks() -> (Vec<WifiNetwork>, bool) {
+    match cmd_localized("nmcli", &["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "dev", "wifi", "list"]) {
+        Some(list) => {
+            let cons = cmd_localized("nmcli", &["-t", "-f", "NAME,TYPE", "con", "show"]).unwrap_or_default();
+            (parse_wifi_networks(&list, &cons), true)
+        }
+        None => (Vec::new(), false),
+    }
 }
 
 fn query_bt_devices() -> Vec<BtDevice> {
@@ -2473,30 +2587,40 @@ fn query_bt_devices() -> Vec<BtDevice> {
         .into_iter()
         .map(|(m, _)| m)
         .collect();
-    let mut devices = Vec::new();
-    for (mac, name) in paired {
-        let is_connected = connected.contains(&mac);
-        let mut icon = String::new();
-        let mut battery = None;
-        if let Some(detail) = cmd("bluetoothctl", &["info", &mac]) {
-            for l in detail.lines().map(str::trim) {
-                if let Some(i) = l.strip_prefix("Icon: ") {
-                    icon = i.to_string();
-                }
-                if let Some(b) = l.strip_prefix("Battery Percentage: ") {
-                    // "0x5a (90)"
-                    battery = b.split('(').nth(1).and_then(|x| x.trim_end_matches(')').parse().ok());
-                }
-            }
-        }
-        devices.push(BtDevice {
-            mac,
-            name,
-            connected: is_connected,
-            icon,
-            battery,
-        });
-    }
+    // One `info` round trip per paired device; asking in parallel keeps a slow
+    // or busy bluetoothd from stalling the whole Control Center refresh.
+    let mut devices: Vec<BtDevice> = std::thread::scope(|s| {
+        let handles: Vec<_> = paired
+            .into_iter()
+            .map(|(mac, name)| {
+                let connected = &connected;
+                s.spawn(move || {
+                    let mut icon = String::new();
+                    let mut battery = None;
+                    if let Some(detail) = cmd("bluetoothctl", &["info", &mac]) {
+                        for l in detail.lines().map(str::trim) {
+                            if let Some(i) = l.strip_prefix("Icon: ") {
+                                icon = i.to_string();
+                            }
+                            if let Some(b) = l.strip_prefix("Battery Percentage: ") {
+                                // "0x5a (90)"
+                                battery = b.split('(').nth(1).and_then(|x| x.trim_end_matches(')').parse().ok());
+                            }
+                        }
+                    }
+                    let is_connected = connected.contains(&mac);
+                    BtDevice {
+                        mac,
+                        name,
+                        connected: is_connected,
+                        icon,
+                        battery,
+                    }
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
     devices.sort_by(|a, b| b.connected.cmp(&a.connected).then(a.name.cmp(&b.name)));
     devices
 }
@@ -2554,10 +2678,10 @@ pub fn query_streams() -> Vec<AppStream> {
     parse_sink_inputs(&cmd_localized("pactl", &["-f", "json", "list", "sink-inputs"]).unwrap_or_default())
 }
 
-fn query_audio_sinks() -> Vec<AudioSink> {
-    let json = cmd_localized("pactl", &["-f", "json", "list", "sinks"]).unwrap_or_default();
+fn query_audio_sinks() -> Option<Vec<AudioSink>> {
+    let json = cmd_localized("pactl", &["-f", "json", "list", "sinks"])?;
     let default_sink = cmd("pactl", &["get-default-sink"]).unwrap_or_default().trim().to_string();
-    parse_audio_sinks(&json, &default_sink)
+    Some(parse_audio_sinks(&json, &default_sink))
 }
 
 fn parse_nm_devices(out: &str) -> (bool, Option<String>, Vec<EthernetDevice>) {
@@ -2644,10 +2768,34 @@ fn query_ethernet_sysfs() -> Vec<EthernetDevice> {
     eths
 }
 
-pub fn query_control() -> ControlState {
-    let (has_wifi, active_wifi_con, ethernet) =
-        if let Some(devs) = cmd("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev"]) {
+/// Wi-Fi hardware as seen by the kernel, so a failing `nmcli` alone never makes
+/// the Wi-Fi tile vanish.
+fn has_wifi_sysfs() -> bool {
+    std::fs::read_dir("/sys/class/net")
+        .map(|rd| rd.flatten().any(|e| e.path().join("wireless").exists()))
+        .unwrap_or(false)
+}
+
+#[derive(Default)]
+struct NetQuery {
+    wifi: Option<(bool, Option<String>)>,
+    wifi_networks: Vec<WifiNetwork>,
+    ethernet: Vec<EthernetDevice>,
+    fresh_wifi: bool,
+    fresh_networks: bool,
+    fresh_ethernet: bool,
+}
+
+fn query_network() -> NetQuery {
+    let mut q = NetQuery::default();
+    let mut has_wifi = has_wifi_sysfs();
+    let mut active_wifi_con = None;
+
+    match cmd("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "dev"]) {
+        Some(devs) => {
             let (hw, aw, mut eths) = parse_nm_devices(&devs);
+            has_wifi |= hw;
+            active_wifi_con = aw;
             for dev in &mut eths {
                 if !dev.managed && !dev.connected {
                     let up = std::fs::read_to_string(format!("/sys/class/net/{}/operstate", dev.device))
@@ -2676,55 +2824,91 @@ pub fn query_control() -> ControlState {
                     .then(b.plugged.cmp(&a.plugged))
                     .then(a.device.cmp(&b.device))
             });
-            (hw, aw, eths)
-        } else {
-            (false, None, query_ethernet_sysfs())
-        };
-    let wifi_on = if has_wifi {
-        cmd("nmcli", &["-t", "radio", "wifi"]).map(|r| r.trim() == "enabled")
-    } else {
-        None
-    };
-    let wifi_networks = if wifi_on == Some(true) {
-        query_wifi_networks()
-    } else {
-        Vec::new()
-    };
-    let wifi = wifi_on.map(|on| {
-        let ssid = if on {
-            wifi_networks
-                .iter()
-                .find(|n| n.active)
-                .map(|n| n.ssid.clone())
-                .or(active_wifi_con)
-        } else {
-            None
-        };
-        (on, ssid)
-    });
-
-    let bluetooth = cmd("bluetoothctl", &["show"]).and_then(|o| {
-        if o.contains("Powered: yes") {
-            Some(true)
-        } else if o.contains("Powered: no") {
-            Some(false)
-        } else {
-            None
+            q.ethernet = eths;
+            q.fresh_ethernet = true;
         }
-    });
-    let bt_devices = if bluetooth == Some(true) {
-        query_bt_devices()
-    } else {
-        Vec::new()
-    };
+        None => {
+            q.ethernet = query_ethernet_sysfs();
+            q.fresh_ethernet = !q.ethernet.is_empty();
+        }
+    }
 
-    let volume = cmd("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]).and_then(|o| crate::osd::parse_wpctl(&o));
-    let audio_sinks = query_audio_sinks();
-    let streams = query_streams();
+    if !has_wifi {
+        // No radio at all: "off / no networks" is the real answer, not a failure.
+        q.fresh_wifi = true;
+        q.fresh_networks = true;
+        return q;
+    }
 
-    let displays = crate::ddc::query_displays();
+    match cmd("nmcli", &["-t", "radio", "wifi"]) {
+        Some(out) => {
+            let on = out.trim() == "enabled";
+            q.fresh_wifi = true;
+            if on {
+                let (nets, ok) = query_wifi_networks();
+                let ssid = nets
+                    .iter()
+                    .find(|n| n.active)
+                    .map(|n| n.ssid.clone())
+                    .or(active_wifi_con);
+                q.wifi_networks = nets;
+                q.fresh_networks = ok;
+                q.wifi = Some((true, ssid));
+            } else {
+                q.fresh_networks = true;
+                q.wifi = Some((false, None));
+            }
+        }
+        None => {
+            // Radio state unknown this round (busy NetworkManager); the previous
+            // value is kept by the merge instead of showing "Unavailable".
+        }
+    }
+    q
+}
 
-    let media = sh("playerctl metadata --format '{{status}}\t{{title}}\t{{artist}}'").and_then(|o| {
+fn query_bluetooth() -> (Option<bool>, Vec<BtDevice>, bool) {
+    match cmd("bluetoothctl", &["show"]) {
+        Some(out) => {
+            let powered = if out.contains("Powered: yes") {
+                Some(true)
+            } else if out.contains("Powered: no") {
+                Some(false)
+            } else {
+                None
+            };
+            let devices = if powered == Some(true) { query_bt_devices() } else { Vec::new() };
+            (powered, devices, true)
+        }
+        None => (None, Vec::new(), false),
+    }
+}
+
+#[derive(Default)]
+struct AudioQuery {
+    volume: Option<(f32, bool)>,
+    sinks: Vec<AudioSink>,
+    streams: Vec<AppStream>,
+    fresh_volume: bool,
+    fresh_sinks: bool,
+}
+
+fn query_audio() -> AudioQuery {
+    let mut q = AudioQuery::default();
+    if let Some(out) = cmd("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
+        q.volume = crate::osd::parse_wpctl(&out);
+        q.fresh_volume = q.volume.is_some();
+    }
+    if let Some(sinks) = query_audio_sinks() {
+        q.sinks = sinks;
+        q.fresh_sinks = true;
+    }
+    q.streams = query_streams();
+    q
+}
+
+fn query_media() -> Option<Media> {
+    sh("playerctl metadata --format '{{status}}\t{{title}}\t{{artist}}'").and_then(|o| {
         let mut parts = o.trim_end_matches('\n').splitn(3, '\t');
         let status = parts.next()?;
         Some(Media {
@@ -2732,24 +2916,54 @@ pub fn query_control() -> ControlState {
             title: parts.next().unwrap_or_default().to_string(),
             artist: parts.next().unwrap_or_default().to_string(),
         })
+    })
+}
+
+/// Read the whole Control Center state. The independent groups (network,
+/// Bluetooth, audio, displays, media) run in parallel, so a slow DDC probe or
+/// Wi-Fi scan no longer delays the tiles it has nothing to do with.
+pub fn query_control_fresh() -> (ControlState, ControlFresh) {
+    let (net, (bluetooth, bt_devices, bt_ok), audio, (displays, displays_ok), media) = std::thread::scope(|s| {
+        let net = s.spawn(query_network);
+        let bt = s.spawn(query_bluetooth);
+        let audio = s.spawn(query_audio);
+        let displays = s.spawn(crate::ddc::query_displays);
+        let media = s.spawn(query_media);
+        (
+            net.join().unwrap_or_default(),
+            bt.join().unwrap_or_default(),
+            audio.join().unwrap_or_default(),
+            displays.join().unwrap_or_default(),
+            media.join().unwrap_or_default(),
+        )
     });
 
-    ControlState {
-        wifi,
-        wifi_networks,
-        ethernet,
+    let state = ControlState {
+        wifi: net.wifi,
+        wifi_networks: net.wifi_networks,
+        ethernet: net.ethernet,
         bluetooth,
         bt_devices,
-        volume,
-        audio_sinks,
-        streams,
+        volume: audio.volume,
+        audio_sinks: audio.sinks,
+        streams: audio.streams,
         displays,
         media,
-    }
+    };
+    let fresh = ControlFresh {
+        wifi: net.fresh_wifi,
+        wifi_networks: net.fresh_networks,
+        ethernet: net.fresh_ethernet,
+        bluetooth: bt_ok,
+        volume: audio.fresh_volume,
+        audio_sinks: audio.fresh_sinks,
+        displays: displays_ok,
+    };
+    (state, fresh)
 }
 
 /// Fast path for sliders & mute: only applies the system change without running
-/// the 15-subprocess full `query_control()`.
+/// the full `query_control_fresh()`.
 pub fn run_control_slider(
     target: &Target,
     value: Option<f32>,
@@ -2795,7 +3009,7 @@ pub fn run_control_slider(
 }
 
 /// Run a Control Center action; returns the new state.
-pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) -> ControlState {
+pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) -> (ControlState, ControlFresh) {
     match target {
         Target::WifiToggle => {
             let on = current.wifi.as_ref().map(|w| w.0).unwrap_or(false);
@@ -2879,7 +3093,12 @@ pub fn run_control(target: &Target, value: Option<f32>, current: &ControlState) 
     if matches!(target, Target::MediaPrev | Target::MediaNext | Target::MediaPlay) {
         std::thread::sleep(Duration::from_millis(250));
     }
-    query_control()
+    // NetworkManager / BlueZ publish the new state over D-Bus just after the
+    // command returns; give them a moment so the read-back isn't the old one.
+    if matches!(target, Target::WifiToggle | Target::EthernetToggle | Target::BluetoothToggle) {
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    query_control_fresh()
 }
 
 #[cfg(test)]
@@ -2903,6 +3122,53 @@ mod tests {
         assert_eq!(nets[2].ssid, "FreeWifi");
         assert!(!nets[2].known);
         assert!(!nets[2].secure);
+    }
+
+    #[test]
+    fn merge_keeps_fields_that_failed_to_read() {
+        let prev = ControlState {
+            wifi: Some((true, Some("HomeNet".into()))),
+            bluetooth: Some(true),
+            volume: Some((0.4, false)),
+            audio_sinks: vec![AudioSink {
+                name: "alsa_output.hdmi".into(),
+                desc: "HDMI".into(),
+                active: true,
+                icon: AudioIcon::Display,
+            }],
+            displays: vec![crate::ddc::DisplayBrightness {
+                bus: Some(4),
+                name: "DELL".into(),
+                value: 0.5,
+            }],
+            ..Default::default()
+        };
+
+        // Every helper timed out: nothing may flicker away.
+        let all_failed = ControlUpdate {
+            seq: 1,
+            state: ControlState::default(),
+            fresh: ControlFresh::default(),
+        };
+        assert_eq!(all_failed.merged(&prev), prev);
+
+        // Only volume was read: it replaces, everything else is kept.
+        let volume_only = ControlUpdate {
+            seq: 2,
+            state: ControlState {
+                volume: Some((0.9, true)),
+                ..Default::default()
+            },
+            fresh: ControlFresh {
+                volume: true,
+                ..Default::default()
+            },
+        };
+        let merged = volume_only.merged(&prev);
+        assert_eq!(merged.volume, Some((0.9, true)));
+        assert_eq!(merged.wifi, prev.wifi);
+        assert_eq!(merged.displays, prev.displays);
+        assert_eq!(merged.audio_sinks, prev.audio_sinks);
     }
 
     #[test]

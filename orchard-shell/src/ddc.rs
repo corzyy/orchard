@@ -28,11 +28,17 @@ struct DdcInfo {
     name: String,
 }
 
-static DDC_CACHE: OnceLock<Mutex<Option<(Instant, Vec<DdcInfo>)>>> = OnceLock::new();
+/// `(when, monitors, detection succeeded)`
+static DDC_CACHE: OnceLock<Mutex<Option<(Instant, Vec<DdcInfo>, bool)>>> = OnceLock::new();
 const CACHE_TTL: Duration = Duration::from_secs(30);
+/// A failed `ddcutil detect` is retried soon (so sliders come back), but not on
+/// every refresh.
+const RETRY_TTL: Duration = Duration::from_secs(3);
 
 fn run_cmd(prog: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(prog).args(args).output().ok()?;
+    // an I2C hiccup must never wedge the Control Center worker: a hung ddcutil
+    // would otherwise leave the panel waiting for a state that never arrives
+    let out = Command::new("timeout").arg("3").arg(prog).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -90,27 +96,44 @@ pub fn parse_ddc_detect(s: &str) -> Vec<(u8, String)> {
     out
 }
 
-fn detected_ddc_monitors() -> Vec<DdcInfo> {
+/// `(known, monitors)`: `known` is false when `ddcutil detect` failed and the
+/// previously cached list (possibly empty) is all we have. That way a transient
+/// I2C error does not make the brightness sliders disappear for 30 seconds.
+fn detected_ddc_monitors() -> (bool, Vec<DdcInfo>) {
     let cache = DDC_CACHE.get_or_init(|| Mutex::new(None));
     if let Ok(g) = cache.lock() {
-        if let Some((at, list)) = g.as_ref() {
-            if at.elapsed() < CACHE_TTL {
-                return list.clone();
+        if let Some((at, list, ok)) = g.as_ref() {
+            let ttl = if *ok { CACHE_TTL } else { RETRY_TTL };
+            if at.elapsed() < ttl {
+                return (*ok, list.clone());
             }
         }
     }
-    let list: Vec<DdcInfo> = run_cmd("ddcutil", &["detect", "--terse"])
-        .map(|s| {
-            parse_ddc_detect(&s)
+    match run_cmd("ddcutil", &["detect", "--terse"]) {
+        Some(out) => {
+            let list: Vec<DdcInfo> = parse_ddc_detect(&out)
                 .into_iter()
                 .map(|(bus, name)| DdcInfo { bus, name })
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Ok(mut g) = cache.lock() {
-        *g = Some((Instant::now(), list.clone()));
+                .collect();
+            if let Ok(mut g) = cache.lock() {
+                *g = Some((Instant::now(), list.clone(), true));
+            }
+            (true, list)
+        }
+        // Keep the last known monitors, mark the result incomplete so the UI
+        // does not drop their sliders, and retry in a few seconds.
+        None => {
+            let list = cache
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|(_, l, _)| l.clone()))
+                .unwrap_or_default();
+            if let Ok(mut g) = cache.lock() {
+                *g = Some((Instant::now(), list.clone(), false));
+            }
+            (false, list)
+        }
     }
-    list
 }
 
 fn query_ddc_vcp10(bus: u8) -> Option<f32> {
@@ -122,31 +145,37 @@ fn query_ddc_vcp10(bus: u8) -> Option<f32> {
     crate::osd::parse_ddcutil(&out)
 }
 
-/// Query all controllable displays (internal backlight + DDC/CI external monitors).
-pub fn query_displays() -> Vec<DisplayBrightness> {
+/// Query all controllable displays (internal backlight + DDC/CI external
+/// monitors). The flag is false when any probe failed, so the caller can keep
+/// the last known brightness rows instead of dropping the monitors.
+pub fn query_displays() -> (Vec<DisplayBrightness>, bool) {
     let mut displays = Vec::new();
+    let mut complete = true;
     let has_bl = std::fs::read_dir("/sys/class/backlight")
         .map(|mut d| d.next().is_some())
         .unwrap_or(false);
     if has_bl {
-        if let Some(v) = run_cmd("brightnessctl", &["-m"]).and_then(|o| crate::osd::parse_brightnessctl(&o)) {
-            displays.push(DisplayBrightness {
+        match run_cmd("brightnessctl", &["-m"]).and_then(|o| crate::osd::parse_brightnessctl(&o)) {
+            Some(v) => displays.push(DisplayBrightness {
                 bus: None,
                 name: "Built-in Display".into(),
                 value: v,
-            });
+            }),
+            None => complete = false,
         }
     }
 
-    let ddc_list = detected_ddc_monitors();
+    let (known, ddc_list) = detected_ddc_monitors();
+    complete &= known;
     if ddc_list.len() <= 1 {
         for m in ddc_list {
-            if let Some(v) = query_ddc_vcp10(m.bus) {
-                displays.push(DisplayBrightness {
+            match query_ddc_vcp10(m.bus) {
+                Some(v) => displays.push(DisplayBrightness {
                     bus: Some(m.bus),
                     name: m.name,
                     value: v,
-                });
+                }),
+                None => complete = false,
             }
         }
     } else {
@@ -164,12 +193,13 @@ pub fn query_displays() -> Vec<DisplayBrightness> {
             })
             .collect();
         for h in handles {
-            if let Ok(Some(d)) = h.join() {
-                displays.push(d);
+            match h.join() {
+                Ok(Some(d)) => displays.push(d),
+                _ => complete = false,
             }
         }
     }
-    displays
+    (displays, complete)
 }
 
 struct PendingQueue {
@@ -242,7 +272,7 @@ pub fn set_brightness(bus: Option<u8>, value: f32) {
 
 /// Relative brightness step for media keys across all DDC monitors; returns the first monitor's new level.
 pub fn adjust_all_ddc(sign: char, amount: i32) -> Option<f32> {
-    let monitors = detected_ddc_monitors();
+    let (_, monitors) = detected_ddc_monitors();
     if monitors.is_empty() {
         let sign_s = sign.to_string();
         let amt_s = amount.to_string();

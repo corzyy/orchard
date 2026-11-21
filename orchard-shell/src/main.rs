@@ -223,8 +223,13 @@ struct App {
     screenshot_surf: Option<Surf>,
     screenshot_prefs: screenshot::Prefs,
     last_shot_backdrop: Vec<(f32, f32, f32, f32, f32)>,
-    control_tx: Sender<panel::ControlState>,
+    /// Control Center jobs are queued to one worker thread, in order
+    control_req_tx: std::sync::mpsc::Sender<panel::ControlRequest>,
     control_cache: panel::ControlState,
+    /// id of the newest Control Center request
+    control_seq: u64,
+    /// id of the newest Control Center state applied to the UI
+    control_applied: u64,
     last_slider_cmd: Instant,
     vol_tx: Sender<Option<(f32, bool)>>,
     vol_pending: Arc<AtomicBool>,
@@ -327,14 +332,18 @@ fn main() {
             }
         })
         .expect("global menu channel");
-    let (control_tx, control_rx) = channel::channel::<panel::ControlState>();
+    let (control_tx, control_rx) = channel::channel::<panel::ControlUpdate>();
     loop_handle
         .insert_source(control_rx, |ev, _, app: &mut App| {
-            if let channel::Event::Msg(st) = ev {
-                app.on_control_state(st);
+            if let channel::Event::Msg(up) = ev {
+                app.on_control_state(up);
             }
         })
         .expect("control channel");
+    let (control_req_tx, control_req_rx) = std::sync::mpsc::channel::<panel::ControlRequest>();
+    panel::spawn_control_worker(control_req_rx, move |up| {
+        let _ = control_tx.send(up);
+    });
     let (spot_tx, spot_rx) = channel::channel::<launcher::Msg>();
     loop_handle
         .insert_source(spot_rx, |ev, _, app: &mut App| {
@@ -424,8 +433,10 @@ fn main() {
         screenshot_surf: None,
         screenshot_prefs: screenshot::Prefs::default(),
         last_shot_backdrop: Vec::new(),
-        control_tx,
+        control_req_tx,
         control_cache: Default::default(),
+        control_seq: 0,
+        control_applied: 0,
         last_slider_cmd: Instant::now(),
         vol_tx,
         vol_pending: Arc::new(AtomicBool::new(false)),
@@ -451,6 +462,9 @@ fn main() {
     app.menubar.cfg = settings.menu_bar.clone();
     app.menubar.refresh_status();
     app.refresh_volume();
+    // Warm the Control Center cache so the first open already shows every tile
+    // instead of popping them in one query later.
+    app.refresh_control(None, None);
     app.notes.do_not_disturb = panel_app::load_dnd();
     app.menubar.dnd = app.notes.do_not_disturb;
     let apps_ref = &app.apps;

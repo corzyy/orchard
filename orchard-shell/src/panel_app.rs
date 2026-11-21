@@ -14,7 +14,7 @@ use smithay_client_toolkit::{
 use crate::{
     menubar::BarItem,
     notify::{self, Hit},
-    panel::{self, ControlState, Kind, Panel, Submenu, Target},
+    panel::{self, ControlRequest, ControlUpdate, Kind, Panel, Submenu, Target},
     App, Surf, Which, BTN_LEFT,
 };
 
@@ -131,10 +131,20 @@ impl App {
         }
     }
 
-    /// Query (and optionally change) Wi-Fi, Bluetooth, volume … on a helper thread.
+    /// Query (and optionally change) Wi-Fi, Bluetooth, volume … on the helper worker.
     pub(crate) fn refresh_control(&mut self, target: Option<Target>, value: Option<f32>) {
-        // Fast path for volume/brightness sliders & mute: apply without spawning the
-        // full 15-subprocess `query_control()` on every drag tick.
+        self.control_seq = self.control_seq.wrapping_add(1);
+
+        // A click (any target) or a slider move invalidates snapshots that are
+        // still in flight: they were taken before the change and would flip the
+        // UI back until the next query finishes.
+        let local_change = target.is_some();
+        if local_change {
+            self.control_applied = self.control_applied.max(self.control_seq);
+        }
+
+        // Fast path for volume/brightness sliders & mute: apply without running
+        // the full state query on every drag tick.
         if let Some(ref t) = target {
             if matches!(
                 t,
@@ -154,18 +164,23 @@ impl App {
                 return;
             }
         }
-        let tx = self.control_tx.clone();
-        let current = self.control_cache.clone();
-        let _ = std::thread::Builder::new().name("control-center".into()).spawn(move || {
-            let st = match target {
-                Some(t) => panel::run_control(&t, value, &current),
-                None => panel::query_control(),
-            };
-            let _ = tx.send(st);
-        });
+        let job = ControlRequest {
+            seq: self.control_seq,
+            target,
+            value,
+            current: self.control_cache.clone(),
+        };
+        let _ = self.control_req_tx.send(job);
     }
 
-    pub(crate) fn on_control_state(&mut self, st: ControlState) {
+    pub(crate) fn on_control_state(&mut self, up: ControlUpdate) {
+        // Drop results that were requested before the newest applied state (the
+        // worker is serial, but this keeps fast slider paths safe too).
+        if up.seq < self.control_applied {
+            return;
+        }
+        self.control_applied = up.seq;
+        let st = up.merged(&self.control_cache);
         tracing::debug!(?st, "control center state");
         self.control_cache = st.clone();
         let mut bar_dirty = false;
